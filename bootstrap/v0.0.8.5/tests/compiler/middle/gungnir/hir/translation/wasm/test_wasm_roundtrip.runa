@@ -1,0 +1,531 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+WebAssembly (WAT) Translation Round-Trip Probe
+
+End-to-end proof that the WebAssembly text-format (WAT) translation pipeline is
+REAL, not a skeleton:
+
+    WAT s-expression source
+      -> wasm_lexer       (tokenize: parens, $identifiers, "strings", numbers,
+                           keywords (module/func/param/result/local/export/...),
+                           value types (i32/i64/f32/f64), instruction mnemonics)
+      -> wasm_parser      (recursive-descent s-expression tree; each head keyword
+                           is classified into a WasmNode tag - WASM_FUNCTION,
+                           WASM_PARAM, WASM_RESULT, WASM_LOCAL, WASM_IMPORT,
+                           WASM_EXPORT, WASM_TYPE, or WASM_INSTRUCTION)
+      -> wasm_to_hir      (partition the module tree into a HIR dictionary with
+                           "functions"/"imports"/"exports"/"types" lists; each
+                           function is a dictionary with "parameters"/"results"/
+                           "locals"/"body" lists; each body instruction is a
+                           dictionary keyed by "opcode" plus an "operands" list of
+                           nested instruction / immediate-operand dictionaries)
+      -> hir_to_wasm      (emit the HIR dictionary back to canonical WAT text)
+
+The HIR model is the dictionary/list-literal model (String-keyed dictionaries),
+NOT the typed hir.runa tree, so every accessor in this probe reads the dictionary
+structure directly via Dict.get / List.get / List.size.
+
+The probe feeds a representative WAT snippet:
+
+    (module
+      (func $add (param $a i32) (param $b i32) (result i32)
+        (i32.add (local.get $a) (local.get $b)))
+      (export "add" (func $add)))
+
+exercising: a (module ...) root, a named (func $add ...) with two named+typed
+params, a (result i32), a folded body instruction (i32.add ...) whose two
+operands are themselves nested (local.get $a) / (local.get $b) instructions, and
+an (export "add" (func $add)).
+
+It then:
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     dictionary type tag and the top-level section counts.
+  2. Asserts the lowered function name, its parameter names and types, its result
+     type, and the body instruction's opcode plus the opcodes / immediates of its
+     nested operands survived on the FIRST emission's HIR. Asserts the export
+     name and internal reference.
+  3. Emits the HIR back to WAT text and asserts the text is non-empty.
+  4. Re-parses the emitted text back into HIR (the SECOND emission) and asserts
+     the two HIR streams are STRUCTURALLY EQUAL via recursive comparators: same
+     function count, same per-function name / parameter stream / result stream /
+     body instruction tree (opcode + operand arity + operand kind + nested
+     opcodes and immediate values at every position), and same export stream
+     (name + internal_name). The backend canonicalises whitespace and the folded
+     export form, so the byte stream differs while the meaning is identical;
+     structural equality is the correct fidelity check.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/wasm/wasm_lexer.runa" as WasmLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/wasm/wasm_parser.runa" as WasmParser
+Import "compiler/middle/gungnir/hir/translation/frontends/wasm/wasm_to_hir.runa" as WasmFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/wasm/hir_to_wasm.runa" as WasmBackend
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: WAT source -> HIR dictionary
+Note: ============================================================================
+
+@Reasoning:
+The WAT pipeline has no single source-to-HIR convenience, so the probe owns the
+chain explicitly: create_lexer wraps the source, tokenize fills the lexer's token
+list, create_parser snapshots that list, parse builds the s-expression AST, and
+translate_wasm_to_hir partitions the AST into the HIR dictionary. Returning the
+dictionary pointer (or 0 on any stage failure) lets the caller assert on one
+value.
+@End Reasoning
+Process called "wasm_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from WasmLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    proc tokenize from WasmLexer with lexer
+
+    Let parser be proc create_parser from WasmParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from WasmParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_wasm_to_hir from WasmFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: HIR accessors (mirror the backend's dictionary read contract)
+Note: ============================================================================
+
+@Reasoning:
+The HIR dictionary keys are content-hashed Strings, so a fresh literal key
+constructed here resolves to the same entry the frontend stored under. This
+helper builds the key and fetches the value (section list or scalar) so the
+comparators and assertions can read it uniformly.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as String returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key_str be proc create_from_literal from StringCore with key
+    Return proc get from Dict with node, key_str
+End Process
+
+@Reasoning:
+Returns the number of entries in a list, tolerating a missing (0) list so the
+count assertions read uniformly.
+@End Reasoning
+Process called "list_count" takes lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with lst
+End Process
+
+@Reasoning:
+Returns entry i of a list as a raw pointer so callers can read its fields.
+@End Reasoning
+Process called "list_at" takes lst as Integer, index as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with lst, index
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two instruction trees (recursive)
+Note: ============================================================================
+
+@Reasoning:
+Two body instructions are equal when their opcodes match and their operand lists
+match position-for-position. An operand is either a nested instruction (compared
+recursively) or a simple immediate (compared by its "value" payload). Comparing
+the opcode, the operand arity, the operand kind at each position, and recursing
+into nested instructions proves operand-level round-trip fidelity for folded WAT
+expression trees without being fooled by the backend's canonical re-rendering.
+@End Reasoning
+Process called "instructions_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let opcode_a be proc dict_get with a, "opcode"
+    Let opcode_b be proc dict_get with b, "opcode"
+    Let opcodes_match be proc string_equals from StringCore with opcode_a, opcode_b
+    If opcodes_match is not equal to 1:
+        Return 0
+    End If
+
+    Let ops_a be proc dict_get with a, "operands"
+    Let ops_b be proc dict_get with b, "operands"
+    Let opc_a be proc list_count with ops_a
+    Let opc_b be proc list_count with ops_b
+    If opc_a is not equal to opc_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than opc_a:
+        Let op_a be proc list_at with ops_a, i
+        Let op_b be proc list_at with ops_b, i
+
+        Let type_a be proc dict_get with op_a, "type"
+        Let type_b be proc dict_get with op_b, "type"
+        Let types_match be proc string_equals from StringCore with type_a, type_b
+        If types_match is not equal to 1:
+            Return 0
+        End If
+
+        Note: An operand tagged "instruction" is a nested folded instruction;
+        Note: recurse. Any other operand is a simple immediate compared by value.
+        Let is_nested be proc string_equals from StringCore with type_a, "instruction"
+        If is_nested is equal to 1:
+            Let nested_match be proc instructions_equal with op_a, op_b
+            If nested_match is not equal to 1:
+                Return 0
+            End If
+        Otherwise:
+            Let val_a be proc dict_get with op_a, "value"
+            Let val_b be proc dict_get with op_b, "value"
+            Let vals_match be proc string_equals from StringCore with val_a, val_b
+            If vals_match is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two body instruction streams are equal when they have the same length and
+structurally equal instructions at every position.
+@End Reasoning
+Process called "body_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count_a:
+        Let instr_a be proc list_at with a, i
+        Let instr_b be proc list_at with b, i
+        Let match be proc instructions_equal with instr_a, instr_b
+        If match is not equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Two parameter streams are equal when they have the same length and the same name
+plus the same value type at every position.
+@End Reasoning
+Process called "param_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count_a:
+        Let pa be proc list_at with a, i
+        Let pb be proc list_at with b, i
+
+        Let name_a be proc dict_get with pa, "name"
+        Let name_b be proc dict_get with pb, "name"
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+
+        Let type_a be proc dict_get with pa, "param_type"
+        Let type_b be proc dict_get with pb, "param_type"
+        Let types_match be proc string_equals from StringCore with type_a, type_b
+        If types_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Two result streams are equal when they have the same length and the same result
+value type at every position.
+@End Reasoning
+Process called "result_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count_a:
+        Let ra be proc list_at with a, i
+        Let rb be proc list_at with b, i
+        Let type_a be proc dict_get with ra, "result_type"
+        Let type_b be proc dict_get with rb, "result_type"
+        Let types_match be proc string_equals from StringCore with type_a, type_b
+        If types_match is not equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Two function streams are equal when they have the same length and, at every
+position, the same name and structurally equal parameter / result / body streams.
+This is the load-bearing whole-function round-trip check.
+@End Reasoning
+Process called "function_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count_a:
+        Let fa be proc list_at with a, i
+        Let fb be proc list_at with b, i
+
+        Let name_a be proc dict_get with fa, "name"
+        Let name_b be proc dict_get with fb, "name"
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+
+        Let params_a be proc dict_get with fa, "parameters"
+        Let params_b be proc dict_get with fb, "parameters"
+        Let params_match be proc param_streams_equal with params_a, params_b
+        If params_match is not equal to 1:
+            Return 0
+        End If
+
+        Let results_a be proc dict_get with fa, "results"
+        Let results_b be proc dict_get with fb, "results"
+        Let results_match be proc result_streams_equal with results_a, results_b
+        If results_match is not equal to 1:
+            Return 0
+        End If
+
+        Let body_a be proc dict_get with fa, "body"
+        Let body_b be proc dict_get with fb, "body"
+        Let body_match be proc body_streams_equal with body_a, body_b
+        If body_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Two export streams are equal when they have the same length and the same public
+name plus internal reference at every position.
+@End Reasoning
+Process called "export_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count_a:
+        Let ea be proc list_at with a, i
+        Let eb be proc list_at with b, i
+
+        Let name_a be proc dict_get with ea, "name"
+        Let name_b be proc dict_get with eb, "name"
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+
+        Let int_a be proc dict_get with ea, "internal_name"
+        Let int_b be proc dict_get with eb, "internal_name"
+        Let ints_match be proc string_equals from StringCore with int_a, int_b
+        If ints_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "WebAssembly (WAT) translation round-trip"
+
+    Note:
+    Representative WAT snippet. Newlines are explicit \n in the Runa string
+    literal. The instruction heads (i32.add / local.get) are not keywords, so the
+    lexer classifies them as instruction mnemonics and the parser tags them
+    WASM_INSTRUCTION; the structural keywords (func / param / result / export)
+    drive the WasmNode classification in classify_head.
+    :End Note
+    Let source be "(module\n  (func $add (param $a i32) (param $b i32) (result i32)\n    (i32.add (local.get $a) (local.get $b)))\n  (export \"add\" (func $add)))\n"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc wasm_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR dictionary", hir1
+
+    Let type_value be proc dict_get with hir1, "type"
+    Let type_is_wasm be proc string_equals from StringCore with type_value, "wasm_module"
+    proc assert_equal from TestUtils with results, "HIR type is wasm_module", type_is_wasm, 1
+
+    Let functions1 be proc dict_get with hir1, "functions"
+    proc assert_not_null from TestUtils with results, "HIR carries a functions section", functions1
+    Let func_count1 be proc list_count with functions1
+    proc assert_equal from TestUtils with results, "1 function parsed", func_count1, 1
+
+    Let exports1 be proc dict_get with hir1, "exports"
+    Let export_count1 be proc list_count with exports1
+    proc assert_equal from TestUtils with results, "1 export parsed", export_count1, 1
+
+    Note: --- Stage 1 content: function $add signature ---
+    Let func0 be proc list_at with functions1, 0
+    Let func0_name be proc dict_get with func0, "name"
+    proc assert_string_equal from TestUtils with results, "function name is '$add'", func0_name, "$add"
+
+    Let params1 be proc dict_get with func0, "parameters"
+    Let param_count1 be proc list_count with params1
+    proc assert_equal from TestUtils with results, "function has 2 parameters", param_count1, 2
+
+    Let param0 be proc list_at with params1, 0
+    Let param0_name be proc dict_get with param0, "name"
+    proc assert_string_equal from TestUtils with results, "param[0] name is '$a'", param0_name, "$a"
+    Let param0_type be proc dict_get with param0, "param_type"
+    proc assert_string_equal from TestUtils with results, "param[0] type is 'i32'", param0_type, "i32"
+
+    Let param1 be proc list_at with params1, 1
+    Let param1_name be proc dict_get with param1, "name"
+    proc assert_string_equal from TestUtils with results, "param[1] name is '$b'", param1_name, "$b"
+    Let param1_type be proc dict_get with param1, "param_type"
+    proc assert_string_equal from TestUtils with results, "param[1] type is 'i32'", param1_type, "i32"
+
+    Let results_list1 be proc dict_get with func0, "results"
+    Let result_count1 be proc list_count with results_list1
+    proc assert_equal from TestUtils with results, "function has 1 result", result_count1, 1
+    Let result0 be proc list_at with results_list1, 0
+    Let result0_type be proc dict_get with result0, "result_type"
+    proc assert_string_equal from TestUtils with results, "result type is 'i32'", result0_type, "i32"
+
+    Note: --- Stage 1 content: folded body instruction (i32.add (local.get $a) (local.get $b)) ---
+    Let body1 be proc dict_get with func0, "body"
+    Let body_count1 be proc list_count with body1
+    proc assert_equal from TestUtils with results, "function body has 1 top-level instruction", body_count1, 1
+
+    Let add_instr be proc list_at with body1, 0
+    Let add_opcode be proc dict_get with add_instr, "opcode"
+    proc assert_string_equal from TestUtils with results, "body opcode is 'i32.add'", add_opcode, "i32.add"
+
+    Let add_ops be proc dict_get with add_instr, "operands"
+    Let add_opc be proc list_count with add_ops
+    proc assert_equal from TestUtils with results, "i32.add has 2 operands", add_opc, 2
+
+    Let nested0 be proc list_at with add_ops, 0
+    Let nested0_type be proc dict_get with nested0, "type"
+    proc assert_string_equal from TestUtils with results, "operand[0] is a nested instruction", nested0_type, "instruction"
+    Let nested0_op be proc dict_get with nested0, "opcode"
+    proc assert_string_equal from TestUtils with results, "operand[0] opcode is 'local.get'", nested0_op, "local.get"
+    Let nested0_args be proc dict_get with nested0, "operands"
+    Let nested0_arg0 be proc list_at with nested0_args, 0
+    Let nested0_arg0_val be proc dict_get with nested0_arg0, "value"
+    proc assert_string_equal from TestUtils with results, "operand[0] immediate is '$a'", nested0_arg0_val, "$a"
+
+    Let nested1 be proc list_at with add_ops, 1
+    Let nested1_op be proc dict_get with nested1, "opcode"
+    proc assert_string_equal from TestUtils with results, "operand[1] opcode is 'local.get'", nested1_op, "local.get"
+    Let nested1_args be proc dict_get with nested1, "operands"
+    Let nested1_arg0 be proc list_at with nested1_args, 0
+    Let nested1_arg0_val be proc dict_get with nested1_arg0, "value"
+    proc assert_string_equal from TestUtils with results, "operand[1] immediate is '$b'", nested1_arg0_val, "$b"
+
+    Note: --- Stage 1 content: export "add" -> $add ---
+    Let export0 be proc list_at with exports1, 0
+    Let export0_name be proc dict_get with export0, "name"
+    proc assert_string_equal from TestUtils with results, "export name is 'add'", export0_name, "add"
+    Let export0_internal be proc dict_get with export0, "internal_name"
+    proc assert_string_equal from TestUtils with results, "export internal name is '$add'", export0_internal, "$add"
+
+    Note: --- Stage 2: HIR -> WAT text ---
+    Let emitted be proc generate_wasm_from_hir from WasmBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced WAT text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted WAT is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted text -> HIR (the SECOND emission),
+    Note: then assert the section streams are structurally equal. This is the
+    Note: load-bearing round-trip assertion. ---
+    Let hir2 be proc wasm_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted WAT produced HIR", hir2
+
+    Let type_value2 be proc dict_get with hir2, "type"
+    Let type_is_wasm2 be proc string_equals from StringCore with type_value2, "wasm_module"
+    proc assert_equal from TestUtils with results, "re-parsed HIR type is wasm_module", type_is_wasm2, 1
+
+    Let functions2 be proc dict_get with hir2, "functions"
+    Let func_count2 be proc list_count with functions2
+    proc assert_equal from TestUtils with results, "re-parsed preserves 1 function", func_count2, 1
+
+    Let exports2 be proc dict_get with hir2, "exports"
+    Let export_count2 be proc list_count with exports2
+    proc assert_equal from TestUtils with results, "re-parsed preserves 1 export", export_count2, 1
+
+    Note: Spot-check survival on the SECOND emission directly (not just stage 1).
+    Let r_func0 be proc list_at with functions2, 0
+    Let r_func0_name be proc dict_get with r_func0, "name"
+    proc assert_string_equal from TestUtils with results, "round-trip function name survives", r_func0_name, "$add"
+
+    Let r_body be proc dict_get with r_func0, "body"
+    Let r_add_instr be proc list_at with r_body, 0
+    Let r_add_opcode be proc dict_get with r_add_instr, "opcode"
+    proc assert_string_equal from TestUtils with results, "round-trip body opcode survives", r_add_opcode, "i32.add"
+
+    Let r_export0 be proc list_at with exports2, 0
+    Let r_export0_name be proc dict_get with r_export0, "name"
+    proc assert_string_equal from TestUtils with results, "round-trip export name survives", r_export0_name, "add"
+
+    Note: --- Full structural equality across functions and exports ---
+    Let funcs_equal be proc function_streams_equal with functions1, functions2
+    proc assert_equal from TestUtils with results, "round-trip functions structurally equal", funcs_equal, 1
+
+    Let exports_equal be proc export_streams_equal with exports1, exports2
+    proc assert_equal from TestUtils with results, "round-trip exports structurally equal", exports_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

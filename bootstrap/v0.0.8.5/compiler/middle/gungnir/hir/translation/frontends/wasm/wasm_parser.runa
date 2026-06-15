@@ -74,7 +74,7 @@ Process called "destroy_wasm_node" takes node as Integer:
     Let i be 0
     While i is less than child_count:
         Let child be proc get from List with children, i
-        proc destroy_wasm_node from child
+        proc destroy_wasm_node with child
         Set i to i plus 1
     End While
     proc destroy from List with children
@@ -177,7 +177,7 @@ Fetch the current token; if null pointer return 0. Otherwise read the type tag f
 @End Implementation
 
 Process called "check_token_type" takes parser as Integer, token_type as Integer returns Integer:
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is equal to 0:
         Return 0
     End If
@@ -186,6 +186,86 @@ Process called "check_token_type" takes parser as Integer, token_type as Integer
         Return 1
     End If
     Return 0
+End Process
+
+@Reasoning:
+Compare a source-buffer lexeme view (pointer + length) against a NUL-terminated
+literal. parse_sexpr classifies the head keyword of every nested s-expression by
+its byte content, so the comparator must match the lexeme exactly - including
+length - to avoid "param" matching a "parameter"-like prefix.
+@End Reasoning
+
+@Implementation:
+Reject immediately if the lexeme length differs from the literal length, then
+compare byte-for-byte, short-circuiting to 0 on the first mismatch. Returns 1
+only on a full-length exact match.
+@End Implementation
+
+Process called "lexeme_equals" takes text as Integer, text_length as Integer, literal as String, literal_length as Integer returns Integer:
+    If text_length is not equal to literal_length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than text_length:
+        Let c1 be proc memory_get_byte from Layout with text, i
+        Let c2 be proc memory_get_byte from Layout with literal, i
+        If c1 is not equal to c2:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+WAT s-expressions are uniform "(head ...)" forms, but the head keyword
+determines the structural role of the construct (a function, a parameter, an
+export, an instruction, ...). Mapping the head lexeme onto the WasmNode tag at
+parse time lets the downstream translator dispatch on node_type without
+re-inspecting lexeme bytes, and - critically - lets wasm_to_hir's PARAM / RESULT
+/ LOCAL / IMPORT / EXPORT / TYPE handlers actually fire instead of every
+keyword-headed form collapsing into a single function tag.
+@End Reasoning
+
+@Implementation:
+Match the head lexeme against the structural WAT keywords in descending
+specificity. "func" -> WASM_FUNCTION, "param" -> WASM_PARAM, "result" ->
+WASM_RESULT, "local" -> WASM_LOCAL, "import" -> WASM_IMPORT, "export" ->
+WASM_EXPORT, "type" -> WASM_TYPE. Anything else (i32.add, local.get, call, nop,
+memory, global, table, ...) is an instruction or a construct the body treats
+uniformly as WASM_INSTRUCTION.
+@End Implementation
+
+Process called "classify_head" takes value_ptr as Integer, value_length as Integer returns Integer:
+    Let is_func be proc lexeme_equals with value_ptr, value_length, "func", 4
+    If is_func is equal to 1:
+        Return WASM_FUNCTION
+    End If
+    Let is_param be proc lexeme_equals with value_ptr, value_length, "param", 5
+    If is_param is equal to 1:
+        Return WASM_PARAM
+    End If
+    Let is_result be proc lexeme_equals with value_ptr, value_length, "result", 6
+    If is_result is equal to 1:
+        Return WASM_RESULT
+    End If
+    Let is_local be proc lexeme_equals with value_ptr, value_length, "local", 5
+    If is_local is equal to 1:
+        Return WASM_LOCAL
+    End If
+    Let is_import be proc lexeme_equals with value_ptr, value_length, "import", 6
+    If is_import is equal to 1:
+        Return WASM_IMPORT
+    End If
+    Let is_export be proc lexeme_equals with value_ptr, value_length, "export", 6
+    If is_export is equal to 1:
+        Return WASM_EXPORT
+    End If
+    Let is_type be proc lexeme_equals with value_ptr, value_length, "type", 4
+    If is_type is equal to 1:
+        Return WASM_TYPE
+    End If
+    Return WASM_INSTRUCTION
 End Process
 
 @Reasoning:
@@ -209,21 +289,35 @@ Process called "parse" takes parser as Integer returns Integer:
     If is_lparen is not equal to 1:
         Return 0
     End If
-    proc advance_token from parser
-    Let token be proc current_token from parser
+    proc advance_token with parser
+    Let token be proc current_token with parser
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_length be proc memory_get_int64 from Layout with token, 16
-    proc advance_token from parser
+    proc advance_token with parser
     Let module_node be proc create_wasm_node with WASM_MODULE, value_ptr, value_length
     While 1 is equal to 1:
-        Let is_rparen be proc check_token_type with parser, 2
-        If is_rparen is equal to 1:
-            proc advance_token from parser
+        Let body_token be proc current_token with parser
+        If body_token is equal to 0:
             Break
         End If
-        Let child be proc parse_sexpr from parser
-        If child is not equal to 0:
-            proc add_child with module_node, child
+        Let is_rparen be proc check_token_type with parser, 2
+        If is_rparen is equal to 1:
+            proc advance_token with parser
+            Break
+        End If
+        Let is_open be proc check_token_type with parser, 1
+        If is_open is not equal to 1:
+            Note: Forward-progress guard: a stray non-paren token at module level
+            Note: is not a valid section head. parse_sexpr would decline without
+            Note: consuming it, pinning this loop, so skip the token explicitly.
+            proc advance_token with parser
+        Otherwise:
+            Let child be proc parse_sexpr with parser
+            If child is not equal to 0:
+                proc add_child with module_node, child
+            Otherwise:
+                Break
+            End If
         End If
     End While
     Return module_node
@@ -234,7 +328,13 @@ WAT's grammar is uniformly s-expression - every nested construct is a parenthesi
 @End Reasoning
 
 @Implementation:
-After requiring "(", read the head identifier and classify it: "func" forms become WASM_FUNCTION nodes, everything else WASM_INSTRUCTION. Loop collecting children: nested "(" recurses, plain tokens become WASM_TYPE leaves, ")" terminates.
+After requiring "(", read the head lexeme and classify it via classify_head into
+the structural WasmNode tag (WASM_FUNCTION / WASM_PARAM / WASM_RESULT /
+WASM_LOCAL / WASM_IMPORT / WASM_EXPORT / WASM_TYPE / WASM_INSTRUCTION). The head
+lexeme is stored on the node value so the instruction translator can recover the
+opcode text. Loop collecting children: nested "(" recurses, plain tokens become
+WASM_TYPE leaves carrying their own lexeme, ")" terminates. A null token inside
+the body terminates the loop to keep an unbalanced input from spinning.
 @End Implementation
 
 @Performance_Hints:
@@ -242,7 +342,7 @@ O(n) tokens per call across the full recursion. Stack depth bounded by source ne
 @End Performance_Hints
 
 @Security_Scope:
-Pathologically deep s-expressions can exhaust the native stack. Callers parsing untrusted WAT should reject inputs whose paren-depth exceeds a configured limit before reaching this routine.
+Pathologically deep s-expressions can exhaust the native stack. Callers parsing untrusted WAT should reject inputs whose paren-depth exceeds a configured limit before reaching this routine. The body loop terminates on a null (exhausted) token so a missing closing paren cannot drive an unbounded loop.
 @End Security_Scope
 
 Process called "parse_sexpr" takes parser as Integer returns Integer:
@@ -250,41 +350,44 @@ Process called "parse_sexpr" takes parser as Integer returns Integer:
     If is_lparen is not equal to 1:
         Return 0
     End If
-    proc advance_token from parser
-    Let token be proc current_token from parser
+    proc advance_token with parser
+    Let token be proc current_token with parser
     If token is equal to 0:
         Return 0
     End If
-    Let token_type be proc memory_get_int64 from Layout with token, 0
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_length be proc memory_get_int64 from Layout with token, 16
-    proc advance_token from parser
-    Let node be 0
-    If token_type is equal to 3:
-        Set node to proc create_wasm_node with WASM_FUNCTION, value_ptr, value_length
-    Otherwise:
-        Set node to proc create_wasm_node with WASM_INSTRUCTION, value_ptr, value_length
-    End If
+    proc advance_token with parser
+    Let node_type be proc classify_head with value_ptr, value_length
+    Let node be proc create_wasm_node with node_type, value_ptr, value_length
     While 1 is equal to 1:
+        Let body_token be proc current_token with parser
+        If body_token is equal to 0:
+            Break
+        End If
         Let is_rparen be proc check_token_type with parser, 2
         If is_rparen is equal to 1:
-            proc advance_token from parser
+            proc advance_token with parser
             Break
         End If
         Set is_lparen to proc check_token_type with parser, 1
         If is_lparen is equal to 1:
-            Let child be proc parse_sexpr from parser
+            Let child be proc parse_sexpr with parser
             If child is not equal to 0:
                 proc add_child with node, child
+            Otherwise:
+                Note: parse_sexpr declines only when the current token is not an
+                Note: opening paren; since we just checked it IS one, a 0 return
+                Note: means the stream is exhausted. Stop to preserve progress.
+                Break
             End If
         Otherwise:
-            Let leaf_token be proc current_token from parser
-            Let leaf_type be proc memory_get_int64 from Layout with leaf_token, 0
+            Let leaf_token be proc current_token with parser
             Let leaf_value_ptr be proc memory_get_int64 from Layout with leaf_token, 8
             Let leaf_value_length be proc memory_get_int64 from Layout with leaf_token, 16
             Let leaf_node be proc create_wasm_node with WASM_TYPE, leaf_value_ptr, leaf_value_length
             proc add_child with node, leaf_node
-            proc advance_token from parser
+            proc advance_token with parser
         End If
     End While
     Return node

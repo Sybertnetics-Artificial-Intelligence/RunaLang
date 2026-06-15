@@ -10,6 +10,7 @@ Import "compiler/middle/gungnir/hir/translation/frontends/wasm/wasm_parser.runa"
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: WASM node type constants (must match wasm_parser.runa)
@@ -59,18 +60,25 @@ Process called "translate_wasm_to_hir" takes wasm_ast as Integer returns Integer
         Return hir  Note: Not a module node, return empty HIR
     End If
 
-    Note: Extract module name if present
-    Let value_ptr be proc memory_get_int64 from Layout with wasm_ast, 8
-    Let value_length be proc memory_get_int64 from Layout with wasm_ast, 16
-    If value_length is greater than 0:
-        Let name_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with hir, name_key, name_str
-    End If
-
     Note: Translate child nodes
     Let children be proc memory_get_int64 from Layout with wasm_ast, 24
     Let child_count be proc size from List with children
+
+    Note:
+    Extract the optional module name. The parser stores the head keyword
+    ("module") on the node value, so the symbolic module name - when present -
+    is the first child and is recognisable by its leading '$'. Capturing it as
+    "name" lets the backend re-emit "(module $name" identically.
+    :End Note
+    If child_count is greater than 0:
+        Let first_child be proc get from List with children, 0
+        Let first_is_name be proc child_is_dollar_name with first_child
+        If first_is_name is equal to 1:
+            Let mod_name_str be proc node_lexeme_string with first_child
+            Let mod_name_key be proc create_string_literal with "name"
+            proc set from Dict with hir, mod_name_key, mod_name_str
+        End If
+    End If
 
     Note: Create lists for different node types
     Let functions be proc create from List
@@ -84,31 +92,40 @@ Process called "translate_wasm_to_hir" takes wasm_ast as Integer returns Integer
         Let child be proc get from List with children, i
         Let child_type be proc memory_get_int64 from Layout with child, 0
 
+        Note:
+        A module-level '$name' leaf carries the WASM_TYPE tag (the parser tags
+        every bare leaf token that way) but is the module name, not a type
+        declaration. Skip it so it is not mistranslated into a bogus type entry.
+        :End Note
+        Let is_name_leaf be proc child_is_dollar_name with child
+
         If child_type is equal to WASM_FUNCTION:
-            Let func_hir be proc translate_function from child
+            Let func_hir be proc translate_function with child
             If func_hir is not equal to 0:
                 proc push from List with functions, func_hir
             End If
         End If
 
         If child_type is equal to WASM_IMPORT:
-            Let import_hir be proc translate_import from child
+            Let import_hir be proc translate_import with child
             If import_hir is not equal to 0:
                 proc push from List with imports, import_hir
             End If
         End If
 
         If child_type is equal to WASM_EXPORT:
-            Let export_hir be proc translate_export from child
+            Let export_hir be proc translate_export with child
             If export_hir is not equal to 0:
                 proc push from List with exports, export_hir
             End If
         End If
 
         If child_type is equal to WASM_TYPE:
-            Let type_hir be proc translate_type from child
-            If type_hir is not equal to 0:
-                proc push from List with types, type_hir
+            If is_name_leaf is not equal to 1:
+                Let type_hir be proc translate_type with child
+                If type_hir is not equal to 0:
+                    proc push from List with types, type_hir
+                End If
             End If
         End If
 
@@ -136,7 +153,12 @@ A WAT function bundles params, results, locals, and an instruction body; mapping
 @End Reasoning
 
 @Implementation:
-Allocate a Dictionary tagged type=function, copy the optional $name from the node value. Iterate children, dispatching WASM_PARAM/RESULT/LOCAL/INSTRUCTION into four pre-allocated Lists. Attach them at keys parameters / results / locals / body.
+Allocate a Dictionary tagged type=function. The parser stores the "func"
+keyword on the node value, so the optional symbolic name is the first child when
+it is a '$'-leaf; capture it at "name". Iterate the remaining children,
+dispatching WASM_PARAM/RESULT/LOCAL into their translators and treating every
+sub-sexpr that is not one of those structural keywords as a body instruction.
+Attach the four Lists at keys parameters / results / locals / body.
 @End Implementation
 
 @Performance_Hints:
@@ -153,54 +175,70 @@ Process called "translate_function" takes func_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "function"
     proc set from Dict with func_hir, type_key, type_value
 
-    Note: Extract function name
-    Let value_ptr be proc memory_get_int64 from Layout with func_node, 8
-    Let value_length be proc memory_get_int64 from Layout with func_node, 16
-    If value_length is greater than 0:
-        Let name_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with func_hir, name_key, name_str
-    End If
-
     Note: Process function children (params, locals, results, instructions)
     Let children be proc memory_get_int64 from Layout with func_node, 24
     Let child_count be proc size from List with children
+
+    Note:
+    Extract the optional function name: the first child, when it is a '$'-leaf,
+    is the symbolic binding ($add). Record it and start the structural scan past
+    it so the name is not mistaken for a body instruction.
+    :End Note
+    Let scan_start be 0
+    If child_count is greater than 0:
+        Let first_child be proc get from List with children, 0
+        Let first_is_name be proc child_is_dollar_name with first_child
+        If first_is_name is equal to 1:
+            Let name_str be proc node_lexeme_string with first_child
+            Let name_key be proc create_string_literal with "name"
+            proc set from Dict with func_hir, name_key, name_str
+            Set scan_start to 1
+        End If
+    End If
 
     Let params be proc create from List
     Let results be proc create from List
     Let locals be proc create from List
     Let body be proc create from List
 
-    Let i be 0
+    Let i be scan_start
     While i is less than child_count:
         Let child be proc get from List with children, i
         Let child_type be proc memory_get_int64 from Layout with child, 0
 
         If child_type is equal to WASM_PARAM:
-            Let param_hir be proc translate_param from child
+            Let param_hir be proc translate_param with child
             If param_hir is not equal to 0:
                 proc push from List with params, param_hir
             End If
-        End If
-
-        If child_type is equal to WASM_RESULT:
-            Let result_hir be proc translate_result from child
-            If result_hir is not equal to 0:
-                proc push from List with results, result_hir
-            End If
-        End If
-
-        If child_type is equal to WASM_LOCAL:
-            Let local_hir be proc translate_local from child
-            If local_hir is not equal to 0:
-                proc push from List with locals, local_hir
-            End If
-        End If
-
-        If child_type is equal to WASM_INSTRUCTION:
-            Let instr_hir be proc translate_instruction from child
-            If instr_hir is not equal to 0:
-                proc push from List with body, instr_hir
+        Otherwise:
+            If child_type is equal to WASM_RESULT:
+                Let result_hir be proc translate_result with child
+                If result_hir is not equal to 0:
+                    proc push from List with results, result_hir
+                End If
+            Otherwise:
+                If child_type is equal to WASM_LOCAL:
+                    Let local_hir be proc translate_local with child
+                    If local_hir is not equal to 0:
+                        proc push from List with locals, local_hir
+                    End If
+                Otherwise:
+                    Note:
+                    Any other sub-sexpr in a function body is an instruction -
+                    folded forms like (i32.add (local.get $a) (i32.const 1)) and
+                    flat forms like (return) alike. classify_head tagged them
+                    WASM_INSTRUCTION (or, for heads named "type", WASM_TYPE if a
+                    typeuse appears; those are skipped here as they carry no body
+                    semantics for the round trip).
+                    :End Note
+                    If child_type is equal to WASM_INSTRUCTION:
+                        Let instr_hir be proc translate_instruction with child
+                        If instr_hir is not equal to 0:
+                            proc push from List with body, instr_hir
+                        End If
+                    End If
+                End If
             End If
         End If
 
@@ -228,7 +266,10 @@ WAT params are "(param $name? type)"; the optional $name lives on the param node
 @End Reasoning
 
 @Implementation:
-Allocate a Dictionary tagged type=parameter. If the param node carries a non-empty lexeme, store it at "name". If it has at least one child (the type token), materialize its lexeme into a String and store at "param_type".
+Allocate a Dictionary tagged type=parameter. The parser stores the "param"
+keyword on the node value, so the name and value type are both children: an
+optional leading '$'-leaf is the name (stored at "name"), and the following leaf
+is the i32/i64/f32/f64 value type (stored at "param_type").
 @End Implementation
 
 Process called "translate_param" takes param_node as Integer returns Integer:
@@ -240,23 +281,25 @@ Process called "translate_param" takes param_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "parameter"
     proc set from Dict with param_hir, type_key, type_value
 
-    Note: Extract parameter name (if present, starts with $)
-    Let value_ptr be proc memory_get_int64 from Layout with param_node, 8
-    Let value_length be proc memory_get_int64 from Layout with param_node, 16
-    If value_length is greater than 0:
-        Let name_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with param_hir, name_key, name_str
-    End If
-
-    Note: Get parameter type from children
+    Note: Children are [optional $name][value type]; split on the leading '$'.
     Let children be proc memory_get_int64 from Layout with param_node, 24
     Let child_count be proc size from List with children
+
+    Let type_index be 0
     If child_count is greater than 0:
-        Let type_child be proc get from List with children, 0
-        Let type_ptr be proc memory_get_int64 from Layout with type_child, 8
-        Let type_len be proc memory_get_int64 from Layout with type_child, 16
-        Let type_str be proc create_string_from_buffer from StringCore with type_ptr, type_len
+        Let first_child be proc get from List with children, 0
+        Let first_is_name be proc child_is_dollar_name with first_child
+        If first_is_name is equal to 1:
+            Let name_str be proc node_lexeme_string with first_child
+            Let name_key be proc create_string_literal with "name"
+            proc set from Dict with param_hir, name_key, name_str
+            Set type_index to 1
+        End If
+    End If
+
+    If type_index is less than child_count:
+        Let type_child be proc get from List with children, type_index
+        Let type_str be proc node_lexeme_string with type_child
         Let param_type_key be proc create_string_literal with "param_type"
         proc set from Dict with param_hir, param_type_key, type_str
     End If
@@ -281,14 +324,12 @@ Process called "translate_result" takes result_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "result"
     proc set from Dict with result_hir, type_key, type_value
 
-    Note: Get result type from children
+    Note: Get result type from children (result has no name; type is child 0).
     Let children be proc memory_get_int64 from Layout with result_node, 24
     Let child_count be proc size from List with children
     If child_count is greater than 0:
         Let type_child be proc get from List with children, 0
-        Let type_ptr be proc memory_get_int64 from Layout with type_child, 8
-        Let type_len be proc memory_get_int64 from Layout with type_child, 16
-        Let type_str be proc create_string_from_buffer from StringCore with type_ptr, type_len
+        Let type_str be proc node_lexeme_string with type_child
         Let result_type_key be proc create_string_literal with "result_type"
         proc set from Dict with result_hir, result_type_key, type_str
     End If
@@ -301,7 +342,10 @@ WAT locals share the shape of params - optional $name followed by a value type -
 @End Reasoning
 
 @Implementation:
-Allocate a Dictionary tagged type=local. Copy the node's lexeme to "name" if present. If at least one child exists, materialize the type token's lexeme into a String and store at "local_type".
+Allocate a Dictionary tagged type=local. The parser stores the "local" keyword
+on the node value, so name and value type are both children, mirroring
+translate_param: an optional leading '$'-leaf is the name (stored at "name") and
+the next leaf is the value type (stored at "local_type").
 @End Implementation
 
 Process called "translate_local" takes local_node as Integer returns Integer:
@@ -313,23 +357,25 @@ Process called "translate_local" takes local_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "local"
     proc set from Dict with local_hir, type_key, type_value
 
-    Note: Extract local name (if present, starts with $)
-    Let value_ptr be proc memory_get_int64 from Layout with local_node, 8
-    Let value_length be proc memory_get_int64 from Layout with local_node, 16
-    If value_length is greater than 0:
-        Let name_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with local_hir, name_key, name_str
-    End If
-
-    Note: Get local type from children
+    Note: Children are [optional $name][value type]; split on the leading '$'.
     Let children be proc memory_get_int64 from Layout with local_node, 24
     Let child_count be proc size from List with children
+
+    Let type_index be 0
     If child_count is greater than 0:
-        Let type_child be proc get from List with children, 0
-        Let type_ptr be proc memory_get_int64 from Layout with type_child, 8
-        Let type_len be proc memory_get_int64 from Layout with type_child, 16
-        Let type_str be proc create_string_from_buffer from StringCore with type_ptr, type_len
+        Let first_child be proc get from List with children, 0
+        Let first_is_name be proc child_is_dollar_name with first_child
+        If first_is_name is equal to 1:
+            Let name_str be proc node_lexeme_string with first_child
+            Let name_key be proc create_string_literal with "name"
+            proc set from Dict with local_hir, name_key, name_str
+            Set type_index to 1
+        End If
+    End If
+
+    If type_index is less than child_count:
+        Let type_child be proc get from List with children, type_index
+        Let type_str be proc node_lexeme_string with type_child
         Let local_type_key be proc create_string_literal with "local_type"
         proc set from Dict with local_hir, local_type_key, type_str
     End If
@@ -362,11 +408,10 @@ Process called "translate_instruction" takes instr_node as Integer returns Integ
     Let type_value be proc create_string_literal with "instruction"
     proc set from Dict with instr_hir, type_key, type_value
 
-    Note: Extract instruction opcode/name
-    Let value_ptr be proc memory_get_int64 from Layout with instr_node, 8
+    Note: Extract instruction opcode/name (the head lexeme on the node value).
     Let value_length be proc memory_get_int64 from Layout with instr_node, 16
     If value_length is greater than 0:
-        Let opcode_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
+        Let opcode_str be proc node_lexeme_string with instr_node
         Let opcode_key be proc create_string_literal with "opcode"
         proc set from Dict with instr_hir, opcode_key, opcode_str
     End If
@@ -385,15 +430,13 @@ Process called "translate_instruction" takes instr_node as Integer returns Integ
 
             If child_type is equal to WASM_INSTRUCTION:
                 Note: Nested instruction
-                Let nested_hir be proc translate_instruction from child
+                Let nested_hir be proc translate_instruction with child
                 If nested_hir is not equal to 0:
                     proc push from List with operands, nested_hir
                 End If
             Otherwise:
                 Note: Immediate value or type
-                Let operand_ptr be proc memory_get_int64 from Layout with child, 8
-                Let operand_len be proc memory_get_int64 from Layout with child, 16
-                Let operand_str be proc create_string_from_buffer from StringCore with operand_ptr, operand_len
+                Let operand_str be proc node_lexeme_string with child
 
                 Let operand_dict be proc create from Dict
                 Let operand_type_key be proc create_string_literal with "type"
@@ -421,7 +464,13 @@ WAT imports have the form "(import "module" "name" desc...)"; positional childre
 @End Reasoning
 
 @Implementation:
-Build a Dictionary tagged type=import. Module string lives on the import node's lexeme - store at "module". For children: index 0 -> "name", index 1 -> "descriptor"; additional children are ignored to mirror WAT's grammar.
+Build a Dictionary tagged type=import. The parser stores the "import" keyword on
+the node value, so both the module string and the field name are quoted-string
+children: child 0 -> "module", child 1 -> "name" (quotes stripped). The third
+child is the import descriptor s-expression; its head lexeme (e.g. "func",
+"memory", "global") is recorded at "descriptor" so the backend re-emits a
+non-empty descriptor token. Additional children are ignored to mirror WAT's
+grammar.
 @End Implementation
 
 @Security_Scope:
@@ -437,38 +486,30 @@ Process called "translate_import" takes import_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "import"
     proc set from Dict with import_hir, type_key, type_value
 
-    Note: Extract import details from value
-    Let value_ptr be proc memory_get_int64 from Layout with import_node, 8
-    Let value_length be proc memory_get_int64 from Layout with import_node, 16
-    If value_length is greater than 0:
-        Let import_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let module_key be proc create_string_literal with "module"
-        proc set from Dict with import_hir, module_key, import_str
-    End If
-
-    Note: Process import children (name, type, signature)
+    Note: Process import children: "module" string, "name" string, descriptor.
     Let children be proc memory_get_int64 from Layout with import_node, 24
     Let child_count be proc size from List with children
 
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc get from List with children, i
-        Let child_ptr be proc memory_get_int64 from Layout with child, 8
-        Let child_len be proc memory_get_int64 from Layout with child, 16
-        Let child_str be proc create_string_from_buffer from StringCore with child_ptr, child_len
+    If child_count is greater than 0:
+        Let module_child be proc get from List with children, 0
+        Let module_str be proc child_string_literal_value with module_child
+        Let module_key be proc create_string_literal with "module"
+        proc set from Dict with import_hir, module_key, module_str
+    End If
 
-        If i is equal to 0:
-            Let name_key be proc create_string_literal with "name"
-            proc set from Dict with import_hir, name_key, child_str
-        End If
+    If child_count is greater than 1:
+        Let name_child be proc get from List with children, 1
+        Let name_str be proc child_string_literal_value with name_child
+        Let name_key be proc create_string_literal with "name"
+        proc set from Dict with import_hir, name_key, name_str
+    End If
 
-        If i is equal to 1:
-            Let desc_key be proc create_string_literal with "descriptor"
-            proc set from Dict with import_hir, desc_key, child_str
-        End If
-
-        Set i to i plus 1
-    End While
+    If child_count is greater than 2:
+        Let desc_child be proc get from List with children, 2
+        Let desc_str be proc node_lexeme_string with desc_child
+        Let desc_key be proc create_string_literal with "descriptor"
+        proc set from Dict with import_hir, desc_key, desc_str
+    End If
 
     Return import_hir
 End Process
@@ -478,7 +519,13 @@ WAT exports are "(export "name" (kind $internal))"; the public name is stored on
 @End Reasoning
 
 @Implementation:
-Allocate a Dictionary tagged type=export. Store the export node's lexeme at "name". If at least one child exists, materialize the internal name lexeme as a String and store at "internal_name".
+Allocate a Dictionary tagged type=export. The parser stores the "export" keyword
+on the node value, so the public name is the first quoted-string child (quotes
+stripped, stored at "name"). The second child is the export descriptor, which on
+the first emission is a folded "(func $internal)" s-expression and on a re-parse
+of the backend's canonical "(export "name" $internal)" form is a bare
+'$internal' leaf. extract_internal_name normalises both shapes to the bare
+'$internal' lexeme so the round trip converges, storing it at "internal_name".
 @End Implementation
 
 @Security_Scope:
@@ -494,24 +541,20 @@ Process called "translate_export" takes export_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "export"
     proc set from Dict with export_hir, type_key, type_value
 
-    Note: Extract export name
-    Let value_ptr be proc memory_get_int64 from Layout with export_node, 8
-    Let value_length be proc memory_get_int64 from Layout with export_node, 16
-    If value_length is greater than 0:
-        Let export_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with export_hir, name_key, export_str
-    End If
-
-    Note: Process export children (internal name, descriptor)
+    Note: Process export children: public "name" string, then the descriptor.
     Let children be proc memory_get_int64 from Layout with export_node, 24
     Let child_count be proc size from List with children
 
     If child_count is greater than 0:
-        Let child be proc get from List with children, 0
-        Let child_ptr be proc memory_get_int64 from Layout with child, 8
-        Let child_len be proc memory_get_int64 from Layout with child, 16
-        Let internal_str be proc create_string_from_buffer from StringCore with child_ptr, child_len
+        Let name_child be proc get from List with children, 0
+        Let name_str be proc child_string_literal_value with name_child
+        Let name_key be proc create_string_literal with "name"
+        proc set from Dict with export_hir, name_key, name_str
+    End If
+
+    If child_count is greater than 1:
+        Let desc_child be proc get from List with children, 1
+        Let internal_str be proc extract_internal_name with desc_child
         Let internal_key be proc create_string_literal with "internal_name"
         proc set from Dict with export_hir, internal_key, internal_str
     End If
@@ -520,11 +563,55 @@ Process called "translate_export" takes export_node as Integer returns Integer:
 End Process
 
 @Reasoning:
+An export descriptor reaches translation in two shapes across a round trip: the
+authored "(func $name)" folded s-expression on the first pass, and the backend's
+canonical "(export "name" $name)" bare-leaf form on the second. Normalising both
+to the bare '$name' lexeme is what makes generate_wasm_from_hir a fixed point on
+exports: emit "(export "name" $name)" once, and every subsequent parse-emit
+cycle reproduces it byte-stably at the structural level.
+@End Reasoning
+
+@Implementation:
+If the descriptor node has no children it is already the bare '$name' leaf, so
+return its lexeme directly. Otherwise it is a folded "(kind $name)" form whose
+first '$'-leaf child carries the internal binding name; scan the children for
+that leaf and return its lexeme. Falling back to the descriptor head lexeme keeps
+the result non-empty for malformed descriptors that carry no '$'-leaf.
+@End Implementation
+
+Process called "extract_internal_name" takes desc_node as Integer returns Integer:
+    If desc_node is equal to 0:
+        Return proc create_string_literal with ""
+    End If
+    Let children be proc memory_get_int64 from Layout with desc_node, 24
+    Let child_count be proc size from List with children
+    If child_count is equal to 0:
+        Return proc node_lexeme_string with desc_node
+    End If
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc get from List with children, i
+        Let is_name be proc child_is_dollar_name with child
+        If is_name is equal to 1:
+            Return proc node_lexeme_string with child
+        End If
+        Set i to i plus 1
+    End While
+    Return proc node_lexeme_string with desc_node
+End Process
+
+@Reasoning:
 WAT type declarations bundle params and results into a reusable function signature; HIR splits them into parallel Lists of raw type strings to make the signature directly inspectable.
 @End Reasoning
 
 @Implementation:
-Dictionary tagged type=type_declaration. Store the optional name lexeme. Walk children: WASM_PARAM lexemes are appended to the params List, WASM_RESULT lexemes to the results List. Attach both Lists at "parameters" / "results".
+Dictionary tagged type=type_declaration. The parser stores the "type" keyword on
+the node value, so the optional signature name is the leading '$'-leaf child
+(stored at "name"). The signature itself lives inside a folded "(func ...)" child
+whose WASM_PARAM / WASM_RESULT children each carry a value-type leaf. Collect
+those value-type strings into the params / results Lists the backend expects, so
+the emitted "(param T)" / "(result T)" forms carry concrete types rather than
+the structural keyword.
 @End Implementation
 
 Process called "translate_type" takes type_node as Integer returns Integer:
@@ -536,41 +623,37 @@ Process called "translate_type" takes type_node as Integer returns Integer:
     Let type_value be proc create_string_literal with "type_declaration"
     proc set from Dict with type_hir, type_key, type_value
 
-    Note: Extract type name/index
-    Let value_ptr be proc memory_get_int64 from Layout with type_node, 8
-    Let value_length be proc memory_get_int64 from Layout with type_node, 16
-    If value_length is greater than 0:
-        Let type_str be proc create_string_from_buffer from StringCore with value_ptr, value_length
-        Let name_key be proc create_string_literal with "name"
-        proc set from Dict with type_hir, name_key, type_str
-    End If
-
-    Note: Process type signature (params and results)
     Let children be proc memory_get_int64 from Layout with type_node, 24
     Let child_count be proc size from List with children
+
+    Note: Optional signature name is the leading '$'-leaf.
+    Let sig_start be 0
+    If child_count is greater than 0:
+        Let first_child be proc get from List with children, 0
+        Let first_is_name be proc child_is_dollar_name with first_child
+        If first_is_name is equal to 1:
+            Let name_str be proc node_lexeme_string with first_child
+            Let name_key be proc create_string_literal with "name"
+            proc set from Dict with type_hir, name_key, name_str
+            Set sig_start to 1
+        End If
+    End If
 
     Let params be proc create from List
     Let results be proc create from List
 
-    Let i be 0
+    Note:
+    Collect param / result value types. They sit inside the folded "(func ...)"
+    child of the type declaration, so descend into any WASM_FUNCTION child and
+    read each WASM_PARAM / WASM_RESULT node's value-type leaf.
+    :End Note
+    Let i be sig_start
     While i is less than child_count:
         Let child be proc get from List with children, i
         Let child_type be proc memory_get_int64 from Layout with child, 0
-
-        If child_type is equal to WASM_PARAM:
-            Let param_ptr be proc memory_get_int64 from Layout with child, 8
-            Let param_len be proc memory_get_int64 from Layout with child, 16
-            Let param_str be proc create_string_from_buffer from StringCore with param_ptr, param_len
-            proc push from List with params, param_str
+        If child_type is equal to WASM_FUNCTION:
+            proc collect_signature_types with child, params, results
         End If
-
-        If child_type is equal to WASM_RESULT:
-            Let result_ptr be proc memory_get_int64 from Layout with child, 8
-            Let result_len be proc memory_get_int64 from Layout with child, 16
-            Let result_str be proc create_string_from_buffer from StringCore with result_ptr, result_len
-            proc push from List with results, result_str
-        End If
-
         Set i to i plus 1
     End While
 
@@ -584,13 +667,161 @@ Process called "translate_type" takes type_node as Integer returns Integer:
 End Process
 
 @Reasoning:
+A WAT function type's parameter and result value types live one level below the
+"(func ...)" wrapper inside a "(type ...)" declaration. Factoring the descent
+into a helper keeps translate_type readable and lets the value-type extraction
+reuse the same name/type splitting logic the standalone param / local
+translators use.
+@End Reasoning
+
+@Implementation:
+Walk the func node's children. For each WASM_PARAM, the value type is the leaf
+after an optional '$'-name; for each WASM_RESULT, it is the single leaf. Append
+each materialised value-type String to the corresponding List.
+@End Implementation
+
+Process called "collect_signature_types" takes func_node as Integer, params as Integer, results as Integer:
+    Let children be proc memory_get_int64 from Layout with func_node, 24
+    Let child_count be proc size from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc get from List with children, i
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+        If child_type is equal to WASM_PARAM:
+            Let p_str be proc value_type_of with child
+            proc push from List with params, p_str
+        End If
+        If child_type is equal to WASM_RESULT:
+            Let r_str be proc value_type_of with child
+            proc push from List with results, r_str
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A WAT "(param $x i32)" or "(result i32)" carries its value type as the final
+leaf after an optional '$'-name. Extracting just that type leaf gives the raw
+type string the type-declaration emitter and signature consumers expect.
+@End Reasoning
+
+@Implementation:
+Read the node's children; the value-type leaf is the last child when present.
+Materialise its lexeme as a String, falling back to an empty literal when the
+node has no children.
+@End Implementation
+
+Process called "value_type_of" takes node as Integer returns Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    Let child_count be proc size from List with children
+    If child_count is equal to 0:
+        Return proc create_string_literal with ""
+    End If
+    Let last_index be child_count minus 1
+    Let type_child be proc get from List with children, last_index
+    Return proc node_lexeme_string with type_child
+End Process
+
+@Reasoning:
 String-literal allocation is a single delegation but is wrapped here so that future changes to the canonical key-construction path (e.g., interning) only touch one call site.
 @End Reasoning
 
 @Implementation:
-Forward to StringCore.create_string_from_literal and return its pointer.
+Forward to StringCore.create_from_literal and return its pointer.
 @End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
-    Return proc create_string_from_literal from StringCore with value
+    Return proc create_from_literal from StringCore with value
+End Process
+
+@Reasoning:
+WasmNode lexemes are non-owning views into the source buffer (a pointer plus a
+byte length). Translating a node into HIR requires materialising that view as a
+heap String so the dictionary owns its own copy independent of the source
+buffer's lifetime. Centralising the slice-to-String conversion keeps every
+accessor consistent and routes through StringPrim, matching the sibling assembly
+frontends.
+@End Reasoning
+
+@Implementation:
+Read the node's value pointer (offset 8) and length (offset 16). When the length
+is positive, materialise the slice via StringPrim.string_substring with start 0
+and the recorded length. A zero length yields an empty String literal so callers
+can store the result without a null check.
+@End Implementation
+
+Process called "node_lexeme_string" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return proc create_string_literal with ""
+    End If
+    Let value_ptr be proc memory_get_int64 from Layout with node, 8
+    Let value_length be proc memory_get_int64 from Layout with node, 16
+    If value_length is greater than 0:
+        Return proc string_substring from StringPrim with value_ptr, 0, value_length
+    End If
+    Return proc create_string_literal with ""
+End Process
+
+@Reasoning:
+WAT symbolic identifiers begin with '$' ($add, $p, $x) while value-type tokens
+(i32, f64) and quoted strings do not. Several translators need to tell whether a
+leaf child is a name binding or a type token, and the leading '$' is the
+unambiguous discriminator the lexer preserves in the lexeme bytes.
+@End Reasoning
+
+@Implementation:
+Inspect the first byte of the child's lexeme; return 1 when it is ASCII '$' (36)
+and the lexeme is non-empty, 0 otherwise.
+@End Implementation
+
+Process called "child_is_dollar_name" takes child as Integer returns Integer:
+    If child is equal to 0:
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Layout with child, 8
+    Let value_length be proc memory_get_int64 from Layout with child, 16
+    If value_length is less than 1:
+        Return 0
+    End If
+    Let first_byte be proc memory_get_byte from Layout with value_ptr, 0
+    If first_byte is equal to 36:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+WAT string literals are wrapped in double quotes in the source, and the lexer
+preserves the surrounding quotes in the lexeme view. Import module / name fields
+and export public names are quoted strings whose quotes must be stripped before
+they become HIR String values, otherwise the backend re-quotes an already-quoted
+token and the round trip drifts.
+@End Reasoning
+
+@Implementation:
+When the child lexeme is at least two bytes and both the first and last bytes are
+ASCII double-quote (34), materialise the interior span (offset 1, length minus 2)
+as a String. Otherwise fall back to the full lexeme so non-quoted tokens pass
+through unchanged.
+@End Implementation
+
+Process called "child_string_literal_value" takes child as Integer returns Integer:
+    If child is equal to 0:
+        Return proc create_string_literal with ""
+    End If
+    Let value_ptr be proc memory_get_int64 from Layout with child, 8
+    Let value_length be proc memory_get_int64 from Layout with child, 16
+    If value_length is greater than or equal to 2:
+        Let first_byte be proc memory_get_byte from Layout with value_ptr, 0
+        Let last_index be value_length minus 1
+        Let last_byte be proc memory_get_byte from Layout with value_ptr, last_index
+        If first_byte is equal to 34:
+            If last_byte is equal to 34:
+                Let inner_ptr be value_ptr plus 1
+                Let inner_length be value_length minus 2
+                Return proc string_substring from StringPrim with inner_ptr, 0, inner_length
+            End If
+        End If
+    End If
+    Return proc node_lexeme_string with child
 End Process
