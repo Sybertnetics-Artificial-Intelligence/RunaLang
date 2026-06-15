@@ -168,7 +168,7 @@ Process called "tokenize" takes lexer as Integer:
     Note: Tokenize complete regex pattern
 
     While 1 is equal to 1:
-        Let token be proc next_token from lexer
+        Let token be proc next_token with lexer
 
         If token is equal to 0:
             Break
@@ -212,19 +212,18 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     Note: Check for backslash (escape or special class)
     If char is equal to 92:  Note: \
-        Return proc lex_backslash from lexer
+        Return proc lex_backslash with lexer
     End If
 
     Note: Check for character class start
     If char is equal to 91:  Note: [
-        proc memory_set_int64 from Layout with lexer, 16, position + 1
-        Return proc create_token with TOKEN_CHAR_CLASS_START, source plus position, 1, position
+        Return proc lex_char_class with lexer
     End If
 
-    Note: Check for character class end
+    Note: Check for character class end (bare ']' outside a class is a literal)
     If char is equal to 93:  Note: ]
         proc memory_set_int64 from Layout with lexer, 16, position + 1
-        Return proc create_token with TOKEN_CHAR_CLASS_END, source plus position, 1, position
+        Return proc create_token with TOKEN_LITERAL, source plus position, 1, position
     End If
 
     Note: Check for quantifiers
@@ -244,7 +243,7 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 123:  Note: {
-        Return proc lex_quantifier_range from lexer
+        Return proc lex_quantifier_range with lexer
     End If
 
     Note: Check for anchors
@@ -260,7 +259,7 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     Note: Check for group start
     If char is equal to 40:  Note: (
-        Return proc lex_group_start from lexer
+        Return proc lex_group_start with lexer
     End If
 
     Note: Check for group end
@@ -374,13 +373,13 @@ Process called "lex_backslash" takes lexer as Integer returns Integer:
     Note: Check for backreferences (digits)
     If next_char is greater than or equal to 48:
         If next_char is less than or equal to 57:  Note: 0-9
-            Return proc lex_backreference from lexer
+            Return proc lex_backreference with lexer
         End If
     End If
 
     Note: Check for named backreference \k<name>
     If next_char is equal to 107:  Note: k
-        Return proc lex_named_backreference from lexer
+        Return proc lex_named_backreference with lexer
     End If
 
     Note: Otherwise, it's an escaped literal character
@@ -408,7 +407,7 @@ Process called "lex_quantifier_range" takes lexer as Integer returns Integer:
     Note: Lex quantifier range {n}, {n,}, {n,m}
 
     Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with source, 0
+    Let source be proc memory_get_int64 from Layout with lexer, 0
     Let source_length be proc memory_get_int64 from Layout with lexer, 8
 
     Let start_pos be position
@@ -430,6 +429,73 @@ Process called "lex_quantifier_range" takes lexer as Integer returns Integer:
 
     Let length be position minus start_pos
     Return proc create_token with TOKEN_QUANTIFIER_RANGE, source plus start_pos, length, start_pos
+End Process
+
+Note: ========================================
+Note: Character Class Lexing
+Note: ========================================
+
+@Reasoning:
+A PCRE character class "[...]" is an opaque region whose interior bytes (ranges like a-z, shorthand escapes like \d, negation "^", a leading literal "]") are reproduced verbatim downstream; lexing the whole bracketed span into one token keeps the parser's class handling to a single consume and preserves the exact source so the round trip is byte-faithful.
+@End Reasoning
+
+@Implementation:
+Record start_pos at '['. Advance past '['. Honour PCRE's first-character rules: an immediate '^' (negation) is consumed and a ']' that appears first (or first after '^') is a literal member, not the terminator. Then scan: a backslash (92) escapes the next byte (consume both); a ']' (93) closes the class (consume it and stop); any other byte is consumed. The source-length bound guarantees termination on an unterminated class. Emit one TOKEN_CHAR_CLASS_START spanning the entire "[...]" lexeme.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Every loop iteration consumes at least one byte and the source-length bound caps the scan, so an unterminated "[" cannot loop forever.
+@End Security_Scope
+
+Process called "lex_char_class" takes lexer as Integer returns Integer:
+    Note: Lex an entire character class [...] as one token
+
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let source_length be proc memory_get_int64 from Layout with lexer, 8
+
+    Let start_pos be position
+    Set position to position plus 1  Note: Skip [
+
+    Note: Optional negation '^' immediately after '['
+    If position is less than source_length:
+        Let neg_char be proc memory_get_byte from Layout with source, position
+        If neg_char is equal to 94:  Note: ^
+            Set position to position plus 1
+        End If
+    End If
+
+    Note: A ']' in first position is a literal member, not the terminator
+    If position is less than source_length:
+        Let first_char be proc memory_get_byte from Layout with source, position
+        If first_char is equal to 93:  Note: ]
+            Set position to position plus 1
+        End If
+    End If
+
+    Let scanning be 1
+    While scanning is equal to 1:
+        If position is greater than or equal to source_length:
+            Set scanning to 0
+        Otherwise:
+            Let cls_char be proc memory_get_byte from Layout with source, position
+            If cls_char is equal to 92:  Note: backslash escapes next byte
+                Set position to position plus 2
+            Otherwise:
+                If cls_char is equal to 93:  Note: ] terminator
+                    Set position to position plus 1
+                    Set scanning to 0
+                Otherwise:
+                    Set position to position plus 1
+                End If
+            End If
+        End If
+    End While
+
+    proc memory_set_int64 from Layout with lexer, 16, position
+
+    Let length be position minus start_pos
+    Return proc create_token with TOKEN_CHAR_CLASS_START, source plus start_pos, length, start_pos
 End Process
 
 Note: ========================================
@@ -508,13 +574,13 @@ Process called "lex_group_start" takes lexer as Integer returns Integer:
             End If
 
             Note: Otherwise, it's named group (?<name>
-            Return proc lex_named_group from lexer
+            Return proc lex_named_group with lexer
         End If
     End If
 
     Note: Check for named group (?P<name>
     If third_char is equal to 80:  Note: P
-        Return proc lex_named_group from lexer
+        Return proc lex_named_group with lexer
     End If
 
     Note: Default: treat as simple group start

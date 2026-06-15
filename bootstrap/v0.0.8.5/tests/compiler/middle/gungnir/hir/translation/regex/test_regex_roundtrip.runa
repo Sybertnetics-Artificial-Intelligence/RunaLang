@@ -1,0 +1,284 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Regex Translation Round-Trip Probe
+
+End-to-end proof that the regex translation pipeline is REAL, not a skeleton:
+
+    regex source
+      -> regex_lexer    (tokenize: literals, escapes, char classes, shorthand
+                         classes, quantifiers incl. lazy/possessive, anchors,
+                         groups incl. named + lookaround, alternation, backref)
+      -> regex_parser   (build the regex AST: alternation of concatenations of
+                         quantified atoms, groups, classes, anchors, backrefs)
+      -> regex_to_hir   (lower the AST to the dict/list-encoded HIR interchange)
+      -> hir_to_regex   (emit HIR back to a valid PCRE pattern string)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural + content assertions on the key constructs
+
+The probe feeds a representative pattern that exercises every construct the
+task requires:
+
+  - literal characters and concatenation        (abc, def, foo, x)
+  - a character class with a range               ([a-z0-9])
+  - a shorthand class                            (\d)
+  - a bounded quantifier {n,m}                   ({2,5})
+  - a lazy quantifier                            (x*?)
+  - anchors                                      (^, $, \b)
+  - a capturing group                            ((abc|def|ghi))
+  - a named group                                ((?<year>...))
+  - an alternation with >= 2 alternatives        (abc|def|ghi)
+  - a positive lookahead                         ((?=foo))
+  - a backreference                              (\1)
+
+The regex HIR node model is the dict/list-encoded interchange shared by
+regex_to_hir (producer) and hir_to_regex (consumer): each node is a Dict
+primitive keyed by a "type" tag plus per-kind payload keys ("branches",
+"elements", "quantifier", "element", "group_type", "name", "contents",
+"value"). This probe reads HIR fields through the exact Dict/List primitives
+the producer and consumer use, so the test exercises the real contract.
+
+It lowers the source to HIR1, asserts HIR1 is a "regex_pattern" carrying a
+"pattern" body, emits HIR1 back to a PCRE string, asserts the emitted text
+carries the load-bearing tokens of every required construct (whitespace-free,
+so token presence is a faithful content check), re-runs the whole pipeline on
+the emitted text to HIR2, and asserts HIR2 is a regex_pattern as well. A
+second pass walks HIR2 structurally to confirm the alternation, named group,
+quantifiers, char class, anchors, lookahead and backreference node kinds
+survive the round trip.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/regex/regex_to_hir.runa" as RegexFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/regex/hir_to_regex.runa" as RegexBackend
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dict/list readers (use the same primitives the pipeline uses)
+Note: ============================================================================
+
+@Reasoning:
+Regex HIR nodes are Dict primitives keyed by null-terminated string literals.
+Looking up a value means building a fresh key string with the same content and
+calling Dict.get, which compares keys by content via the hashtable. This mirror
+of the producer's key construction proves the produced shape is the consumed
+shape.
+@End Reasoning
+Process called "hir_get" takes node as Integer, key_literal as String returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key be proc create_from_literal from StringCore with key_literal
+    Return proc get from Dict with node, key
+End Process
+
+@Reasoning:
+A regex HIR node's kind is the string value stored under "type"; returning it
+lets callers compare against an expected tag with string_equals.
+@End Reasoning
+Process called "hir_type" takes node as Integer returns Integer:
+    Return proc hir_get with node, "type"
+End Process
+
+@Reasoning:
+Convenience predicate: does a node carry the given "type" tag? Returns 1 on a
+content match, 0 otherwise (including a null node or missing type).
+@End Reasoning
+Process called "hir_is_type" takes node as Integer, expected as String returns Integer:
+    Let t be proc hir_type with node
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with t, expected
+End Process
+
+@Reasoning:
+The pattern body lives under the root's "pattern" key. Unwrapping it here keeps
+the assertions focused on the meaningful expression node rather than the
+envelope.
+@End Reasoning
+Process called "hir_pattern_body" takes root as Integer returns Integer:
+    Return proc hir_get with root, "pattern"
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Regex translation round-trip"
+
+    Note:
+    Representative pattern exercising: start anchor, named group around a
+    shorthand class with a bounded quantifier, a capturing group holding a
+    3-way alternation, a char class with a range and a '+' quantifier, a lazy
+    quantifier, a positive lookahead, a backreference, a word-boundary anchor,
+    and an end anchor.
+    :End Note
+    Let source be "^(?<year>\\d{2,5})(abc|def|ghi)[a-z0-9]+x*?(?=foo)\\1\\b$"
+
+    Note: --- Stage 0-2: source -> HIR1 ---
+    Let hir1 be proc regex_to_hir_from_source from RegexFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR", hir1
+
+    Let root_is_pattern be proc hir_is_type with hir1, "regex_pattern"
+    proc assert_equal from TestUtils with results, "HIR root is a regex_pattern", root_is_pattern, 1
+
+    Let body1 be proc hir_pattern_body with hir1
+    proc assert_not_null from TestUtils with results, "pattern body present", body1
+
+    Note:
+    The top-level body is a concatenation of the anchors, groups, class and
+    backreference. Confirm the body is a concatenation with several elements.
+    :End Note
+    Let body_is_concat be proc hir_is_type with body1, "concatenation"
+    proc assert_equal from TestUtils with results, "body is a concatenation", body_is_concat, 1
+    Let elements be proc hir_get with body1, "elements"
+    Let element_count be proc size from List with elements
+    proc assert_greater_than_or_equal from TestUtils with results, "concatenation has several elements", element_count, 6
+
+    Note: --- Stage 3: HIR1 -> regex text ---
+    Let emitted be proc generate_regex_from_hir from RegexBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced regex text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted regex is non-empty", emitted_len, 0
+
+    Note:
+    --- Depth assertions: the emitted text must carry the load-bearing tokens
+    of every required construct. The output is whitespace-free, so substring
+    presence is a faithful content check that each construct survived.
+    :End Note
+    Let has_class_range be proc string_contains from StringUtils with emitted, "[a-z0-9]"
+    proc assert_equal from TestUtils with results, "emitted carries char class with range", has_class_range, 1
+    Let has_shorthand be proc string_contains from StringUtils with emitted, "\\d"
+    proc assert_equal from TestUtils with results, "emitted carries shorthand class", has_shorthand, 1
+    Let has_range_quant be proc string_contains from StringUtils with emitted, "{2,5}"
+    proc assert_equal from TestUtils with results, "emitted carries {n,m} quantifier", has_range_quant, 1
+    Let has_lazy be proc string_contains from StringUtils with emitted, "*?"
+    proc assert_equal from TestUtils with results, "emitted carries lazy quantifier", has_lazy, 1
+    Let has_anchor_start be proc string_contains from StringUtils with emitted, "^"
+    proc assert_equal from TestUtils with results, "emitted carries start anchor", has_anchor_start, 1
+    Let has_anchor_end be proc string_contains from StringUtils with emitted, "$"
+    proc assert_equal from TestUtils with results, "emitted carries end anchor", has_anchor_end, 1
+    Let has_word_boundary be proc string_contains from StringUtils with emitted, "\\b"
+    proc assert_equal from TestUtils with results, "emitted carries word-boundary anchor", has_word_boundary, 1
+    Let has_capturing be proc string_contains from StringUtils with emitted, "(abc"
+    proc assert_equal from TestUtils with results, "emitted carries capturing group", has_capturing, 1
+    Let has_named be proc string_contains from StringUtils with emitted, "(?<year>"
+    proc assert_equal from TestUtils with results, "emitted carries named group", has_named, 1
+    Let has_alt be proc string_contains from StringUtils with emitted, "abc|def|ghi"
+    proc assert_equal from TestUtils with results, "emitted carries alternation with >= 2 alts", has_alt, 1
+    Let has_lookahead be proc string_contains from StringUtils with emitted, "(?=foo)"
+    proc assert_equal from TestUtils with results, "emitted carries lookahead", has_lookahead, 1
+    Let has_backref be proc string_contains from StringUtils with emitted, "\\1"
+    proc assert_equal from TestUtils with results, "emitted carries backreference", has_backref, 1
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc regex_to_hir_from_source from RegexFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted regex produced HIR", hir2
+    Let root2_is_pattern be proc hir_is_type with hir2, "regex_pattern"
+    proc assert_equal from TestUtils with results, "round-trip root is a regex_pattern", root2_is_pattern, 1
+
+    Let body2 be proc hir_pattern_body with hir2
+    proc assert_not_null from TestUtils with results, "round-trip pattern body present", body2
+    Let body2_is_concat be proc hir_is_type with body2, "concatenation"
+    proc assert_equal from TestUtils with results, "round-trip body is a concatenation", body2_is_concat, 1
+
+    Note:
+    --- Structural depth walk on HIR2: locate each required node kind inside the
+    re-parsed tree, proving the constructs survived as structure (not just text).
+    :End Note
+    Let elements2 be proc hir_get with body2, "elements"
+    Let element2_count be proc size from List with elements2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip concatenation has several elements", element2_count, 6
+
+    Note: Find the named group, the capturing group (with alternation), the
+    Note: quantified char-class, the lazy-quantified atom, the lookahead group,
+    Note: the anchors and the backreference among the concatenation elements.
+    Let found_named be 0
+    Let found_capturing_alt be 0
+    Let found_quant_class be 0
+    Let found_lazy be 0
+    Let found_lookahead be 0
+    Let found_anchor be 0
+    Let found_backref be 0
+
+    Let idx be 0
+    While idx is less than element2_count:
+        Let elem be proc get from List with elements2, idx
+
+        Let is_group be proc hir_is_type with elem, "group"
+        If is_group is equal to 1:
+            Let gtype be proc hir_get with elem, "group_type"
+            If gtype is not equal to 0:
+                Let is_named_g be proc string_equals from StringCore with gtype, "named"
+                If is_named_g is equal to 1:
+                    Set found_named to 1
+                End If
+                Let is_lah_g be proc string_equals from StringCore with gtype, "lookahead_pos"
+                If is_lah_g is equal to 1:
+                    Set found_lookahead to 1
+                End If
+                Let is_cap_g be proc string_equals from StringCore with gtype, "capturing"
+                If is_cap_g is equal to 1:
+                    Let gcontents be proc hir_get with elem, "contents"
+                    Let contents_is_alt be proc hir_is_type with gcontents, "alternation"
+                    If contents_is_alt is equal to 1:
+                        Set found_capturing_alt to 1
+                    End If
+                End If
+            End If
+        End If
+
+        Let is_quant be proc hir_is_type with elem, "quantified"
+        If is_quant is equal to 1:
+            Let q be proc hir_get with elem, "quantifier"
+            If q is not equal to 0:
+                Let q_is_lazy be proc string_equals from StringCore with q, "*?"
+                If q_is_lazy is equal to 1:
+                    Set found_lazy to 1
+                End If
+            End If
+            Let qelem be proc hir_get with elem, "element"
+            Let qelem_is_class be proc hir_is_type with qelem, "char_class"
+            If qelem_is_class is equal to 1:
+                Set found_quant_class to 1
+            End If
+        End If
+
+        Let is_anchor be proc hir_is_type with elem, "anchor"
+        If is_anchor is equal to 1:
+            Set found_anchor to 1
+        End If
+
+        Let is_backref be proc hir_is_type with elem, "backreference"
+        If is_backref is equal to 1:
+            Set found_backref to 1
+        End If
+
+        Set idx to idx plus 1
+    End While
+
+    proc assert_equal from TestUtils with results, "round-trip preserves named group node", found_named, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves capturing group with alternation", found_capturing_alt, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves quantified char class", found_quant_class, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves lazy quantifier", found_lazy, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves lookahead group", found_lookahead, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves an anchor", found_anchor, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves backreference", found_backref, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

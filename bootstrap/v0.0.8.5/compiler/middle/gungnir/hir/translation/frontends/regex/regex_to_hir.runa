@@ -30,7 +30,7 @@ Process called "translate_regex_to_hir" takes ast as Integer returns Integer:
     Let type_value be proc create_string_literal with "regex_pattern"
     proc set from Dict with hir, type_key, type_value
     Let pattern_key be proc create_string_literal with "pattern"
-    Let pattern_value be proc translate_node from ast
+    Let pattern_value be proc translate_node with ast
     proc set from Dict with hir, pattern_key, pattern_value
     Return hir
 End Process
@@ -49,34 +49,34 @@ Process called "translate_node" takes node as Integer returns Integer:
     End If
     Let node_type be proc memory_get_int64 from Layout with node, 0
     If node_type is equal to 1:  Note: REGEX_PATTERN
-        Return proc translate_pattern from node
+        Return proc translate_pattern with node
     End If
     If node_type is equal to 2:  Note: REGEX_ALTERNATION
-        Return proc translate_alternation from node
+        Return proc translate_alternation with node
     End If
     If node_type is equal to 3:  Note: REGEX_CONCATENATION
-        Return proc translate_concatenation from node
+        Return proc translate_concatenation with node
     End If
     If node_type is equal to 4:  Note: REGEX_QUANTIFIED
-        Return proc translate_quantified from node
+        Return proc translate_quantified with node
     End If
     If node_type is equal to 5:  Note: REGEX_GROUP
-        Return proc translate_group from node
+        Return proc translate_group with node
     End If
     If node_type is equal to 6:  Note: REGEX_CHAR_CLASS
-        Return proc translate_char_class from node
+        Return proc translate_char_class with node
     End If
     If node_type is equal to 7:  Note: REGEX_LITERAL
-        Return proc translate_literal from node
+        Return proc translate_literal with node
     End If
     If node_type is equal to 8:  Note: REGEX_ANCHOR
-        Return proc translate_anchor from node
+        Return proc translate_anchor with node
     End If
     If node_type is equal to 9:  Note: REGEX_BACKREFERENCE
-        Return proc translate_backreference from node
+        Return proc translate_backreference with node
     End If
     If node_type is equal to 10:  Note: REGEX_DOT
-        Return proc translate_dot from node
+        Return proc translate_dot with node
     End If
     Return 0
 End Process
@@ -94,7 +94,7 @@ Process called "translate_pattern" takes node as Integer returns Integer:
     Let child_count be proc size from List with children
     If child_count is greater than 0:
         Let child be proc get from List with children, 0
-        Return proc translate_node from child
+        Return proc translate_node with child
     End If
     Return proc create from Dict
 End Process
@@ -118,7 +118,7 @@ Process called "translate_alternation" takes node as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let child be proc get from List with children, i
-        Let branch_hir be proc translate_node from child
+        Let branch_hir be proc translate_node with child
         If branch_hir is not equal to 0:
             proc push from List with branches, branch_hir
         End If
@@ -148,7 +148,7 @@ Process called "translate_concatenation" takes node as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let child be proc get from List with children, i
-        Let element_hir be proc translate_node from child
+        Let element_hir be proc translate_node with child
         If element_hir is not equal to 0:
             proc push from List with elements, element_hir
         End If
@@ -160,11 +160,11 @@ Process called "translate_concatenation" takes node as Integer returns Integer:
 End Process
 
 @Reasoning:
-The parser encodes the quantifier kind in a metadata field (8=*, 9=+, 10=?, 11=range {m,n}) and the inner sub-expression as the single child; translating the metadata into a recognisable string keeps the HIR self-describing.
+The parser encodes the quantifier in a metadata field as base + modifier-band: the base is 8 (*), 9 (+), 10 (?), or 11 (range {m,n}); the band is 0 (greedy), 30 (lazy '?' suffix), or 60 (possessive '+' suffix). The inner sub-expression is the single child. Translating both the base and the modifier into the fully-formed quantifier string (e.g. "*", "*?", "++", "{2,5}?") keeps the HIR self-describing and lets the backend blit the suffix verbatim.
 @End Reasoning
 
 @Implementation:
-Read metadata at offset 24. Map 8 to "*", 9 to "+", 10 to "?"; for 11 (range form) materialise the literal "{m,n}" lexeme from the node's value pointer. Attach the choice at key "quantifier". Translate the single inner child and attach it at key "element".
+Read metadata at offset 24. Decode band = metadata - (metadata mod-30 partition): values >= 60 are possessive (modifier byte '+'/43), >= 30 are lazy (modifier byte '?'/63), else greedy (no modifier). The base is metadata minus the band. Map base 8/9/10 to the single bytes '*'/'+'/'?'; base 11 uses the "{m,n}" lexeme span from the node's value pointer. Build the quantifier string by copying the base bytes, appending the modifier byte when present, and NUL-terminating. Attach at key "quantifier". Translate the single inner child and attach at key "element".
 @End Implementation
 
 Process called "translate_quantified" takes node as Integer returns Integer:
@@ -173,28 +173,67 @@ Process called "translate_quantified" takes node as Integer returns Integer:
     Let type_value be proc create_string_literal with "quantified"
     proc set from Dict with hir, type_key, type_value
     Let metadata be proc memory_get_int64 from Layout with node, 24
+
+    Note: Decode modifier band and base quantifier code.
+    Let modifier_byte be 0
+    Let band be 0
+    If metadata is greater than or equal to 60:
+        Set modifier_byte to 43  Note: '+' possessive
+        Set band to 60
+    Otherwise:
+        If metadata is greater than or equal to 30:
+            Set modifier_byte to 63  Note: '?' lazy
+            Set band to 30
+        End If
+    End If
+    Let base be metadata minus band
+
+    Note: Resolve the base quantifier bytes (pointer + length).
+    Let base_ptr be 0
+    Let base_length be 0
+    Let single_byte be 0
+    If base is equal to 8:
+        Set single_byte to 42  Note: '*'
+        Set base_length to 1
+    End If
+    If base is equal to 9:
+        Set single_byte to 43  Note: '+'
+        Set base_length to 1
+    End If
+    If base is equal to 10:
+        Set single_byte to 63  Note: '?'
+        Set base_length to 1
+    End If
+    If base is equal to 11:
+        Set base_ptr to proc memory_get_int64 from Layout with node, 8
+        Set base_length to proc memory_get_int64 from Layout with node, 16
+    End If
+
+    Note: Assemble base bytes + optional modifier byte + NUL.
+    Let total_length be base_length
+    If modifier_byte is not equal to 0:
+        Set total_length to total_length plus 1
+    End If
+    Let buffer be proc allocate from Layout with total_length plus 1
+    If base is equal to 11:
+        If base_ptr is not equal to 0:
+            proc memory_copy from Layout with buffer, base_ptr, base_length
+        End If
+    Otherwise:
+        proc memory_set_byte from Layout with buffer, 0, single_byte
+    End If
+    If modifier_byte is not equal to 0:
+        proc memory_set_byte from Layout with buffer, base_length, modifier_byte
+    End If
+    proc memory_set_byte from Layout with buffer, total_length, 0
+
     Let quantifier_key be proc create_string_literal with "quantifier"
-    Let quantifier_value be proc create_string_literal with "*"
-    If metadata is equal to 8:
-        Set quantifier_value to proc create_string_literal with "*"
-    End If
-    If metadata is equal to 9:
-        Set quantifier_value to proc create_string_literal with "+"
-    End If
-    If metadata is equal to 10:
-        Set quantifier_value to proc create_string_literal with "?"
-    End If
-    If metadata is equal to 11:
-        Let value_ptr be proc memory_get_int64 from Layout with node, 8
-        Let value_length be proc memory_get_int64 from Layout with node, 16
-        Set quantifier_value to proc create_from_buffer from StringCore with value_ptr, value_length
-    End If
-    proc set from Dict with hir, quantifier_key, quantifier_value
+    proc set from Dict with hir, quantifier_key, buffer
     Let children be proc memory_get_int64 from Layout with node, 32
     Let child_count be proc size from List with children
     If child_count is greater than 0:
         Let child be proc get from List with children, 0
-        Let element_hir be proc translate_node from child
+        Let element_hir be proc translate_node with child
         Let element_key be proc create_string_literal with "element"
         proc set from Dict with hir, element_key, element_hir
     End If
@@ -202,11 +241,11 @@ Process called "translate_quantified" takes node as Integer returns Integer:
 End Process
 
 @Reasoning:
-Groups split into three flavours: capturing "(...)", non-capturing "(?:...)", and named "(?<name>...)"; the parser encodes the kind in metadata so the translator can lift it into a human-readable HIR string.
+Groups span seven flavours: capturing "(...)", non-capturing "(?:...)", named "(?<name>...)", and the four zero-width lookaround assertions positive/negative lookahead "(?=...)"/"(?!...)" and positive/negative lookbehind "(?<=...)"/"(?<!...)". The parser encodes the kind as the originating lexer token tag in metadata; the translator lifts it into a self-describing HIR string so the backend can reproduce the exact PCRE delimiter. For named groups the capture name is extracted from the opening lexeme so it survives the round trip.
 @End Reasoning
 
 @Implementation:
-Dictionary tagged type=group. Read metadata at offset 24: default "capturing", 17 -> "non_capturing", 18 -> "named"; attach at key "group_type". Translate the single child sub-expression and attach at key "contents".
+Dictionary tagged type=group. Read metadata at offset 24 and map: 17 -> "non_capturing", 18 -> "named", 19 -> "lookahead_pos", 20 -> "lookahead_neg", 21 -> "lookbehind_pos", 22 -> "lookbehind_neg", any other (15) -> "capturing". Attach at key "group_type". For a named group, extract the name between '<' and '>' from the node's opening lexeme (value pointer/length) and attach at key "name". Translate the single child sub-expression and attach at key "contents".
 @End Implementation
 
 Process called "translate_group" takes node as Integer returns Integer:
@@ -223,16 +262,101 @@ Process called "translate_group" takes node as Integer returns Integer:
     If metadata is equal to 18:
         Set group_type_value to proc create_string_literal with "named"
     End If
+    If metadata is equal to 19:
+        Set group_type_value to proc create_string_literal with "lookahead_pos"
+    End If
+    If metadata is equal to 20:
+        Set group_type_value to proc create_string_literal with "lookahead_neg"
+    End If
+    If metadata is equal to 21:
+        Set group_type_value to proc create_string_literal with "lookbehind_pos"
+    End If
+    If metadata is equal to 22:
+        Set group_type_value to proc create_string_literal with "lookbehind_neg"
+    End If
     proc set from Dict with hir, group_type_key, group_type_value
+    If metadata is equal to 18:
+        Let lexeme_ptr be proc memory_get_int64 from Layout with node, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with node, 16
+        Let name_str be proc extract_group_name with lexeme_ptr, lexeme_length
+        If name_str is not equal to 0:
+            Let name_key be proc create_string_literal with "name"
+            proc set from Dict with hir, name_key, name_str
+        End If
+    End If
     Let children be proc memory_get_int64 from Layout with node, 32
     Let child_count be proc size from List with children
     If child_count is greater than 0:
         Let child be proc get from List with children, 0
-        Let contents_hir be proc translate_node from child
+        Let contents_hir be proc translate_node with child
         Let contents_key be proc create_string_literal with "contents"
         proc set from Dict with hir, contents_key, contents_hir
     End If
     Return hir
+End Process
+
+@Reasoning:
+A named group's opening lexeme is one of "(?<name>", "(?'name'", or "(?P<name>"; the name is the run of bytes between the opening delimiter ('<' or the apostrophe) and the matching closing delimiter ('>' or apostrophe). Extracting it into an owned null-terminated string lets the HIR carry the name independently of the source buffer.
+@End Reasoning
+
+@Implementation:
+Scan the lexeme for the first '<' (60) or apostrophe (39); the byte after it begins the name. Continue until the closing '>' (62) or apostrophe (39) or end of lexeme; that bounds the name span. Materialise the span via regex_string_from_span. Return 0 when no opening delimiter is found so the caller omits the name key.
+@End Implementation
+
+Process called "extract_group_name" takes lexeme_ptr as Integer, lexeme_length as Integer returns Integer:
+    If lexeme_ptr is equal to 0:
+        Return 0
+    End If
+    If lexeme_length is less than 1:
+        Return 0
+    End If
+    Let name_start be 0 minus 1
+    Let i be 0
+    While i is less than lexeme_length:
+        Let c be proc memory_get_byte from Layout with lexeme_ptr, i
+        If c is equal to 60:  Note: <
+            Set name_start to i plus 1
+            Set i to lexeme_length
+        Otherwise:
+            If c is equal to 39:  Note: apostrophe
+                Set name_start to i plus 1
+                Set i to lexeme_length
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    If name_start is less than 0:
+        Return 0
+    End If
+    Let name_end be name_start
+    Let j be name_start
+    Let scanning be 1
+    While scanning is equal to 1:
+        If j is greater than or equal to lexeme_length:
+            Set name_end to j
+            Set scanning to 0
+        Otherwise:
+            Let cc be proc memory_get_byte from Layout with lexeme_ptr, j
+            If cc is equal to 62:  Note: >
+                Set name_end to j
+                Set scanning to 0
+            Otherwise:
+                If cc is equal to 39:  Note: apostrophe
+                    Set name_end to j
+                    Set scanning to 0
+                Otherwise:
+                    Set j to j plus 1
+                End If
+            End If
+        End If
+    End While
+    Let name_length be name_end minus name_start
+    If name_length is less than 1:
+        Return 0
+    End If
+    Let name_ptr be lexeme_ptr plus name_start
+    Return proc regex_string_from_span with name_ptr, name_length
 End Process
 
 @Reasoning:
@@ -253,7 +377,7 @@ Process called "translate_char_class" takes node as Integer returns Integer:
     If value_ptr is not equal to 0:
         If value_length is greater than 0:
             Let value_key be proc create_string_literal with "value"
-            Let value_str be proc create_from_buffer from StringCore with value_ptr, value_length
+            Let value_str be proc regex_string_from_span with value_ptr, value_length
             proc set from Dict with hir, value_key, value_str
         End If
     End If
@@ -276,7 +400,7 @@ Process called "translate_literal" takes node as Integer returns Integer:
     Let value_ptr be proc memory_get_int64 from Layout with node, 8
     Let value_length be proc memory_get_int64 from Layout with node, 16
     Let value_key be proc create_string_literal with "value"
-    Let value_str be proc create_from_buffer from StringCore with value_ptr, value_length
+    Let value_str be proc regex_string_from_span with value_ptr, value_length
     proc set from Dict with hir, value_key, value_str
     Return hir
 End Process
@@ -297,7 +421,7 @@ Process called "translate_anchor" takes node as Integer returns Integer:
     Let value_ptr be proc memory_get_int64 from Layout with node, 8
     Let value_length be proc memory_get_int64 from Layout with node, 16
     Let value_key be proc create_string_literal with "value"
-    Let value_str be proc create_from_buffer from StringCore with value_ptr, value_length
+    Let value_str be proc regex_string_from_span with value_ptr, value_length
     proc set from Dict with hir, value_key, value_str
     Return hir
 End Process
@@ -322,7 +446,7 @@ Process called "translate_backreference" takes node as Integer returns Integer:
     Let value_ptr be proc memory_get_int64 from Layout with node, 8
     Let value_length be proc memory_get_int64 from Layout with node, 16
     Let value_key be proc create_string_literal with "value"
-    Let value_str be proc create_from_buffer from StringCore with value_ptr, value_length
+    Let value_str be proc regex_string_from_span with value_ptr, value_length
     proc set from Dict with hir, value_key, value_str
     Return hir
 End Process
@@ -352,7 +476,32 @@ Forward to StringCore.create_string_from_literal and return its pointer.
 @End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
-    Return proc create_string_from_literal from StringCore with value
+    Return proc create_from_literal from StringCore with value
+End Process
+
+@Reasoning:
+Lexeme views in the AST point into the original regex source buffer and are NOT individually null-terminated; HIR dictionary values must be standalone null-terminated strings so downstream emitters (which treat values as C-strings) read exactly the span. This helper materialises a fresh owned copy of a byte span and terminates it.
+@End Reasoning
+
+@Implementation:
+Allocate length+1 bytes, copy the span via memory_copy, write a terminating NUL at offset length, and return the new buffer. A null pointer or non-positive length yields a freshly allocated empty (single-NUL) string so callers never receive 0.
+@End Implementation
+
+Process called "regex_string_from_span" takes value_ptr as Integer, value_length as Integer returns Integer:
+    If value_ptr is equal to 0:
+        Let empty be proc allocate from Layout with 1
+        proc memory_set_byte from Layout with empty, 0, 0
+        Return empty
+    End If
+    If value_length is less than 1:
+        Let empty2 be proc allocate from Layout with 1
+        proc memory_set_byte from Layout with empty2, 0, 0
+        Return empty2
+    End If
+    Let buffer be proc allocate from Layout with value_length plus 1
+    proc memory_copy from Layout with buffer, value_ptr, value_length
+    proc memory_set_byte from Layout with buffer, value_length, 0
+    Return buffer
 End Process
 
 Note: ============================================================================
