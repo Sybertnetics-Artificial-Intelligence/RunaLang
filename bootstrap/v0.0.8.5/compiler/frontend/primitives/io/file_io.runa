@@ -60,6 +60,59 @@ Constant SYS_UNLINK as Integer is 87
 Note: Default directory permissions for created directories (0755 octal = 493).
 Constant DIR_DEFAULT_PERMS as Integer is 493
 
+Note: stat, rmdir, and getdents64 syscall numbers on Linux x86_64. The
+Note: platform-aware syscall router maps these to the correct instruction (or
+Note: equivalent call) on other targets. stat fills a struct stat buffer for a
+Note: path; rmdir removes an empty directory; getdents64 reads directory entries
+Note: from an open directory file descriptor into a caller buffer.
+Constant SYS_STAT as Integer is 4
+Constant SYS_RMDIR as Integer is 84
+Constant SYS_GETDENTS64 as Integer is 217
+
+Note: Size of the Linux x86_64 struct stat (144 bytes). stat writes the file
+Note: metadata into a buffer of at least this size.
+Constant STAT_STRUCT_SIZE as Integer is 144
+
+Note: Byte offset of the st_mode field within struct stat on Linux x86_64. The
+Note: field is a 32-bit mode word combining the file-type bits (S_IFMT) and the
+Note: permission bits.
+Constant STAT_ST_MODE_OFFSET as Integer is 24
+
+Note: File-type mask (S_IFMT = 0o170000 = 61440) and the directory type value
+Note: (S_IFDIR = 0o040000 = 16384). (st_mode AND S_IFMT) is equal to S_IFDIR
+Note: exactly when the path names a directory.
+Constant STAT_S_IFMT as Integer is 61440
+Constant STAT_S_IFDIR as Integer is 16384
+
+Note: linux_dirent64 field offsets used while walking getdents64 output. Each
+Note: record is variable length: d_ino (8 bytes), d_off (8 bytes), d_reclen
+Note: (2-byte record length at offset 16), d_type (1 byte at offset 18), and the
+Note: null-terminated d_name beginning at offset 19. d_type value 4 (DT_DIR)
+Note: marks a subdirectory.
+Constant DIRENT_RECLEN_OFFSET as Integer is 16
+Constant DIRENT_DTYPE_OFFSET as Integer is 18
+Constant DIRENT_DNAME_OFFSET as Integer is 19
+Constant DIRENT_DT_DIR as Integer is 4
+
+Note: Buffer size for a single getdents64 read pass. A directory is drained by
+Note: repeatedly filling this buffer until getdents64 returns 0 (end of stream).
+Constant DIRENT_BUFFER_SIZE as Integer is 8192
+
+Note: Buffer size for the copy_file read/write loop. Content is streamed through
+Note: a fixed stack-free heap buffer so arbitrarily large files copy in bounded
+Note: memory.
+Constant COPY_BUFFER_SIZE as Integer is 65536
+
+Note: O_RDONLY / O_WRONLY|O_CREAT|O_TRUNC mode words for copy_file, plus the
+Note: O_DIRECTORY flag (0o200000 = 65536) used when opening a directory for
+Note: getdents64 enumeration.
+Constant FILE_FLAGS_WRITE_CREATE_TRUNC as Integer is 577
+Constant FILE_FLAG_DIRECTORY as Integer is 65536
+
+Note: Negated EINTR (interrupted system call = 4 on Linux). A read or write that
+Note: returns this should be retried rather than treated as a hard failure.
+Constant FILE_NEG_EINTR as Integer is -4
+
 Note: Negated errno for "file already exists" (EEXIST = 17 on Linux). mkdir
 Note: returns this when a path component already exists, which recursive
 Note: directory creation treats as success for that component.
@@ -282,6 +335,390 @@ Process called "create_directory_recursive" takes path as Integer returns Intege
         Return 1
     End If
     Return 0
+End Process
+
+Note: ============================================================================
+Note: EXTENDED FILESYSTEM OPERATIONS (stat, copy, recursive directory)
+Note: ============================================================================
+
+Note: Return 1 if path exists and is a directory, 0 otherwise. Implemented via
+Note: the stat syscall into a struct stat buffer; the st_mode field is masked
+Note: with S_IFMT and compared against S_IFDIR. A 0 path, a stat failure (the
+Note: path does not exist or is unreachable), or any non-directory file type all
+Note: yield 0. The scratch buffer is freed before returning.
+Process called "directory_exists" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let stat_buf be proc allocate from Layout with STAT_STRUCT_SIZE
+    If stat_buf is equal to 0:
+        Return 0
+    End If
+    Let result be fio_syscall3(SYS_STAT, path, stat_buf, 0)
+    If result is less than 0:
+        proc deallocate from Layout with stat_buf
+        Return 0
+    End If
+    Let mode be proc memory_get_int32 from MemoryCore with stat_buf, STAT_ST_MODE_OFFSET
+    proc deallocate from Layout with stat_buf
+    Let file_type be mode bit_and STAT_S_IFMT
+    If file_type is equal to STAT_S_IFDIR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: Return the directory the system uses for temporary files as a freshly
+Note: allocated, null-terminated, caller-owned string. The lightweight frontend
+Note: substrate has no working getenv (the process-environment callback is wired
+Note: only in the full runtime), so TMPDIR cannot be consulted here; the POSIX
+Note: default of "/tmp" is the correct, reliable fallback for every Linux/BSD/
+Note: Darwin host the compiler frontend runs on. A private copy is returned so
+Note: callers may free it without disturbing any shared literal.
+Process called "get_temp_dir" returns Integer:
+    Let default_dir be "/tmp"
+    Let dir_len be proc string_length from StringCore with default_dir
+    Let buffer be proc allocate from Layout with dir_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from MemoryCore with buffer, default_dir, dir_len
+    proc memory_set_byte from MemoryCore with buffer, dir_len, 0
+    Return buffer
+End Process
+
+Note: Copy the regular file at src to dst, creating or truncating dst. Returns 0
+Note: on success, a negative errno on failure. src is opened O_RDONLY; dst is
+Note: opened O_WRONLY|O_CREAT|O_TRUNC with 0644 permissions. Content streams
+Note: through a fixed 64 KiB heap buffer so files of any size copy in bounded
+Note: memory. Each write is looped until the full chunk lands (handling short
+Note: writes), and both read and write retry on EINTR. Both descriptors and the
+Note: buffer are released on every exit path.
+Process called "copy_file" takes src as Integer, dst as Integer returns Integer:
+    If src is equal to 0:
+        Return -1
+    End If
+    If dst is equal to 0:
+        Return -1
+    End If
+    Let src_fd be fio_open(src, FILE_MODE_READ_ONLY, 0)
+    If src_fd is less than 0:
+        Return src_fd
+    End If
+    Let dst_fd be fio_open(dst, FILE_FLAGS_WRITE_CREATE_TRUNC, FILE_DEFAULT_PERMS)
+    If dst_fd is less than 0:
+        Let close_src be fio_close(src_fd)
+        Return dst_fd
+    End If
+    Let buffer be proc allocate from Layout with COPY_BUFFER_SIZE
+    If buffer is equal to 0:
+        Let close_src2 be fio_close(src_fd)
+        Let close_dst2 be fio_close(dst_fd)
+        Return -1
+    End If
+
+    Let status be 0
+    Let copying be 1
+    While copying is equal to 1:
+        Let bytes_read be fio_read(src_fd, buffer, COPY_BUFFER_SIZE)
+        If bytes_read is less than 0:
+            If bytes_read is equal to FILE_NEG_EINTR:
+                Note: Interrupted before any data transferred; the enclosing loop
+                Note: re-issues the read on the next iteration (retry on EINTR).
+                Set copying to 1
+            Otherwise:
+                Set status to bytes_read
+                Set copying to 0
+            End If
+        Otherwise:
+            If bytes_read is equal to 0:
+                Note: End of source file reached.
+                Set copying to 0
+            Otherwise:
+                Let written be 0
+                Let write_ok be 1
+                While written is less than bytes_read:
+                    Let remaining be bytes_read minus written
+                    Let chunk be fio_write(dst_fd, buffer plus written, remaining)
+                    If chunk is less than 0:
+                        If chunk is equal to FILE_NEG_EINTR:
+                            Note: Interrupted before progress; the inner loop
+                            Note: re-issues the write (retry on EINTR). written is
+                            Note: left unchanged so the same span is rewritten.
+                            Set write_ok to 1
+                        Otherwise:
+                            Set status to chunk
+                            Set write_ok to 0
+                            Set written to bytes_read
+                        End If
+                    Otherwise:
+                        If chunk is equal to 0:
+                            Note: No progress and no error: treat as a write
+                            Note: failure to avoid an infinite loop.
+                            Set status to -1
+                            Set write_ok to 0
+                            Set written to bytes_read
+                        Otherwise:
+                            Set written to written plus chunk
+                        End If
+                    End If
+                End While
+                If write_ok is equal to 0:
+                    Set copying to 0
+                End If
+            End If
+        End If
+    End While
+
+    proc deallocate from Layout with buffer
+    Let close_src3 be fio_close(src_fd)
+    Let close_dst3 be fio_close(dst_fd)
+    Return status
+End Process
+
+Note: Recursively remove the directory at path and everything beneath it.
+Note: Returns 0 on success, a negative errno on the first failure encountered.
+Note: The directory is opened with O_RDONLY|O_DIRECTORY and drained with
+Note: getdents64; "." and ".." are skipped. Each entry's absolute child path is
+Note: built (path + "/" + name); subdirectories recurse through delete_directory
+Note: and regular entries are unlinked. After the directory is emptied its
+Note: descriptor is closed and rmdir removes the now-empty directory itself. All
+Note: heap buffers are freed on every path.
+Process called "delete_directory" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return -1
+    End If
+    Let dir_fd be fio_open(path, FILE_FLAG_DIRECTORY, 0)
+    If dir_fd is less than 0:
+        Return dir_fd
+    End If
+    Let buffer be proc allocate from Layout with DIRENT_BUFFER_SIZE
+    If buffer is equal to 0:
+        Let close_fd be fio_close(dir_fd)
+        Return -1
+    End If
+
+    Let status be 0
+    Let reading be 1
+    While reading is equal to 1:
+        Let nread be fio_syscall3(SYS_GETDENTS64, dir_fd, buffer, DIRENT_BUFFER_SIZE)
+        If nread is less than 0:
+            If nread is equal to FILE_NEG_EINTR:
+                Note: Interrupted; the enclosing loop re-issues getdents64 on the
+                Note: next iteration (retry on EINTR).
+                Set reading to 1
+            Otherwise:
+                Set status to nread
+                Set reading to 0
+            End If
+        Otherwise:
+            If nread is equal to 0:
+                Note: All entries consumed.
+                Set reading to 0
+            Otherwise:
+                Let offset be 0
+                While offset is less than nread:
+                    Let reclen be proc memory_get_int16 from MemoryCore with buffer, offset plus DIRENT_RECLEN_OFFSET
+                    Let dtype be proc memory_get_byte from MemoryCore with buffer, offset plus DIRENT_DTYPE_OFFSET
+                    Let name_ptr be buffer plus offset plus DIRENT_DNAME_OFFSET
+                    Let skip be proc dirent_is_dot_entry with name_ptr
+                    If skip is equal to 0:
+                        Let child be proc join_path with path, name_ptr
+                        If child is equal to 0:
+                            Set status to -1
+                            Set offset to nread
+                            Set reading to 0
+                        Otherwise:
+                            If dtype is equal to DIRENT_DT_DIR:
+                                Let sub_status be proc delete_directory with child
+                                If sub_status is less than 0:
+                                    Set status to sub_status
+                                End If
+                            Otherwise:
+                                Let unlink_result be fio_syscall1(SYS_UNLINK, child)
+                                If unlink_result is less than 0:
+                                    Set status to unlink_result
+                                End If
+                            End If
+                            proc deallocate from Layout with child
+                        End If
+                    End If
+                    If reclen is less than 1:
+                        Note: A zero record length would loop forever; abort
+                        Note: this buffer to preserve forward progress.
+                        Set offset to nread
+                    Otherwise:
+                        Set offset to offset plus reclen
+                    End If
+                End While
+                If status is less than 0:
+                    Set reading to 0
+                End If
+            End If
+        End If
+    End While
+
+    proc deallocate from Layout with buffer
+    Let close_dir be fio_close(dir_fd)
+    If status is less than 0:
+        Return status
+    End If
+    Let rmdir_result be fio_syscall1(SYS_RMDIR, path)
+    If rmdir_result is less than 0:
+        Return rmdir_result
+    End If
+    Return 0
+End Process
+
+Note: Recursively copy the directory tree at src into dst. Returns 0 on success,
+Note: a negative errno on the first failure. dst (and any missing parents) is
+Note: created via create_directory_recursive. src is opened with
+Note: O_RDONLY|O_DIRECTORY and walked with getdents64; "." and ".." are skipped.
+Note: For each entry the source and destination child paths are built; a
+Note: subdirectory recurses through copy_directory, a regular entry is copied
+Note: with copy_file. All heap buffers are freed on every path.
+Process called "copy_directory" takes src as Integer, dst as Integer returns Integer:
+    If src is equal to 0:
+        Return -1
+    End If
+    If dst is equal to 0:
+        Return -1
+    End If
+    Let made be proc create_directory_recursive with dst
+    If made is equal to 0:
+        Return -1
+    End If
+    Let dir_fd be fio_open(src, FILE_FLAG_DIRECTORY, 0)
+    If dir_fd is less than 0:
+        Return dir_fd
+    End If
+    Let buffer be proc allocate from Layout with DIRENT_BUFFER_SIZE
+    If buffer is equal to 0:
+        Let close_fd be fio_close(dir_fd)
+        Return -1
+    End If
+
+    Let status be 0
+    Let reading be 1
+    While reading is equal to 1:
+        Let nread be fio_syscall3(SYS_GETDENTS64, dir_fd, buffer, DIRENT_BUFFER_SIZE)
+        If nread is less than 0:
+            If nread is equal to FILE_NEG_EINTR:
+                Note: Interrupted; the enclosing loop re-issues getdents64 on the
+                Note: next iteration (retry on EINTR).
+                Set reading to 1
+            Otherwise:
+                Set status to nread
+                Set reading to 0
+            End If
+        Otherwise:
+            If nread is equal to 0:
+                Note: All entries consumed.
+                Set reading to 0
+            Otherwise:
+                Let offset be 0
+                While offset is less than nread:
+                    Let reclen be proc memory_get_int16 from MemoryCore with buffer, offset plus DIRENT_RECLEN_OFFSET
+                    Let dtype be proc memory_get_byte from MemoryCore with buffer, offset plus DIRENT_DTYPE_OFFSET
+                    Let name_ptr be buffer plus offset plus DIRENT_DNAME_OFFSET
+                    Let skip be proc dirent_is_dot_entry with name_ptr
+                    If skip is equal to 0:
+                        Let src_child be proc join_path with src, name_ptr
+                        Let dst_child be proc join_path with dst, name_ptr
+                        If src_child is equal to 0:
+                            Set status to -1
+                            Set offset to nread
+                            Set reading to 0
+                        Otherwise:
+                            If dst_child is equal to 0:
+                                proc deallocate from Layout with src_child
+                                Set status to -1
+                                Set offset to nread
+                                Set reading to 0
+                            Otherwise:
+                                If dtype is equal to DIRENT_DT_DIR:
+                                    Let sub_status be proc copy_directory with src_child, dst_child
+                                    If sub_status is less than 0:
+                                        Set status to sub_status
+                                    End If
+                                Otherwise:
+                                    Let copy_status be proc copy_file with src_child, dst_child
+                                    If copy_status is less than 0:
+                                        Set status to copy_status
+                                    End If
+                                End If
+                                proc deallocate from Layout with src_child
+                                proc deallocate from Layout with dst_child
+                            End If
+                        End If
+                    End If
+                    If reclen is less than 1:
+                        Note: Guard against a zero record length looping forever.
+                        Set offset to nread
+                    Otherwise:
+                        Set offset to offset plus reclen
+                    End If
+                End While
+                If status is less than 0:
+                    Set reading to 0
+                End If
+            End If
+        End If
+    End While
+
+    proc deallocate from Layout with buffer
+    Let close_dir be fio_close(dir_fd)
+    Return status
+End Process
+
+Note: Return 1 if the null-terminated name pointed to by name_ptr is exactly "."
+Note: or "..", 0 otherwise. Used to skip the self/parent directory entries that
+Note: getdents64 reports so recursive walks never ascend or loop on themselves.
+Process called "dirent_is_dot_entry" takes name_ptr as Integer returns Integer:
+    Let first be proc memory_get_byte from MemoryCore with name_ptr, 0
+    If first is not equal to 46:
+        Return 0
+    End If
+    Let second be proc memory_get_byte from MemoryCore with name_ptr, 1
+    If second is equal to 0:
+        Note: name is "."
+        Return 1
+    End If
+    If second is equal to 46:
+        Let third be proc memory_get_byte from MemoryCore with name_ptr, 2
+        If third is equal to 0:
+            Note: name is ".."
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Note: Build a freshly allocated, null-terminated, caller-owned path by joining a
+Note: directory string and a child name with a single '/' separator
+Note: ("dir" + "/" + "name"). The directory's own length is used verbatim, so a
+Note: trailing separator on dir would produce a doubled separator; callers in
+Note: this module pass clean directory paths. Returns 0 if either argument is 0
+Note: or allocation fails.
+Process called "join_path" takes dir as Integer, name as Integer returns Integer:
+    If dir is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let dir_len be proc string_length from StringCore with dir
+    Let name_len be proc string_length from StringCore with name
+    Let total be dir_len plus name_len plus 1
+    Let buffer be proc allocate from Layout with total plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from MemoryCore with buffer, dir, dir_len
+    proc memory_set_byte from MemoryCore with buffer, dir_len, PATH_SEPARATOR_BYTE
+    proc memory_copy from MemoryCore with buffer plus dir_len plus 1, name, name_len
+    proc memory_set_byte from MemoryCore with buffer, total, 0
+    Return buffer
 End Process
 
 Note: Return the current wall-clock time as whole seconds since the Unix epoch.
