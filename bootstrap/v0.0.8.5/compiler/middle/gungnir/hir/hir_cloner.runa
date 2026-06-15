@@ -1,0 +1,1312 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements HIRCloner: structural duplication and rewriting of the
+real Runa HIR (the uniform HIRNode model defined in hir.runa and the
+accessor/metadata surface defined in hir_nodes.runa).
+
+This file performs the following tasks:
+- Deep recursive duplication of HIR subtrees (clone_node), preserving node
+  kind, scalar payload, type information, scope/symbol bindings, the children
+  list, and every named property held in the metadata dictionary.
+- Variable-reference remapping inside a cloned subtree (substitute_variables),
+  used by inlining and monomorphization to bind parameters to arguments.
+- Call-site discovery (find_call_sites): locates HIR call expressions whose
+  callee resolves to a given process definition.
+- Return rewriting (convert_returns_to_assignments): turns HIR_RETURN nodes
+  into assignment-to-result plus a jump to an end label, the canonical
+  transformation for inlining a callee body into a caller.
+- Parent-relative tree splicing (replace_node, insert_before, insert_after,
+  remove_node) over the real children-list / metadata-slot representation.
+- Node-size estimation (estimate_node_size) and integer-literal construction
+  (create_int_literal) built on the real constructors.
+
+This file is essential because:
+- Every specialization, monomorphization, and inlining transformation must
+  duplicate or rewrite HIR without aliasing the original tree.
+- A single, correct, model-aware cloner removes the per-pass ad-hoc copies
+  that previously diverged from the real HIR layout.
+
+Dependencies:
+- hir.runa            : core HIRNode layout, create_hir_node, node accessors
+- hir_nodes.runa      : node-kind constants and the metadata/accessor surface
+- memory/layout.runa  : raw field load/store and allocation
+- collections/list.runa       : children-list and argument-list management
+- collections/dictionary.runa : metadata dictionary traversal
+- core/string_core.runa       : metadata-key and identifier-name comparison
+:End Note
+
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note:
+========================================
+HIRNode FIELD OFFSETS (mirror of hir.runa HIRNode layout)
+========================================
+The HIRNode header is 104 bytes; these byte offsets are the load-bearing
+field positions documented in hir.runa's create_hir_node. They are restated
+here as named constants so this module reads and writes the same slots the
+core constructors do.
+:End Note
+
+Constant NODE_TYPE_OFFSET as Integer is 0
+Constant NODE_LINE_OFFSET as Integer is 8
+Constant NODE_COLUMN_OFFSET as Integer is 16
+Constant NODE_CHILDREN_OFFSET as Integer is 24
+Constant NODE_CHILD_COUNT_OFFSET as Integer is 32
+Constant NODE_VALUE_OFFSET as Integer is 40
+Constant NODE_VALUE_TYPE_OFFSET as Integer is 48
+Constant NODE_METADATA_OFFSET as Integer is 56
+Constant NODE_PARENT_OFFSET as Integer is 64
+Constant NODE_TYPE_INFO_OFFSET as Integer is 72
+Constant NODE_SCOPE_ID_OFFSET as Integer is 80
+Constant NODE_SYMBOL_ID_OFFSET as Integer is 88
+Constant NODE_AST_NODE_OFFSET as Integer is 96
+Constant NODE_HEADER_SIZE as Integer is 104
+
+Note:
+========================================
+METADATA KEY CLASSIFICATION
+========================================
+The metadata dictionary (offset 56) holds three value categories per key:
+1. Scalar keys: string pointers, operator codes, and boolean flags. These are
+   copied verbatim into the clone (no recursion).
+2. Node-list keys: List pointers whose elements are themselves HIR nodes. Each
+   element is cloned and re-parented under the clone.
+3. Node keys (the default): a single HIR node pointer that is cloned
+   recursively.
+
+These sets are the complete metadata-key universe emitted by hir_nodes.runa's
+setters; classifying every key deterministically guarantees a faithful deep
+clone with no aliasing of the original tree.
+:End Note
+
+@Reasoning
+A metadata key is scalar when its value is a string, an operator code, or a
+boolean flag rather than a child HIR node. Copying these verbatim is correct
+because the clone shares immutable name/flag payloads with the original; only
+mutable subtree structure must be duplicated.
+@End Reasoning
+Process called "is_scalar_metadata_key" that takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+
+    If StringCore.string_equals(key, "name") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "member_name") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "variable_name") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "parameter_name") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "type_name") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "path") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "alias") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "operator") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_named") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_optional") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_static") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_final") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_const") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "is_abstract") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "has_expression_body") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "redirect_name") is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+A metadata key holds a List of HIR nodes when it names one of the ordered
+child collections the accessor surface exposes (argument lists, member lists,
+parameter lists, case lists, and so on). These require element-wise cloning
+and re-parenting so the clone owns an independent collection.
+@End Reasoning
+Process called "is_node_list_metadata_key" that takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+
+    If StringCore.string_equals(key, "positional_args") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "named_args") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "parameters") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "members") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "cases") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "operations") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "initializers") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "values") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "type_parameters") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "type_arguments") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "parameter_types") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "mixins") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "interfaces") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "constraints") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "catch_clauses") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "parts") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "imports") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "exports") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "show_list") is equal to 1:
+        Return 1
+    End If
+    If StringCore.string_equals(key, "hide_list") is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note:
+========================================
+HIR NODE-KIND CLASSIFICATION
+========================================
+:End Note
+
+@Reasoning
+A value read from a metadata node-slot or a children-list slot is a real HIR
+node when its kind word (offset 0) falls in one of the documented HIR kind
+bands: expressions/identifiers/literals (10000-10999 core, 17200-17556
+translation), statements (11000-11999 core, 17100-17117 translation),
+declarations (12000-12999 core, 17000-17016 translation), the type-system
+band (13000-13999), pattern band (14000-14999), ownership band
+(15000-15999), and the translation type/op bands (17300-17556). The
+classification lets the cloner deep-copy genuine subtrees while leaving raw
+scalar payloads untouched, and it backstops the metadata key classification
+for any node-slot key.
+@End Reasoning
+Process called "is_hir_node_kind" that takes kind as Integer returns Integer:
+    If kind is greater than or equal to 10000:
+        If kind is less than 16000:
+            Return 1
+        End If
+    End If
+
+    If kind is greater than or equal to 17000:
+        If kind is less than 17600:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note:
+========================================
+CORE DEEP CLONE
+========================================
+:End Note
+
+@Reasoning
+clone_node produces a structurally independent deep copy of an HIR subtree.
+The copy preserves the node kind, the scalar value/value_type payload, the
+attached HIRTypeInfo, scope id, symbol id, source position, and AST back-link,
+then recursively duplicates the children list and every metadata-held
+subtree. No node object is shared between the original and the clone, so a
+subsequent transformation pass may rewrite the clone freely without disturbing
+the source definition.
+@End Reasoning
+
+@Implementation
+1. Allocate a fresh 104-byte HIRNode of the same kind via create_hir_node.
+2. Copy the scalar header slots verbatim (value, value_type, type_info,
+   scope_id, symbol_id, line, column, ast_node).
+3. If a children list is present, clone each element (HIR_MAP_LITERAL stores
+   16-byte key/value entry blocks rather than bare nodes, so its entries are
+   cloned via clone_map_entry) and append the clone, maintaining child_count.
+4. If a metadata dictionary is present, enumerate its keys and rebuild an
+   independent dictionary: scalar keys copy verbatim, node-list keys clone
+   each element into a fresh list, node-slot keys clone the single subtree.
+   Cloned children and node-slot values have their parent pointer set to the
+   clone so the duplicated tree is internally consistent.
+@End Implementation
+
+@Performance_Hints
+The dominant cost is the recursive descent and the per-node allocation; the
+header copy is a fixed set of nine loads/stores. Metadata-key classification
+is a short string-compare chain bounded by the small fixed key universe.
+@End Performance_Hints
+
+@Security_Scope
+Returns a raw owned pointer into the HIR arena. The caller owns the clone and
+must attach it to a parent (directly or through the splice operations) so the
+tree walker reaches it during cleanup. Returns 0 on null input or allocation
+failure; callers must check before dereferencing.
+@End Security_Scope
+Process called "clone_node" that takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be Layout.memory_get_int64(node, NODE_TYPE_OFFSET)
+    Let line be Layout.memory_get_int64(node, NODE_LINE_OFFSET)
+    Let column be Layout.memory_get_int64(node, NODE_COLUMN_OFFSET)
+
+    Let clone be HIR.create_hir_node(kind, line, column)
+    If clone is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy scalar header slots verbatim (payload + bindings)
+    Let value be Layout.memory_get_int64(node, NODE_VALUE_OFFSET)
+    Layout.memory_set_int64(clone, NODE_VALUE_OFFSET, value)
+
+    Let value_type be Layout.memory_get_int64(node, NODE_VALUE_TYPE_OFFSET)
+    Layout.memory_set_int64(clone, NODE_VALUE_TYPE_OFFSET, value_type)
+
+    Let type_info be Layout.memory_get_int64(node, NODE_TYPE_INFO_OFFSET)
+    Layout.memory_set_int64(clone, NODE_TYPE_INFO_OFFSET, type_info)
+
+    Let scope_id be Layout.memory_get_int64(node, NODE_SCOPE_ID_OFFSET)
+    Layout.memory_set_int64(clone, NODE_SCOPE_ID_OFFSET, scope_id)
+
+    Let symbol_id be Layout.memory_get_int64(node, NODE_SYMBOL_ID_OFFSET)
+    Layout.memory_set_int64(clone, NODE_SYMBOL_ID_OFFSET, symbol_id)
+
+    Let ast_node be Layout.memory_get_int64(node, NODE_AST_NODE_OFFSET)
+    Layout.memory_set_int64(clone, NODE_AST_NODE_OFFSET, ast_node)
+
+    Note: Clone the children list (if any)
+    Let children be Layout.memory_get_int64(node, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        Let cloned_children be List.list_create()
+        Let child_total be List.list_length(children)
+        Let child_idx be 0
+        While child_idx is less than child_total:
+            Let child be List.list_get(children, child_idx)
+            Let cloned_child be 0
+            If kind is equal to HIRNodes.HIR_MAP_LITERAL:
+                Set cloned_child to clone_map_entry(child)
+            Otherwise:
+                Set cloned_child to clone_node(child)
+                If cloned_child is not equal to 0:
+                    Layout.memory_set_int64(cloned_child, NODE_PARENT_OFFSET, clone)
+                End If
+            End If
+            List.append(cloned_children, cloned_child)
+            Set child_idx to (child_idx plus 1)
+        End While
+        Layout.memory_set_int64(clone, NODE_CHILDREN_OFFSET, cloned_children)
+        Layout.memory_set_int64(clone, NODE_CHILD_COUNT_OFFSET, child_total)
+    End If
+
+    Note: Clone the metadata dictionary (if any)
+    Let meta be Layout.memory_get_int64(node, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let cloned_meta be Dict.create()
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+            Let entry_value be Dict.get(meta, key)
+
+            If is_scalar_metadata_key(key) is equal to 1:
+                Dict.set(cloned_meta, key, entry_value)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Let cloned_list be clone_node_list(entry_value, clone)
+                    Dict.set(cloned_meta, key, cloned_list)
+                Otherwise:
+                    Note: Default: single node slot, or an unclassified scalar.
+                    Note: Probe the kind word; clone only genuine HIR nodes.
+                    If entry_value is equal to 0:
+                        Dict.set(cloned_meta, key, 0)
+                    Otherwise:
+                        Let slot_kind be Layout.memory_get_int64(entry_value, NODE_TYPE_OFFSET)
+                        If is_hir_node_kind(slot_kind) is equal to 1:
+                            Let cloned_slot be clone_node(entry_value)
+                            If cloned_slot is not equal to 0:
+                                Layout.memory_set_int64(cloned_slot, NODE_PARENT_OFFSET, clone)
+                            End If
+                            Dict.set(cloned_meta, key, cloned_slot)
+                        Otherwise:
+                            Dict.set(cloned_meta, key, entry_value)
+                        End If
+                    End If
+                End If
+            End If
+
+            Set key_idx to (key_idx plus 1)
+        End While
+        Layout.memory_set_int64(clone, NODE_METADATA_OFFSET, cloned_meta)
+    End If
+
+    Return clone
+End Process
+
+@Reasoning
+Node-list metadata values (argument lists, member lists, etc.) are ordered
+Lists of HIR nodes. Cloning produces a fresh List whose elements are deep
+clones re-parented under the owning clone, preserving order and ownership.
+@End Reasoning
+Process called "clone_node_list" that takes source_list as Integer, new_parent as Integer returns Integer:
+    If source_list is equal to 0:
+        Return 0
+    End If
+
+    Let cloned_list be List.list_create()
+    Let total be List.list_length(source_list)
+    Let idx be 0
+    While idx is less than total:
+        Let element be List.list_get(source_list, idx)
+        Let cloned_element be clone_node(element)
+        If cloned_element is not equal to 0:
+            Layout.memory_set_int64(cloned_element, NODE_PARENT_OFFSET, new_parent)
+        End If
+        List.append(cloned_list, cloned_element)
+        Set idx to (idx plus 1)
+    End While
+
+    Return cloned_list
+End Process
+
+@Reasoning
+A HIR_MAP_LITERAL stores each entry as a 16-byte block laid out
+[key_expr(0), value_expr(8)] (per hir_add_map_entry). Cloning an entry
+duplicates both expression nodes into a fresh block so the cloned map owns
+independent key/value subtrees.
+@End Reasoning
+Process called "clone_map_entry" that takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Let cloned_entry be Layout.allocate(16)
+    If cloned_entry is equal to 0:
+        Return 0
+    End If
+
+    Let key_expr be Layout.memory_get_int64(entry, 0)
+    Let value_expr be Layout.memory_get_int64(entry, 8)
+
+    Let cloned_key be clone_node(key_expr)
+    Let cloned_value be clone_node(value_expr)
+
+    Layout.memory_set_int64(cloned_entry, 0, cloned_key)
+    Layout.memory_set_int64(cloned_entry, 8, cloned_value)
+
+    Return cloned_entry
+End Process
+
+Note:
+========================================
+VARIABLE SUBSTITUTION
+========================================
+:End Note
+
+@Reasoning
+substitute_variables rewrites identifier references inside a cloned subtree
+according to a name -> replacement-node mapping. Inlining builds this mapping
+from each callee parameter name to the corresponding caller argument; after
+substitution the cloned body reads its inputs directly from the call's
+argument expressions rather than from parameters that no longer exist.
+
+The mapping is keyed by parameter name (string) because HIR_IDENTIFIER nodes
+carry their name in the value slot and that name is the stable join key
+between a parameter declaration (HIR_PARAMETER "name" property) and its uses.
+@End Reasoning
+
+@Implementation
+Walk the subtree. At each HIR_IDENTIFIER node, look up its name in the mapping;
+if present, splice the mapped replacement in place of the identifier within its
+owning parent slot (children list entry or metadata node slot). The walk
+descends through the children list and every metadata node/node-list slot,
+mirroring clone_node's structure so no reachable identifier is missed. The
+substitution operates on the cloned tree in place and returns the (possibly
+unchanged) root.
+@End Implementation
+
+@Security_Scope
+Mutates the supplied subtree in place; callers pass a freshly cloned body, not
+a shared original. The mapping dictionary is read-only here. Replacement nodes
+are taken verbatim (their parent pointer is updated to the new owner), so they
+must not be shared across multiple substitution sites unless the caller
+intends aliasing; inlining clones arguments per call site to avoid this.
+@End Security_Scope
+Process called "substitute_variables" that takes node as Integer, mapping as Integer returns Integer:
+    If node is equal to 0:
+        Return node
+    End If
+    If mapping is equal to 0:
+        Return node
+    End If
+
+    Note: Descend into the children list, substituting in place.
+    Let children be Layout.memory_get_int64(node, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        Let kind be Layout.memory_get_int64(node, NODE_TYPE_OFFSET)
+        Let child_total be List.list_length(children)
+        Let child_idx be 0
+        While child_idx is less than child_total:
+            Let child be List.list_get(children, child_idx)
+            If kind is equal to HIRNodes.HIR_MAP_LITERAL:
+                substitute_map_entry(child, mapping)
+            Otherwise:
+                Let replacement be try_substitute_identifier(child, mapping)
+                If replacement is not equal to child:
+                    Layout.memory_set_int64(replacement, NODE_PARENT_OFFSET, node)
+                    List.list_set(children, child_idx, replacement)
+                Otherwise:
+                    substitute_variables(child, mapping)
+                End If
+            End If
+            Set child_idx to (child_idx plus 1)
+        End While
+    End If
+
+    Note: Descend into metadata node and node-list slots.
+    Let meta be Layout.memory_get_int64(node, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+
+            If is_scalar_metadata_key(key) is equal to 1:
+                Note: Scalar payloads are never variable references.
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Let slot_list be Dict.get(meta, key)
+                    substitute_node_list(slot_list, node, mapping)
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is equal to 0:
+                        Set key_idx to (key_idx plus 1)
+                    Otherwise:
+                        Let slot_kind be Layout.memory_get_int64(slot, NODE_TYPE_OFFSET)
+                        If is_hir_node_kind(slot_kind) is equal to 1:
+                            Let slot_replacement be try_substitute_identifier(slot, mapping)
+                            If slot_replacement is not equal to slot:
+                                Layout.memory_set_int64(slot_replacement, NODE_PARENT_OFFSET, node)
+                                Dict.set(meta, key, slot_replacement)
+                            Otherwise:
+                                substitute_variables(slot, mapping)
+                            End If
+                        End If
+                        Set key_idx to (key_idx plus 1)
+                    End If
+                End If
+            End If
+        End While
+    End If
+
+    Return node
+End Process
+
+@Reasoning
+For a node-list slot, each element may itself be a variable reference (e.g. an
+identifier passed positionally) or a deeper subtree. We substitute each
+element in place, re-parenting any direct replacement.
+@End Reasoning
+Process called "substitute_node_list" that takes slot_list as Integer, owner as Integer, mapping as Integer returns Integer:
+    If slot_list is equal to 0:
+        Return 0
+    End If
+
+    Let total be List.list_length(slot_list)
+    Let idx be 0
+    While idx is less than total:
+        Let element be List.list_get(slot_list, idx)
+        Let replacement be try_substitute_identifier(element, mapping)
+        If replacement is not equal to element:
+            Layout.memory_set_int64(replacement, NODE_PARENT_OFFSET, owner)
+            List.list_set(slot_list, idx, replacement)
+        Otherwise:
+            substitute_variables(element, mapping)
+        End If
+        Set idx to (idx plus 1)
+    End While
+
+    Return 1
+End Process
+
+@Reasoning
+A HIR_MAP_LITERAL entry holds two expression slots; each may be or contain a
+variable reference, so both are substituted in place.
+@End Reasoning
+Process called "substitute_map_entry" that takes entry as Integer, mapping as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Let key_expr be Layout.memory_get_int64(entry, 0)
+    Let key_replacement be try_substitute_identifier(key_expr, mapping)
+    If key_replacement is not equal to key_expr:
+        Layout.memory_set_int64(entry, 0, key_replacement)
+    Otherwise:
+        substitute_variables(key_expr, mapping)
+    End If
+
+    Let value_expr be Layout.memory_get_int64(entry, 8)
+    Let value_replacement be try_substitute_identifier(value_expr, mapping)
+    If value_replacement is not equal to value_expr:
+        Layout.memory_set_int64(entry, 8, value_replacement)
+    Otherwise:
+        substitute_variables(value_expr, mapping)
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+If a node is an identifier whose name appears in the mapping, the mapped
+replacement node is returned; otherwise the node is returned unchanged. The
+caller distinguishes "substituted" from "unchanged" by pointer identity.
+@End Reasoning
+Process called "try_substitute_identifier" that takes node as Integer, mapping as Integer returns Integer:
+    If node is equal to 0:
+        Return node
+    End If
+
+    Let kind be Layout.memory_get_int64(node, NODE_TYPE_OFFSET)
+    If kind is not equal to HIRNodes.HIR_IDENTIFIER:
+        Return node
+    End If
+
+    Let name be Layout.memory_get_int64(node, NODE_VALUE_OFFSET)
+    If name is equal to 0:
+        Return node
+    End If
+
+    Let replacement be Dict.get(mapping, name)
+    If replacement is equal to 0:
+        Return node
+    End If
+
+    Return replacement
+End Process
+
+Note:
+========================================
+CALL-SITE DISCOVERY
+========================================
+:End Note
+
+@Reasoning
+find_call_sites locates every HIR_CALL_EXPR in a subtree whose callee resolves
+to a target process definition, appending each matching call node to the
+result list. Inlining iterates this list to substitute each call with the
+callee body. A call matches when its callee identifier's resolved symbol id
+equals the target's symbol id, or, when symbols are unresolved, when the
+callee identifier name equals the target's process name.
+@End Reasoning
+
+@Implementation
+Recursively walk the subtree (children list and metadata node / node-list
+slots). At each HIR_CALL_EXPR, read its "callee" property; if the callee is an
+identifier, compare its symbol id against the target's symbol id (HIRNode
+offset 88 on the target's base node) and, as a fallback, its name against the
+target's process name. Matching calls are appended to result_list. Returns the
+number of call sites found.
+@End Implementation
+Process called "find_call_sites" that takes root as Integer, target_fn as Integer, result_list as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If result_list is equal to 0:
+        Return 0
+    End If
+
+    Let target_symbol be 0
+    Let target_name be 0
+    If target_fn is not equal to 0:
+        Set target_symbol to Layout.memory_get_int64(target_fn, NODE_SYMBOL_ID_OFFSET)
+        Set target_name to HIRNodes.hir_get_function_name(target_fn)
+    End If
+
+    Let found be 0
+    Set found to find_call_sites_walk(root, target_symbol, target_name, result_list)
+    Return found
+End Process
+
+@Reasoning
+The recursive worker carries the resolved target identity (symbol id and name)
+so each node is tested without re-deriving them. Both the children list and
+metadata-held subtrees are visited so calls nested anywhere in the body are
+discovered.
+@End Reasoning
+Process called "find_call_sites_walk" that takes node as Integer, target_symbol as Integer, target_name as Integer, result_list as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let found be 0
+    Let kind be Layout.memory_get_int64(node, NODE_TYPE_OFFSET)
+
+    If kind is equal to HIRNodes.HIR_CALL_EXPR:
+        If call_targets(node, target_symbol, target_name) is equal to 1:
+            List.append(result_list, node)
+            Set found to (found plus 1)
+        End If
+    End If
+
+    Note: Visit children list.
+    Let children be Layout.memory_get_int64(node, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        If kind is equal to HIRNodes.HIR_MAP_LITERAL:
+            Let entry_total be List.list_length(children)
+            Let entry_idx be 0
+            While entry_idx is less than entry_total:
+                Let entry be List.list_get(children, entry_idx)
+                If entry is not equal to 0:
+                    Let key_expr be Layout.memory_get_int64(entry, 0)
+                    Set found to (found plus find_call_sites_walk(key_expr, target_symbol, target_name, result_list))
+                    Let value_expr be Layout.memory_get_int64(entry, 8)
+                    Set found to (found plus find_call_sites_walk(value_expr, target_symbol, target_name, result_list))
+                End If
+                Set entry_idx to (entry_idx plus 1)
+            End While
+        Otherwise:
+            Let child_total be List.list_length(children)
+            Let child_idx be 0
+            While child_idx is less than child_total:
+                Let child be List.list_get(children, child_idx)
+                Set found to (found plus find_call_sites_walk(child, target_symbol, target_name, result_list))
+                Set child_idx to (child_idx plus 1)
+            End While
+        End If
+    End If
+
+    Note: Visit metadata node and node-list slots.
+    Let meta be Layout.memory_get_int64(node, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+
+            If is_scalar_metadata_key(key) is equal to 1:
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Let slot_list be Dict.get(meta, key)
+                    If slot_list is not equal to 0:
+                        Let elem_total be List.list_length(slot_list)
+                        Let elem_idx be 0
+                        While elem_idx is less than elem_total:
+                            Let element be List.list_get(slot_list, elem_idx)
+                            Set found to (found plus find_call_sites_walk(element, target_symbol, target_name, result_list))
+                            Set elem_idx to (elem_idx plus 1)
+                        End While
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is not equal to 0:
+                        Let slot_kind be Layout.memory_get_int64(slot, NODE_TYPE_OFFSET)
+                        If is_hir_node_kind(slot_kind) is equal to 1:
+                            Set found to (found plus find_call_sites_walk(slot, target_symbol, target_name, result_list))
+                        End If
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                End If
+            End If
+        End While
+    End If
+
+    Return found
+End Process
+
+@Reasoning
+A call targets the function when its callee identifier resolves to the same
+symbol, or (symbols unresolved) bears the same name. The callee is read via
+the canonical "callee" accessor.
+@End Reasoning
+Process called "call_targets" that takes call_node as Integer, target_symbol as Integer, target_name as Integer returns Integer:
+    Let callee be HIRNodes.hir_get_call_callee(call_node)
+    If callee is equal to 0:
+        Return 0
+    End If
+
+    Let callee_kind be Layout.memory_get_int64(callee, NODE_TYPE_OFFSET)
+    If callee_kind is not equal to HIRNodes.HIR_IDENTIFIER:
+        Return 0
+    End If
+
+    Note: Prefer resolved-symbol identity when both sides are resolved.
+    If target_symbol is not equal to 0:
+        Let callee_symbol be Layout.memory_get_int64(callee, NODE_SYMBOL_ID_OFFSET)
+        If callee_symbol is not equal to 0:
+            If callee_symbol is equal to target_symbol:
+                Return 1
+            End If
+            Return 0
+        End If
+    End If
+
+    Note: Fallback: compare identifier name against the target name.
+    If target_name is equal to 0:
+        Return 0
+    End If
+
+    Let callee_name be Layout.memory_get_int64(callee, NODE_VALUE_OFFSET)
+    If StringCore.string_equals(callee_name, target_name) is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note:
+========================================
+RETURN REWRITING
+========================================
+:End Note
+
+@Reasoning
+convert_returns_to_assignments rewrites every HIR_RETURN inside an inlined
+body. A "Return e" becomes "Set result_var to e" followed by a jump to the
+body's end label; a bare "Return" becomes just the jump. After this rewrite the
+cloned body has no return statements and its value flows into result_var, which
+the caller reads in place of the original call expression.
+
+The transformation is performed in place on the cloned body. Each return is
+replaced within its owning parent slot (children-list entry or metadata node
+slot) by an assignment statement, and a jump-to-end-label statement is spliced
+immediately after it so control leaves the inlined region exactly where the
+call used to return.
+@End Reasoning
+
+@Implementation
+Walk the cloned body. For each HIR_RETURN found in a block's children list:
+1. Read the return value expression ("value" property).
+2. Build an assignment: HIR_ASSIGN_EXPR with lhs = identifier(result_var
+   name), operator = HIR_ASSIGN_SIMPLE, rhs = the return value (when present),
+   wrapped in a HIR_EXPR_STMT.
+3. Build a jump: a HIR_BREAK statement carrying the end label name in its
+   "name" property (the inliner emits a labeled block whose end the break
+   targets).
+4. Replace the return entry with the assignment statement and insert the jump
+   immediately after it, keeping child_count consistent.
+For returns reached through a metadata node slot (e.g. an if-branch that is a
+single return rather than a block), the slot is rewritten to a freshly built
+two-statement block holding the assignment and the jump.
+A return with no value yields just the jump (no assignment), since there is no
+value to bind.
+@End Implementation
+Process called "convert_returns_to_assignments" that takes body as Integer, result_var as Integer, end_label as Integer returns Integer:
+    If body is equal to 0:
+        Return 0
+    End If
+
+    Let kind be Layout.memory_get_int64(body, NODE_TYPE_OFFSET)
+
+    Note: Rewrite returns that live directly in a block's children list.
+    Let children be Layout.memory_get_int64(body, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        If kind is not equal to HIRNodes.HIR_MAP_LITERAL:
+            Let idx be 0
+            While idx is less than List.list_length(children):
+                Let stmt be List.list_get(children, idx)
+                Let stmt_kind be 0
+                If stmt is not equal to 0:
+                    Set stmt_kind to Layout.memory_get_int64(stmt, NODE_TYPE_OFFSET)
+                End If
+
+                If stmt_kind is equal to HIRNodes.HIR_RETURN:
+                    Let assign_stmt be build_return_assignment(stmt, result_var)
+                    Let jump_stmt be build_jump(end_label)
+
+                    If assign_stmt is equal to 0:
+                        Note: Void return: replace the return with just the jump.
+                        Layout.memory_set_int64(jump_stmt, NODE_PARENT_OFFSET, body)
+                        List.list_set(children, idx, jump_stmt)
+                        Set idx to (idx plus 1)
+                    Otherwise:
+                        Layout.memory_set_int64(assign_stmt, NODE_PARENT_OFFSET, body)
+                        List.list_set(children, idx, assign_stmt)
+                        Layout.memory_set_int64(jump_stmt, NODE_PARENT_OFFSET, body)
+                        List.insert(children, (idx plus 1), jump_stmt)
+                        Let new_count be Layout.memory_get_int64(body, NODE_CHILD_COUNT_OFFSET)
+                        Layout.memory_set_int64(body, NODE_CHILD_COUNT_OFFSET, (new_count plus 1))
+                        Set idx to (idx plus 2)
+                    End If
+                Otherwise:
+                    Note: Recurse into nested statement structure.
+                    convert_returns_to_assignments(stmt, result_var, end_label)
+                    Set idx to (idx plus 1)
+                End If
+            End While
+        End If
+    End If
+
+    Note: Rewrite returns reached through metadata node slots (e.g. if-branch
+    Note: that is a single return statement, or a loop body).
+    Let meta be Layout.memory_get_int64(body, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+
+            If is_scalar_metadata_key(key) is equal to 1:
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is equal to 0:
+                        Set key_idx to (key_idx plus 1)
+                    Otherwise:
+                        Let slot_kind be Layout.memory_get_int64(slot, NODE_TYPE_OFFSET)
+                        If slot_kind is equal to HIRNodes.HIR_RETURN:
+                            Let replacement_block be build_return_block(slot, result_var, end_label)
+                            Layout.memory_set_int64(replacement_block, NODE_PARENT_OFFSET, body)
+                            Dict.set(meta, key, replacement_block)
+                        Otherwise:
+                            If is_hir_node_kind(slot_kind) is equal to 1:
+                                convert_returns_to_assignments(slot, result_var, end_label)
+                            End If
+                        End If
+                        Set key_idx to (key_idx plus 1)
+                    End If
+                End If
+            End If
+        End While
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Builds the assignment statement that captures a return value into the inline
+result variable. Returns 0 when the return is void (no value) so the caller
+emits only the jump.
+@End Reasoning
+Process called "build_return_assignment" that takes return_stmt as Integer, result_var as Integer returns Integer:
+    Let value_expr be HIRNodes.hir_get_return_value(return_stmt)
+    If value_expr is equal to 0:
+        Return 0
+    End If
+
+    Let lhs be HIRNodes.hir_create_identifier(result_var)
+    Let assign be HIRNodes.hir_create_assign_expr(lhs, HIRNodes.HIR_ASSIGN_SIMPLE, value_expr)
+    If assign is equal to 0:
+        Return 0
+    End If
+
+    Let assign_stmt be HIRNodes.hir_create_expression_statement(assign)
+    Return assign_stmt
+End Process
+
+@Reasoning
+Builds the control-flow jump that leaves the inlined region. The break carries
+the end-label name so the inliner's labeled wrapper block can resolve it.
+@End Reasoning
+Process called "build_jump" that takes end_label as Integer returns Integer:
+    Let jump be HIRNodes.hir_create_break()
+    If jump is equal to 0:
+        Return 0
+    End If
+
+    If end_label is not equal to 0:
+        HIRNodes.hir_set_metadata(jump, "name", end_label)
+    End If
+
+    Return jump
+End Process
+
+@Reasoning
+For a return reached as a single-statement branch, wraps the rewritten
+assignment-and-jump in a fresh block so the branch slot remains a single
+statement node.
+@End Reasoning
+Process called "build_return_block" that takes return_stmt as Integer, result_var as Integer, end_label as Integer returns Integer:
+    Let block be HIRNodes.hir_create_block()
+    If block is equal to 0:
+        Return 0
+    End If
+
+    Let assign_stmt be build_return_assignment(return_stmt, result_var)
+    If assign_stmt is not equal to 0:
+        HIRNodes.hir_add_statement(block, assign_stmt)
+    End If
+
+    Let jump_stmt be build_jump(end_label)
+    HIRNodes.hir_add_statement(block, jump_stmt)
+
+    Return block
+End Process
+
+Note:
+========================================
+TREE SPLICING
+========================================
+:End Note
+
+@Reasoning
+replace_node swaps old_node for new_node within parent. The old node may be
+held in the parent's children list or in a metadata node slot; both are
+checked so the operation works regardless of how the parent references the
+child. The new node's parent pointer is updated to parent.
+@End Reasoning
+Process called "replace_node" that takes parent as Integer, old_node as Integer, new_node as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+
+    Note: Children-list slot.
+    Let children be Layout.memory_get_int64(parent, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        Let idx be List.list_index_of(children, old_node)
+        If idx is greater than or equal to 0:
+            List.list_set(children, idx, new_node)
+            If new_node is not equal to 0:
+                Layout.memory_set_int64(new_node, NODE_PARENT_OFFSET, parent)
+            End If
+            Return 1
+        End If
+    End If
+
+    Note: Metadata node slot.
+    Let meta be Layout.memory_get_int64(parent, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+            If is_scalar_metadata_key(key) is equal to 1:
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Let slot_list be Dict.get(meta, key)
+                    If slot_list is not equal to 0:
+                        Let lidx be List.list_index_of(slot_list, old_node)
+                        If lidx is greater than or equal to 0:
+                            List.list_set(slot_list, lidx, new_node)
+                            If new_node is not equal to 0:
+                                Layout.memory_set_int64(new_node, NODE_PARENT_OFFSET, parent)
+                            End If
+                            Return 1
+                        End If
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is equal to old_node:
+                        Dict.set(meta, key, new_node)
+                        If new_node is not equal to 0:
+                            Layout.memory_set_int64(new_node, NODE_PARENT_OFFSET, parent)
+                        End If
+                        Return 1
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                End If
+            End If
+        End While
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+insert_before inserts new_node immediately before anchor in parent's children
+list. Splicing into a positional sequence is only meaningful for the
+children-list representation (blocks, modules, list literals); the operation
+returns 0 if anchor is not a list child.
+@End Reasoning
+Process called "insert_before" that takes parent as Integer, anchor as Integer, new_node as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+
+    Let children be Layout.memory_get_int64(parent, NODE_CHILDREN_OFFSET)
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let idx be List.list_index_of(children, anchor)
+    If idx is less than 0:
+        Return 0
+    End If
+
+    List.insert(children, idx, new_node)
+    If new_node is not equal to 0:
+        Layout.memory_set_int64(new_node, NODE_PARENT_OFFSET, parent)
+    End If
+
+    Let count be Layout.memory_get_int64(parent, NODE_CHILD_COUNT_OFFSET)
+    Layout.memory_set_int64(parent, NODE_CHILD_COUNT_OFFSET, (count plus 1))
+
+    Return 1
+End Process
+
+@Reasoning
+insert_after inserts new_node immediately after anchor in parent's children
+list, mirroring insert_before.
+@End Reasoning
+Process called "insert_after" that takes parent as Integer, anchor as Integer, new_node as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+
+    Let children be Layout.memory_get_int64(parent, NODE_CHILDREN_OFFSET)
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let idx be List.list_index_of(children, anchor)
+    If idx is less than 0:
+        Return 0
+    End If
+
+    List.insert(children, (idx plus 1), new_node)
+    If new_node is not equal to 0:
+        Layout.memory_set_int64(new_node, NODE_PARENT_OFFSET, parent)
+    End If
+
+    Let count be Layout.memory_get_int64(parent, NODE_CHILD_COUNT_OFFSET)
+    Layout.memory_set_int64(parent, NODE_CHILD_COUNT_OFFSET, (count plus 1))
+
+    Return 1
+End Process
+
+@Reasoning
+remove_node detaches node from parent. As with replace_node, the node may be a
+children-list entry or a metadata node slot; both are checked. Removing from
+the children list shrinks it and decrements child_count; clearing a metadata
+node slot writes 0.
+@End Reasoning
+Process called "remove_node" that takes parent as Integer, node as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+
+    Let children be Layout.memory_get_int64(parent, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        Let idx be List.list_index_of(children, node)
+        If idx is greater than or equal to 0:
+            List.remove_at(children, idx)
+            Let count be Layout.memory_get_int64(parent, NODE_CHILD_COUNT_OFFSET)
+            If count is greater than 0:
+                Layout.memory_set_int64(parent, NODE_CHILD_COUNT_OFFSET, (count minus 1))
+            End If
+            Return 1
+        End If
+    End If
+
+    Let meta be Layout.memory_get_int64(parent, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+            If is_node_list_metadata_key(key) is equal to 1:
+                Let slot_list be Dict.get(meta, key)
+                If slot_list is not equal to 0:
+                    Let lidx be List.list_index_of(slot_list, node)
+                    If lidx is greater than or equal to 0:
+                        List.remove_at(slot_list, lidx)
+                        Return 1
+                    End If
+                End If
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_scalar_metadata_key(key) is equal to 1:
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is equal to node:
+                        Dict.set(meta, key, 0)
+                        Return 1
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                End If
+            End If
+        End While
+    End If
+
+    Return 0
+End Process
+
+Note:
+========================================
+NODE SIZE ESTIMATION AND CONSTRUCTION
+========================================
+:End Note
+
+@Reasoning
+estimate_node_size returns a structural weight for a subtree: 1 for the node
+itself plus the recursive weight of every child and metadata-held subtree.
+Inlining and unrolling use this to bound code growth (callers compare the
+result against a budget before duplicating a body).
+@End Reasoning
+Process called "estimate_node_size" that takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let total be 1
+    Let kind be Layout.memory_get_int64(node, NODE_TYPE_OFFSET)
+
+    Let children be Layout.memory_get_int64(node, NODE_CHILDREN_OFFSET)
+    If children is not equal to 0:
+        If kind is equal to HIRNodes.HIR_MAP_LITERAL:
+            Let entry_total be List.list_length(children)
+            Let entry_idx be 0
+            While entry_idx is less than entry_total:
+                Let entry be List.list_get(children, entry_idx)
+                If entry is not equal to 0:
+                    Let key_expr be Layout.memory_get_int64(entry, 0)
+                    Set total to (total plus estimate_node_size(key_expr))
+                    Let value_expr be Layout.memory_get_int64(entry, 8)
+                    Set total to (total plus estimate_node_size(value_expr))
+                End If
+                Set entry_idx to (entry_idx plus 1)
+            End While
+        Otherwise:
+            Let child_total be List.list_length(children)
+            Let child_idx be 0
+            While child_idx is less than child_total:
+                Let child be List.list_get(children, child_idx)
+                Set total to (total plus estimate_node_size(child))
+                Set child_idx to (child_idx plus 1)
+            End While
+        End If
+    End If
+
+    Let meta be Layout.memory_get_int64(node, NODE_METADATA_OFFSET)
+    If meta is not equal to 0:
+        Let keys be Dict.keys(meta)
+        Let key_total be List.list_length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_total:
+            Let key be List.list_get(keys, key_idx)
+            If is_scalar_metadata_key(key) is equal to 1:
+                Set key_idx to (key_idx plus 1)
+            Otherwise:
+                If is_node_list_metadata_key(key) is equal to 1:
+                    Let slot_list be Dict.get(meta, key)
+                    If slot_list is not equal to 0:
+                        Let elem_total be List.list_length(slot_list)
+                        Let elem_idx be 0
+                        While elem_idx is less than elem_total:
+                            Let element be List.list_get(slot_list, elem_idx)
+                            Set total to (total plus estimate_node_size(element))
+                            Set elem_idx to (elem_idx plus 1)
+                        End While
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                Otherwise:
+                    Let slot be Dict.get(meta, key)
+                    If slot is not equal to 0:
+                        Let slot_kind be Layout.memory_get_int64(slot, NODE_TYPE_OFFSET)
+                        If is_hir_node_kind(slot_kind) is equal to 1:
+                            Set total to (total plus estimate_node_size(slot))
+                        End If
+                    End If
+                    Set key_idx to (key_idx plus 1)
+                End If
+            End If
+        End While
+    End If
+
+    Return total
+End Process
+
+@Reasoning
+create_int_literal builds a HIR_INT_LITERAL node carrying value, delegating to
+the real translation-HIR producer so the literal is bit-identical to those the
+frontends emit.
+@End Reasoning
+Process called "create_int_literal" that takes value as Integer returns Integer:
+    Return HIRNodes.hir_create_int_literal(value)
+End Process
+
+@Reasoning
+get_type_info returns the HIRTypeInfo attached to a node, the pointer
+get_type_size and get_type_alignment consume. It delegates to the canonical
+core accessor so all consumers read the same slot.
+@End Reasoning
+Process called "get_type_info" that takes node as Integer returns Integer:
+    Return HIR.get_hir_node_type_info(node)
+End Process

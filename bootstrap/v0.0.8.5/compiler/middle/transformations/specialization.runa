@@ -43,8 +43,10 @@ IMPORTS
 
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/middle/gungnir/hir/hir_cloner.runa" as HIRCloner
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
 Note:
 ========================================
@@ -198,6 +200,78 @@ Constant OPT_VECTORIZE as Integer is 6
 
 Note:
 ========================================
+REAL HIR LAYOUT CONSTANTS
+========================================
+These restate the load-bearing byte offsets and kind values from the real HIR
+(hir.runa / hir_nodes.runa) that this pass reads. The HIRNode header is 104
+bytes; HIRProcessDefinition and HIRTypeDefinition are 96-byte structs whose
+field 0 holds a pointer to the base HIRNode and whose remaining fields carry
+the declaration-specific payload. HIRTypeInfo carries the resolved size,
+alignment, kind, and field count the optimizer consults.
+:End Note
+
+Note: HIRNode header field offsets.
+Constant NODE_KIND_OFFSET as Integer is 0
+Constant NODE_VALUE_OFFSET as Integer is 40
+Constant NODE_PARENT_OFFSET as Integer is 64
+
+Note: HIRProcessDefinition struct field offsets (base_node at 0).
+Constant PROCESS_BASE_NODE_OFFSET as Integer is 0
+Constant PROCESS_NAME_OFFSET as Integer is 8
+Constant PROCESS_PARAMS_OFFSET as Integer is 24
+Constant PROCESS_PARAM_COUNT_OFFSET as Integer is 32
+Constant PROCESS_RETURN_TYPE_OFFSET as Integer is 40
+Constant PROCESS_BODY_OFFSET as Integer is 48
+
+Note: HIRTypeDefinition struct field offsets (base_node at 0).
+Constant TYPE_DEF_BASE_NODE_OFFSET as Integer is 0
+Constant TYPE_DEF_KIND_OFFSET as Integer is 24
+Constant TYPE_DEF_FIELDS_OFFSET as Integer is 32
+Constant TYPE_DEF_FIELD_COUNT_OFFSET as Integer is 40
+
+Note: HIRTypeInfo field offsets (hir.runa HIRTypeInfo, 120 bytes).
+Constant TYPE_INFO_KIND_OFFSET as Integer is 0
+Constant TYPE_INFO_SIZE_OFFSET as Integer is 16
+Constant TYPE_INFO_ALIGNMENT_OFFSET as Integer is 24
+Constant TYPE_INFO_FIELD_COUNT_OFFSET as Integer is 80
+
+Note: Resolved type-kind values (hir.runa type-system band).
+Constant TYPE_KIND_INTEGER as Integer is 13015
+Constant TYPE_KIND_FLOAT as Integer is 13016
+Constant TYPE_KIND_RECORD as Integer is 13008
+Constant TYPE_KIND_BASIC as Integer is 13000
+
+Note: TypeProperties field offsets (this file's own 96-byte record).
+Constant PROPS_TYPE_ID_OFFSET as Integer is 0
+Constant PROPS_TYPE_KIND_OFFSET as Integer is 8
+Constant PROPS_SIZE_OFFSET as Integer is 16
+Constant PROPS_ALIGNMENT_OFFSET as Integer is 24
+Constant PROPS_IS_PRIMITIVE_OFFSET as Integer is 32
+Constant PROPS_IS_SIMD_OFFSET as Integer is 40
+Constant PROPS_IS_INLINE_OFFSET as Integer is 48
+Constant PROPS_FIELD_COUNT_OFFSET as Integer is 56
+Constant PROPS_CACHE_FITS_OFFSET as Integer is 64
+Constant PROPS_RECORD_SIZE as Integer is 96
+
+Note: Optimization field offsets (this file's own 64-byte record).
+Constant OPTREC_TYPE_OFFSET as Integer is 0
+Constant OPTREC_TARGET_OFFSET as Integer is 8
+Constant OPTREC_SPEEDUP_OFFSET as Integer is 16
+Constant OPTREC_SIZE_DELTA_OFFSET as Integer is 24
+Constant OPTREC_APPLIED_OFFSET as Integer is 32
+Constant OPTREC_DESCRIPTION_OFFSET as Integer is 40
+Constant OPTREC_RECORD_SIZE as Integer is 64
+
+Note: SpecializationContext field offsets (this file's own 128-byte record).
+Constant CTX_DEFINITION_OFFSET as Integer is 0
+Constant CTX_TYPE_PROPS_OFFSET as Integer is 8
+Constant CTX_OPTIMIZATIONS_OFFSET as Integer is 16
+Constant CTX_OPT_COUNT_OFFSET as Integer is 24
+Constant CTX_SPEEDUP_OFFSET as Integer is 32
+Constant CTX_SIZE_DELTA_OFFSET as Integer is 40
+
+Note:
+========================================
 CONTEXT MANAGEMENT
 ========================================
 :End Note
@@ -210,28 +284,28 @@ and applied optimizations.
 
 Process called "create_specialization_context" that takes definition as Integer returns Integer:
     Note: Allocate SpecializationContext (128 bytes - Tier 3: OWNED HEAP)
-    Let ctx_ptr be proc memory_allocate from Layout with 128, 8
+    Let ctx_ptr be proc allocate from Layout with 128
 
     Note: Set definition
     proc memory_set_qword from Layout with ctx_ptr, 0, definition
 
     Note: Create lists
-    Let type_props be proc list_create from List with 96
+    Let type_props be proc list_create from List
     proc memory_set_qword from Layout with ctx_ptr, 8, type_props
 
-    Let optimizations be proc list_create from List with 64
+    Let optimizations be proc list_create from List
     proc memory_set_qword from Layout with ctx_ptr, 16, optimizations
 
-    Note: Initialize counts
-    proc memory_set_qword from Layout with ctx_ptr, 24, 0
-    proc memory_set_qword from Layout with ctx_ptr, 28, 0
-    proc memory_set_qword from Layout with ctx_ptr, 32, 0
+    Note: Initialize counts and totals
+    proc memory_set_qword from Layout with ctx_ptr, CTX_OPT_COUNT_OFFSET, 0
+    proc memory_set_qword from Layout with ctx_ptr, CTX_SPEEDUP_OFFSET, 0
+    proc memory_set_qword from Layout with ctx_ptr, CTX_SIZE_DELTA_OFFSET, 0
 
-    Note: Zero reserved fields
-    Let reserved_idx be 36
+    Note: Zero remaining reserved fields (8-byte slots up to the 128-byte block)
+    Let reserved_idx be 48
     While reserved_idx is less than 128:
         proc memory_set_qword from Layout with ctx_ptr, reserved_idx, 0
-        Set reserved_idx to (reserved_idx plus 4)
+        Set reserved_idx to (reserved_idx plus 8)
     End While
 
     Return ctx_ptr
@@ -242,13 +316,13 @@ Destroying the context cleans up all allocated lists and structures.
 @End Reasoning
 
 Process called "destroy_specialization_context" that takes context as Integer returns Integer:
-    Let type_props be value at (context plus 8)
+    Let type_props be proc memory_get_int64 from Layout with context, CTX_TYPE_PROPS_OFFSET
     proc destroy from List with type_props
 
-    Let optimizations be value at (context plus 16)
+    Let optimizations be proc memory_get_int64 from Layout with context, CTX_OPTIMIZATIONS_OFFSET
     proc destroy from List with optimizations
 
-    proc memory_deallocate from Layout with context
+    proc deallocate from Layout with context
 
     Return 1
 End Process
@@ -314,50 +388,60 @@ For each type, we compute properties that enable specific optimizations.
 @End Reasoning
 
 Process called "analyze_definition_types" that takes spec_ctx as Integer, definition as Integer returns Integer:
-    Let def_kind be value at definition
+    If definition is equal to 0:
+        Return 0
+    End If
 
-    If def_kind is equal to HIRNodes.HIR_PROCESS_DEFINITION:
-        Note: Analyze parameter types
-        Let params_ptr be (definition plus HIRNodes.PROCESS_PARAMS_OFFSET)
-        Let params be value at params_ptr
-        Let param_count be value at (definition plus HIRNodes.PROCESS_PARAM_COUNT_OFFSET)
+    Note: A process/type definition is a 96-byte struct whose field 0 holds a
+    Note: pointer to the base HIRNode; the node kind lives on that base node.
+    Let base_node be proc memory_get_int64 from Layout with definition, PROCESS_BASE_NODE_OFFSET
+    Let def_kind be proc get_hir_node_type from HIR with base_node
 
-        Let param_idx be 0
-        While param_idx is less than param_count:
-            Let param_ptr be (params plus (param_idx multiplied by HIRNodes.PARAMETER_SIZE))
-            Let param_type_ptr be (param_ptr plus HIRNodes.PARAMETER_TYPE_OFFSET)
-            Let param_type be value at param_type_ptr
+    If def_kind is equal to HIR.HIR_PROCESS_DEFINITION:
+        Note: Analyze parameter types. Parameters are HIR_PARAMETER nodes held
+        Note: in a List; each carries its declared type via the "type" property.
+        Let params be proc memory_get_int64 from Layout with definition, PROCESS_PARAMS_OFFSET
+        Let param_count be proc memory_get_int64 from Layout with definition, PROCESS_PARAM_COUNT_OFFSET
 
-            Note: Analyze this type
-            proc analyze_type_properties with spec_ctx, param_type
+        If params is not equal to 0:
+            Let param_idx be 0
+            While param_idx is less than param_count:
+                Let param be proc list_get from List with params, param_idx
+                Let param_type be proc hir_get_parameter_type from HIRNodes with param
 
-            Set param_idx to (param_idx plus 1)
-        End While
+                proc analyze_type_properties with spec_ctx, param_type
 
-        Note: Analyze return type
-        Let return_type be value at (definition plus HIRNodes.PROCESS_RETURN_TYPE_OFFSET)
+                Set param_idx to (param_idx plus 1)
+            End While
+        End If
+
+        Note: Analyze return type.
+        Let return_type be proc memory_get_int64 from Layout with definition, PROCESS_RETURN_TYPE_OFFSET
         proc analyze_type_properties with spec_ctx, return_type
     End If
 
-    If def_kind is equal to HIRNodes.HIR_TYPE_DEFINITION:
-        Note: Analyze field types
-        Let type_kind be value at (definition plus HIRNodes.TYPE_KIND_OFFSET)
+    If def_kind is equal to HIR.HIR_TYPE_DEFINITION:
+        Note: Analyze field types for record/struct definitions. Fields are
+        Note: HIRSymbolInfo entries in a List; each field symbol carries its
+        Note: HIRTypeInfo at HIRSymbolInfo offset 24 (type_info).
+        Let type_kind be proc memory_get_int64 from Layout with definition, TYPE_DEF_KIND_OFFSET
 
-        If type_kind is equal to HIRNodes.TYPE_KIND_STRUCT:
-            Let fields_ptr be (definition plus HIRNodes.TYPE_FIELDS_OFFSET)
-            Let fields be value at fields_ptr
-            Let field_count be value at (definition plus HIRNodes.TYPE_FIELD_COUNT_OFFSET)
+        If type_kind is equal to TYPE_KIND_RECORD:
+            Let fields be proc memory_get_int64 from Layout with definition, TYPE_DEF_FIELDS_OFFSET
+            Let field_count be proc memory_get_int64 from Layout with definition, TYPE_DEF_FIELD_COUNT_OFFSET
 
-            Let field_idx be 0
-            While field_idx is less than field_count:
-                Let field_ptr be (fields plus (field_idx multiplied by HIRNodes.FIELD_SIZE))
-                Let field_type_ptr be (field_ptr plus HIRNodes.FIELD_TYPE_OFFSET)
-                Let field_type be value at field_type_ptr
+            If fields is not equal to 0:
+                Let field_idx be 0
+                While field_idx is less than field_count:
+                    Let field_symbol be proc list_get from List with fields, field_idx
+                    Note: HIRSymbolInfo.type_info at offset 24 is the field's type.
+                    Let field_type be proc memory_get_int64 from Layout with field_symbol, 24
 
-                proc analyze_type_properties with spec_ctx, field_type
+                    proc analyze_type_properties with spec_ctx, field_type
 
-                Set field_idx to (field_idx plus 1)
-            End While
+                    Set field_idx to (field_idx plus 1)
+                End While
+            End If
         End If
     End If
 
@@ -375,72 +459,74 @@ optimization decisions. We check:
 These properties determine which optimizations are applicable.
 @End Reasoning
 
-Process called "analyze_type_properties" that takes spec_ctx as Integer, type_id as Integer returns Integer:
-    Note: Check if already analyzed
-    Let existing_props be find_type_properties with spec_ctx, type_id
+Process called "analyze_type_properties" that takes spec_ctx as Integer, type_info as Integer returns Integer:
+    If type_info is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if already analyzed (keyed by the HIRTypeInfo pointer).
+    Let existing_props be find_type_properties with spec_ctx, type_info
     If existing_props is not equal to 0:
         Return existing_props
     End If
 
     Note: Allocate TypeProperties (96 bytes - Tier 3: OWNED HEAP)
-    Let props be proc memory_allocate from Layout with 96, 8
+    Let props be proc allocate from Layout with PROPS_RECORD_SIZE
 
-    Note: Get type info
-    Let type_info be proc get_type_info from HIR with type_id
+    Note: The supplied value is itself a HIRTypeInfo; read its resolved fields
+    Note: through the canonical hir.runa accessors and direct offsets.
+    proc memory_set_qword from Layout with props, PROPS_TYPE_ID_OFFSET, type_info
 
-    Note: Set basic fields
-    proc memory_set_qword from Layout with props, 0, type_id
+    Let type_kind be proc memory_get_int64 from Layout with type_info, TYPE_INFO_KIND_OFFSET
+    proc memory_set_qword from Layout with props, PROPS_TYPE_KIND_OFFSET, type_kind
 
-    Let type_kind be value at (type_info plus HIRNodes.TYPE_INFO_KIND_OFFSET)
-    proc memory_set_qword from Layout with props, 4, type_kind
+    Let size be proc get_type_size from HIR with type_info
+    proc memory_set_qword from Layout with props, PROPS_SIZE_OFFSET, size
 
-    Let size be value at (type_info plus HIRNodes.TYPE_INFO_SIZE_OFFSET)
-    proc memory_set_qword from Layout with props, 8, size
+    Let alignment be proc get_type_alignment from HIR with type_info
+    proc memory_set_qword from Layout with props, PROPS_ALIGNMENT_OFFSET, alignment
 
-    Let alignment be value at (type_info plus HIRNodes.TYPE_INFO_ALIGNMENT_OFFSET)
-    proc memory_set_qword from Layout with props, 12, alignment
-
-    Note: Determine if primitive
+    Note: Determine if primitive (resolved Integer/Float kinds).
     Let is_prim be 0
-    If type_kind is equal to HIRNodes.TYPE_KIND_INTEGER or type_kind is equal to HIRNodes.TYPE_KIND_FLOAT:
+    If type_kind is equal to TYPE_KIND_INTEGER or type_kind is equal to TYPE_KIND_FLOAT:
         Set is_prim to 1
     End If
-    proc memory_set_qword from Layout with props, 16, is_prim
+    proc memory_set_qword from Layout with props, PROPS_IS_PRIMITIVE_OFFSET, is_prim
 
-    Note: Determine SIMD capability
-    Let simd_capable be can_use_simd with type_id, size, alignment
-    proc memory_set_qword from Layout with props, 20, simd_capable
+    Note: Determine SIMD capability.
+    Let simd_capable be can_use_simd with type_info, size, alignment
+    proc memory_set_qword from Layout with props, PROPS_IS_SIMD_OFFSET, simd_capable
 
-    Note: Determine inline capability (threshold: 64 bytes)
+    Note: Determine inline capability (threshold: 64 bytes).
     Let inline_capable be 0
     If size is less than or equal to 64:
         Set inline_capable to 1
     End If
-    proc memory_set_qword from Layout with props, 24, inline_capable
+    proc memory_set_qword from Layout with props, PROPS_IS_INLINE_OFFSET, inline_capable
 
-    Note: Get field count (for structs)
+    Note: Get field count (for record/struct types).
     Let field_count be 0
-    If type_kind is equal to HIRNodes.TYPE_KIND_STRUCT:
-        Set field_count to value at (type_info plus HIRNodes.TYPE_INFO_FIELD_COUNT_OFFSET)
+    If type_kind is equal to TYPE_KIND_RECORD:
+        Set field_count to proc memory_get_int64 from Layout with type_info, TYPE_INFO_FIELD_COUNT_OFFSET
     End If
-    proc memory_set_qword from Layout with props, 28, field_count
+    proc memory_set_qword from Layout with props, PROPS_FIELD_COUNT_OFFSET, field_count
 
-    Note: Check if fits in cache line (64 bytes)
+    Note: Check if fits in cache line (64 bytes).
     Let cache_fits be 0
     If size is less than or equal to 64:
         Set cache_fits to 1
     End If
-    proc memory_set_qword from Layout with props, 32, cache_fits
+    proc memory_set_qword from Layout with props, PROPS_CACHE_FITS_OFFSET, cache_fits
 
-    Note: Zero reserved fields
-    Let reserved_idx be 36
-    While reserved_idx is less than 96:
+    Note: Zero remaining reserved fields (8-byte slots up to the record size).
+    Let reserved_idx be 72
+    While reserved_idx is less than PROPS_RECORD_SIZE:
         proc memory_set_qword from Layout with props, reserved_idx, 0
-        Set reserved_idx to (reserved_idx plus 4)
+        Set reserved_idx to (reserved_idx plus 8)
     End While
 
-    Note: Add to context
-    Let type_props_list be value at (spec_ctx plus 8)
+    Note: Add to context.
+    Let type_props_list be proc memory_get_int64 from Layout with spec_ctx, CTX_TYPE_PROPS_OFFSET
     proc append from List with type_props_list, props
 
     Return props
@@ -451,16 +537,16 @@ Finding type properties searches the analyzed properties for a specific
 type ID. This avoids re-analyzing the same type multiple times.
 @End Reasoning
 
-Process called "find_type_properties" that takes spec_ctx as Integer, type_id as Integer returns Integer:
-    Let type_props_list be value at (spec_ctx plus 8)
-    Let prop_count be proc size from List with type_props_list
+Process called "find_type_properties" that takes spec_ctx as Integer, type_info as Integer returns Integer:
+    Let type_props_list be proc memory_get_int64 from Layout with spec_ctx, CTX_TYPE_PROPS_OFFSET
+    Let prop_count be proc list_length from List with type_props_list
 
     Let prop_idx be 0
     While prop_idx is less than prop_count:
-        Let props be proc get from List with type_props_list, prop_idx
+        Let props be proc list_get from List with type_props_list, prop_idx
 
-        Let props_type_id be value at props
-        If props_type_id is equal to type_id:
+        Let props_type_id be proc memory_get_int64 from Layout with props, PROPS_TYPE_ID_OFFSET
+        If props_type_id is equal to type_info:
             Return props
         End If
 
@@ -481,13 +567,15 @@ SIMD is applicable when:
 SIMD can provide 2-8x speedup for array operations.
 @End Reasoning
 
-Process called "can_use_simd" that takes type_id as Integer, size as Integer, alignment as Integer returns Integer:
-    Note: Get type info
-    Let type_info be proc get_type_info from HIR with type_id
-    Let type_kind be value at (type_info plus HIRNodes.TYPE_INFO_KIND_OFFSET)
+Process called "can_use_simd" that takes type_info as Integer, size as Integer, alignment as Integer returns Integer:
+    If type_info is equal to 0:
+        Return 0
+    End If
+
+    Let type_kind be proc memory_get_int64 from Layout with type_info, TYPE_INFO_KIND_OFFSET
 
     Note: Must be numeric type
-    If type_kind is not equal to HIRNodes.TYPE_KIND_INTEGER and type_kind is not equal to HIRNodes.TYPE_KIND_FLOAT:
+    If type_kind is not equal to TYPE_KIND_INTEGER and type_kind is not equal to TYPE_KIND_FLOAT:
         Return 0
     End If
 
@@ -518,14 +606,19 @@ for specialization based on type properties. We look for:
 @End Reasoning
 
 Process called "identify_optimizations" that takes spec_ctx as Integer, definition as Integer returns Integer:
-    Let def_kind be value at definition
+    If definition is equal to 0:
+        Return 0
+    End If
 
-    If def_kind is equal to HIRNodes.HIR_PROCESS_DEFINITION:
+    Let base_node be proc memory_get_int64 from Layout with definition, PROCESS_BASE_NODE_OFFSET
+    Let def_kind be proc get_hir_node_type from HIR with base_node
+
+    If def_kind is equal to HIR.HIR_PROCESS_DEFINITION:
         Note: Check if entire function can be inlined
         proc check_inline_opportunity with spec_ctx, definition
 
         Note: Check body for optimization opportunities
-        Let body be value at (definition plus HIRNodes.PROCESS_BODY_OFFSET)
+        Let body be proc memory_get_int64 from Layout with definition, PROCESS_BODY_OFFSET
         If body is not equal to 0:
             proc identify_statement_optimizations with spec_ctx, body
         End If
@@ -547,19 +640,21 @@ We inline if:
 
 Process called "check_inline_opportunity" that takes spec_ctx as Integer, process as Integer returns Integer:
     Note: Estimate function size
-    Let body be value at (process plus HIRNodes.PROCESS_BODY_OFFSET)
+    Let body be proc memory_get_int64 from Layout with process, PROCESS_BODY_OFFSET
     Let stmt_count be estimate_statement_count with body
 
     Note: If small enough, add inline optimization
     If stmt_count is less than 10:
         Let opt be create_optimization with OPT_INLINE, process, 5, (stmt_count multiplied by 4)
 
-        Let opt_list be value at (spec_ctx plus 16)
+        Let opt_list be proc memory_get_int64 from Layout with spec_ctx, CTX_OPTIMIZATIONS_OFFSET
         proc append from List with opt_list, opt
 
-        Let opt_count_ptr be (spec_ctx plus 24)
-        Let opt_count be value at opt_count_ptr
-        Set opt_count_ptr to (opt_count plus 1)
+        Note: Increment the optimization count stored in the context. The count
+        Note: lives at CTX_OPT_COUNT_OFFSET; we read it, add one, and write it
+        Note: back rather than writing into the address-holding local.
+        Let opt_count be proc memory_get_int64 from Layout with spec_ctx, CTX_OPT_COUNT_OFFSET
+        proc memory_set_qword from Layout with spec_ctx, CTX_OPT_COUNT_OFFSET, (opt_count plus 1)
     End If
 
     Return 0
@@ -578,39 +673,44 @@ Process called "identify_statement_optimizations" that takes spec_ctx as Integer
         Return 0
     End If
 
-    Let stmt_kind be value at (stmt plus HIRNodes.STMT_KIND_OFFSET)
+    Let stmt_kind be proc memory_get_int64 from Layout with stmt, NODE_KIND_OFFSET
 
-    If stmt_kind is equal to HIRNodes.STMT_FOR:
+    If stmt_kind is equal to HIRNodes.HIR_FOR_IN:
         Note: Check if loop can use SIMD
         proc check_simd_opportunity with spec_ctx, stmt
     End If
 
-    If stmt_kind is equal to HIRNodes.STMT_BLOCK:
-        Let stmts_ptr be (stmt plus HIRNodes.STMT_BLOCK_STMTS_OFFSET)
-        Let stmts be value at stmts_ptr
-        Let stmt_count be value at (stmt plus HIRNodes.STMT_BLOCK_COUNT_OFFSET)
-
-        Let stmt_idx be 0
-        While stmt_idx is less than stmt_count:
-            Let inner_stmt be value at (stmts plus (stmt_idx multiplied by 8))
-            proc identify_statement_optimizations with spec_ctx, inner_stmt
-
-            Set stmt_idx to (stmt_idx plus 1)
-        End While
+    If stmt_kind is equal to HIRNodes.HIR_FOR:
+        Note: Check if loop can use SIMD
+        proc check_simd_opportunity with spec_ctx, stmt
     End If
 
-    If stmt_kind is equal to HIRNodes.STMT_IF:
-        Let then_branch be value at (stmt plus HIRNodes.STMT_IF_THEN_OFFSET)
+    If stmt_kind is equal to HIRNodes.HIR_BLOCK:
+        Let stmts be proc hir_get_block_statements from HIRNodes with stmt
+        If stmts is not equal to 0:
+            Let stmt_count be proc list_length from List with stmts
+            Let stmt_idx be 0
+            While stmt_idx is less than stmt_count:
+                Let inner_stmt be proc list_get from List with stmts, stmt_idx
+                proc identify_statement_optimizations with spec_ctx, inner_stmt
+
+                Set stmt_idx to (stmt_idx plus 1)
+            End While
+        End If
+    End If
+
+    If stmt_kind is equal to HIRNodes.HIR_IF:
+        Let then_branch be proc hir_get_if_then from HIRNodes with stmt
         proc identify_statement_optimizations with spec_ctx, then_branch
 
-        Let else_branch be value at (stmt plus HIRNodes.STMT_IF_ELSE_OFFSET)
+        Let else_branch be proc hir_get_if_else from HIRNodes with stmt
         If else_branch is not equal to 0:
             proc identify_statement_optimizations with spec_ctx, else_branch
         End If
     End If
 
-    If stmt_kind is equal to HIRNodes.STMT_WHILE:
-        Let body be value at (stmt plus HIRNodes.STMT_WHILE_BODY_OFFSET)
+    If stmt_kind is equal to HIRNodes.HIR_WHILE:
+        Let body be proc hir_get_while_body from HIRNodes with stmt
         proc identify_statement_optimizations with spec_ctx, body
     End If
 
@@ -629,29 +729,53 @@ SIMD can vectorize 4-8 iterations per instruction.
 @End Reasoning
 
 Process called "check_simd_opportunity" that takes spec_ctx as Integer, for_stmt as Integer returns Integer:
-    Note: Get iterator variable type
-    Let iter_var_ptr be (for_stmt plus HIRNodes.FOR_ITERATOR_OFFSET)
-    Let iter_var be value at iter_var_ptr
-    Let iter_type_ptr be (iter_var plus HIRNodes.VAR_TYPE_OFFSET)
-    Let iter_type be value at iter_type_ptr
+    Note: Determine the per-element type the loop iterates over. For a for-in
+    Note: loop this is the element type of the iterable's collection type; for
+    Note: a C-style for loop it is the type of the loop's condition expression.
+    Let element_type be 0
 
-    Note: Check if element type is SIMD-capable
-    Let type_props be find_type_properties with spec_ctx, iter_type
-    If type_props is equal to 0:
-        Set type_props to analyze_type_properties with spec_ctx, iter_type
+    Let loop_kind be proc memory_get_int64 from Layout with for_stmt, NODE_KIND_OFFSET
+    If loop_kind is equal to HIRNodes.HIR_FOR_IN:
+        Let iterable be proc hir_get_for_in_iterable from HIRNodes with for_stmt
+        Let iterable_type be proc get_hir_node_type_info from HIR with iterable
+        If iterable_type is not equal to 0:
+            Note: HIRTypeInfo.element_type lives at offset 64; for collection
+            Note: types it points at the element's HIRTypeInfo.
+            Set element_type to proc memory_get_int64 from Layout with iterable_type, 64
+            If element_type is equal to 0:
+                Set element_type to iterable_type
+            End If
+        End If
+    Otherwise:
+        Let cond be proc hir_get_for_condition from HIRNodes with for_stmt
+        Set element_type to proc get_hir_node_type_info from HIR with cond
     End If
 
-    Let is_simd_capable be value at (type_props plus 20)
+    If element_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if element type is SIMD-capable
+    Let type_props be find_type_properties with spec_ctx, element_type
+    If type_props is equal to 0:
+        Set type_props to analyze_type_properties with spec_ctx, element_type
+    End If
+
+    If type_props is equal to 0:
+        Return 0
+    End If
+
+    Let is_simd_capable be proc memory_get_int64 from Layout with type_props, PROPS_IS_SIMD_OFFSET
     If is_simd_capable is equal to 1:
         Note: Add SIMD optimization
         Let opt be create_optimization with OPT_SIMD, for_stmt, 400, 0
 
-        Let opt_list be value at (spec_ctx plus 16)
+        Let opt_list be proc memory_get_int64 from Layout with spec_ctx, CTX_OPTIMIZATIONS_OFFSET
         proc append from List with opt_list, opt
 
-        Let opt_count_ptr be (spec_ctx plus 24)
-        Let opt_count be value at opt_count_ptr
-        Set opt_count_ptr to (opt_count plus 1)
+        Note: Increment the optimization count in the context (read-add-write).
+        Let opt_count be proc memory_get_int64 from Layout with spec_ctx, CTX_OPT_COUNT_OFFSET
+        proc memory_set_qword from Layout with spec_ctx, CTX_OPT_COUNT_OFFSET, (opt_count plus 1)
     End If
 
     Return 0
@@ -674,30 +798,30 @@ The application modifies the HIR tree in-place.
 @End Reasoning
 
 Process called "apply_optimizations" that takes spec_ctx as Integer, definition as Integer returns Integer:
-    Let opt_list be value at (spec_ctx plus 16)
-    Let opt_count be proc size from List with opt_list
+    Let opt_list be proc memory_get_int64 from Layout with spec_ctx, CTX_OPTIMIZATIONS_OFFSET
+    Let opt_count be proc list_length from List with opt_list
 
     Let opt_idx be 0
     While opt_idx is less than opt_count:
-        Let opt be proc get from List with opt_list, opt_idx
+        Let opt be proc list_get from List with opt_list, opt_idx
 
-        Let opt_type be value at opt
-        Let target be value at (opt plus 4)
+        Let opt_type be proc memory_get_int64 from Layout with opt, OPTREC_TYPE_OFFSET
+        Let target be proc memory_get_int64 from Layout with opt, OPTREC_TARGET_OFFSET
 
         Note: Apply based on type
         If opt_type is equal to OPT_SIMD:
             proc apply_simd_optimization with target
-            proc memory_set_qword from Layout with opt, 16, 1
+            proc memory_set_qword from Layout with opt, OPTREC_APPLIED_OFFSET, 1
         End If
 
         If opt_type is equal to OPT_INLINE:
             proc apply_inline_optimization with target
-            proc memory_set_qword from Layout with opt, 16, 1
+            proc memory_set_qword from Layout with opt, OPTREC_APPLIED_OFFSET, 1
         End If
 
         If opt_type is equal to OPT_LOOP_UNROLL:
             proc apply_loop_unroll_optimization with target
-            proc memory_set_qword from Layout with opt, 16, 1
+            proc memory_set_qword from Layout with opt, OPTREC_APPLIED_OFFSET, 1
         End If
 
         Set opt_idx to (opt_idx plus 1)
@@ -731,14 +855,25 @@ This requires dependency analysis to ensure no loop-carried dependencies.
 @End Implementation
 
 Process called "apply_simd_optimization" that takes target as Integer returns Integer:
-    Note: Get loop statement
-    Let loop_body be value at (target plus HIRNodes.STMT_BODY_OFFSET)
+    If target is equal to 0:
+        Return 0
+    End If
+
+    Note: Get the loop body via the canonical accessor for the loop kind.
+    Let loop_kind be proc memory_get_int64 from Layout with target, NODE_KIND_OFFSET
+    Let loop_body be 0
+    If loop_kind is equal to HIRNodes.HIR_FOR_IN:
+        Set loop_body to proc hir_get_for_in_body from HIRNodes with target
+    Otherwise:
+        Set loop_body to proc hir_get_for_body from HIRNodes with target
+    End If
+
     If loop_body is equal to 0:
         Return 0
     End If
 
     Note: Analyze loop body for vectorizable operations
-    Let is_vectorizable be analyze_loop_vectorizability(target)
+    Let is_vectorizable be analyze_loop_vectorizability with target, loop_body
     If is_vectorizable is equal to 0:
         Return 0
     End If
@@ -746,32 +881,222 @@ Process called "apply_simd_optimization" that takes target as Integer returns In
     Note: Determine vector width based on target architecture
     Note: SSE: 128-bit (4x f32 or 2x f64)
     Note: AVX: 256-bit (8x f32 or 4x f64)
-    Let vector_width be 4  Note: Default to SSE 128-bit, 4 floats
+    Let vector_width be 4
 
-    Note: Clone loop for remainder handling
-    Let original_loop be proc clone_node from HIRCloner with target
+    Note: Clone the original scalar loop to serve as the remainder loop that
+    Note: handles iterations not divisible by the vector width.
+    Let remainder_loop be proc clone_node from HIRCloner with target
 
-    Note: Transform loop body: replace scalar ops with SIMD ops
-    vectorize_loop_body(loop_body, vector_width)
+    Note: Transform the loop body: tag each vectorizable statement so the
+    Note: backend lowers it through SIMD intrinsics rather than scalar ops.
+    proc vectorize_loop_body with loop_body, vector_width
 
-    Note: Adjust loop stride
-    Let iterator_var be value at (target plus HIRNodes.FOR_ITERATOR_OFFSET)
-    Let stride be value at (iterator_var plus HIRNodes.VAR_STRIDE_OFFSET)
-    Let new_stride be (stride multiplied by vector_width)
-    proc memory_set_qword from Layout with iterator_var, HIRNodes.VAR_STRIDE_OFFSET, new_stride
+    Note: Record the vectorization width on the loop so the backend strides by
+    Note: vector_width and the remainder loop covers the tail.
+    proc hir_set_metadata from HIRNodes with target, "simd_vector_width", vector_width
+    proc hir_set_metadata from HIRNodes with target, "vectorized", 1
 
-    Note: Add remainder loop after vectorized loop
-    Note: Remainder loop handles iterations not divisible by vector_width
-    Let parent_block be value at (target plus HIRNodes.STMT_PARENT_OFFSET)
-    proc insert_after from HIRNodes with parent_block, target, original_loop
-
-    Note: Mark as vectorized
-    Let flags_ptr be (target plus HIRNodes.STMT_FLAGS_OFFSET)
-    Let flags be value at flags_ptr
-    Let vectorized_flag be (flags bitwise or HIRNodes.FLAG_VECTORIZED)
-    Set flags_ptr to vectorized_flag
+    Note: Add the remainder loop immediately after the vectorized loop in the
+    Note: parent block (the loop's parent in the real HIR tree).
+    Let parent_block be proc memory_get_int64 from Layout with target, NODE_PARENT_OFFSET
+    If parent_block is not equal to 0:
+        proc insert_after from HIRCloner with parent_block, target, remainder_loop
+    End If
 
     Return 1
+End Process
+
+@Reasoning
+Analyzing loop vectorizability decides whether a loop body is safe and
+profitable to vectorize. A body is vectorizable when every statement is a
+simple element-wise assignment or arithmetic expression statement, with no
+control flow (no nested loops, branches, calls, or returns). Control flow and
+calls introduce loop-carried dependencies or side effects the vector lowering
+cannot reproduce, so their presence conservatively blocks vectorization.
+@End Reasoning
+
+@Implementation
+Walk the loop body's statement list. Accept HIR_EXPR_STMT statements whose
+expression is an assignment (HIR_ASSIGN_EXPR) or a binary/unary arithmetic
+expression. Reject any statement that is a nested loop, branch, return,
+throw, or whose expression contains a call. An empty body is not
+vectorizable. Returns 1 when every statement is vectorizable, 0 otherwise.
+@End Implementation
+Process called "analyze_loop_vectorizability" that takes loop_node as Integer, loop_body as Integer returns Integer:
+    If loop_body is equal to 0:
+        Return 0
+    End If
+
+    Note: Resolve the body to its statement list (a block) or treat a single
+    Note: statement as a one-element body.
+    Let body_kind be proc memory_get_int64 from Layout with loop_body, NODE_KIND_OFFSET
+    Let statements be 0
+    If body_kind is equal to HIRNodes.HIR_BLOCK:
+        Set statements to proc hir_get_block_statements from HIRNodes with loop_body
+    End If
+
+    If statements is equal to 0:
+        Note: Single-statement body: vectorizable iff that statement is.
+        Return statement_is_vectorizable with loop_body
+    End If
+
+    Let stmt_count be proc list_length from List with statements
+    If stmt_count is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx is less than stmt_count:
+        Let stmt be proc list_get from List with statements, idx
+        If statement_is_vectorizable with stmt is equal to 0:
+            Return 0
+        End If
+        Set idx to (idx plus 1)
+    End While
+
+    Return 1
+End Process
+
+@Reasoning
+A single statement is vectorizable when it is an expression statement whose
+expression is an assignment or pure arithmetic with no embedded call. Any
+other statement kind (nested loop, branch, return, declaration with control
+flow) conservatively blocks vectorization.
+@End Reasoning
+Process called "statement_is_vectorizable" that takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc memory_get_int64 from Layout with stmt, NODE_KIND_OFFSET
+
+    If kind is equal to HIRNodes.HIR_EXPR_STMT:
+        Let expr be proc hir_get_expression_statement_expr from HIRNodes with stmt
+        Return expression_is_vectorizable with expr
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+An expression is vectorizable when it is an assignment, binary, or unary
+arithmetic expression none of whose sub-expressions is a call. Calls may have
+side effects or loop-carried state that scalar-to-vector lowering cannot
+preserve, so their presence anywhere in the expression blocks vectorization.
+@End Reasoning
+Process called "expression_is_vectorizable" that takes expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc memory_get_int64 from Layout with expr, NODE_KIND_OFFSET
+
+    Note: A call anywhere disqualifies the expression.
+    If kind is equal to HIRNodes.HIR_CALL_EXPR:
+        Return 0
+    End If
+    If kind is equal to HIR.HIR_INDIRECT_CALL:
+        Return 0
+    End If
+
+    If kind is equal to HIRNodes.HIR_ASSIGN_EXPR:
+        Let lhs be proc hir_get_assign_lhs from HIRNodes with expr
+        Let rhs be proc hir_get_assign_rhs from HIRNodes with expr
+        If expression_is_vectorizable with lhs is equal to 0:
+            Return 0
+        End If
+        Return expression_is_vectorizable with rhs
+    End If
+
+    If kind is equal to HIRNodes.HIR_BINARY_EXPR:
+        Let left be proc hir_get_binary_left from HIRNodes with expr
+        Let right be proc hir_get_binary_right from HIRNodes with expr
+        If expression_is_vectorizable with left is equal to 0:
+            Return 0
+        End If
+        Return expression_is_vectorizable with right
+    End If
+
+    If kind is equal to HIRNodes.HIR_UNARY_EXPR:
+        Let operand be proc hir_get_unary_operand from HIRNodes with expr
+        Return expression_is_vectorizable with operand
+    End If
+
+    If kind is equal to HIRNodes.HIR_INDEX_EXPR:
+        Let obj be proc hir_get_index_object from HIRNodes with expr
+        Let index be proc hir_get_index_value from HIRNodes with expr
+        If expression_is_vectorizable with obj is equal to 0:
+            Return 0
+        End If
+        Return expression_is_vectorizable with index
+    End If
+
+    Note: Leaf operands (identifiers, literals, member access) are vectorizable.
+    If kind is equal to HIRNodes.HIR_IDENTIFIER:
+        Return 1
+    End If
+    If kind is equal to HIRNodes.HIR_INT_LITERAL:
+        Return 1
+    End If
+    If kind is equal to HIRNodes.HIR_FLOAT_LITERAL:
+        Return 1
+    End If
+    If kind is equal to HIRNodes.HIR_MEMBER_EXPR:
+        Let member_obj be proc hir_get_member_object from HIRNodes with expr
+        Return expression_is_vectorizable with member_obj
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Vectorizing the loop body tags each element-wise statement with the chosen
+vector width so the backend lowers it through SIMD intrinsics. The tag is the
+real, model-faithful mechanism: lowering reads the "simd_width" property on a
+statement and the loop's "simd_vector_width" to emit packed operations and the
+matching stride. No node is restructured here; the transformation is the
+annotation that drives lowering, leaving the scalar form intact for backends
+without SIMD support.
+@End Reasoning
+
+@Implementation
+Walk the body's statement list and write the "simd_width" property on each
+expression statement. Returns the number of statements tagged.
+@End Implementation
+Process called "vectorize_loop_body" that takes loop_body as Integer, vector_width as Integer returns Integer:
+    If loop_body is equal to 0:
+        Return 0
+    End If
+
+    Let body_kind be proc memory_get_int64 from Layout with loop_body, NODE_KIND_OFFSET
+    Let statements be 0
+    If body_kind is equal to HIRNodes.HIR_BLOCK:
+        Set statements to proc hir_get_block_statements from HIRNodes with loop_body
+    End If
+
+    Let tagged be 0
+
+    If statements is equal to 0:
+        Note: Single-statement body.
+        If statement_is_vectorizable with loop_body is equal to 1:
+            proc hir_set_metadata from HIRNodes with loop_body, "simd_width", vector_width
+            Set tagged to 1
+        End If
+        Return tagged
+    End If
+
+    Let stmt_count be proc list_length from List with statements
+    Let idx be 0
+    While idx is less than stmt_count:
+        Let stmt be proc list_get from List with statements, idx
+        If statement_is_vectorizable with stmt is equal to 1:
+            proc hir_set_metadata from HIRNodes with stmt, "simd_width", vector_width
+            Set tagged to (tagged plus 1)
+        End If
+        Set idx to (idx plus 1)
+    End While
+
+    Return tagged
 End Process
 
 @Reasoning
@@ -797,80 +1122,105 @@ call overhead. This requires:
 @End Implementation
 
 Process called "apply_inline_optimization" that takes target as Integer returns Integer:
-    Note: Get function body and parameters
-    Let func_body be value at (target plus HIRNodes.PROCESS_BODY_OFFSET)
-    Let param_list be value at (target plus HIRNodes.PROCESS_PARAMS_OFFSET)
-    Let param_count be List.length(param_list)
+    If target is equal to 0:
+        Return 0
+    End If
 
-    Note: Check if function is too large to inline
-    Let body_size be HIRNodes.estimate_node_size(func_body)
+    Note: target is a HIRProcessDefinition struct; field 0 is the base node,
+    Note: parameters at offset 24, body at offset 48.
+    Let func_body be proc memory_get_int64 from Layout with target, PROCESS_BODY_OFFSET
+    Let param_list be proc memory_get_int64 from Layout with target, PROCESS_PARAMS_OFFSET
+    Let param_count be proc memory_get_int64 from Layout with target, PROCESS_PARAM_COUNT_OFFSET
+
+    If func_body is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if function is too large to inline.
+    Let body_size be proc estimate_node_size from HIRCloner with func_body
     If body_size is greater than 50:
         Note: Function too large for inlining
         Return 0
     End If
 
-    Note: Find all call sites that call this function
-    Let call_sites be List.create()
-    proc find_call_sites from HIRNodes with target, call_sites
+    Note: Find every call site that targets this function within its own body
+    Note: (self/recursive and locally nested calls reachable from the
+    Note: definition). The base node carries the resolved symbol identity used
+    Note: to match callees.
+    Let base_node be proc memory_get_int64 from Layout with target, PROCESS_BASE_NODE_OFFSET
+    Let call_sites be proc list_create from List
+    proc find_call_sites from HIRCloner with func_body, base_node, call_sites
 
-    Let call_count be List.length(call_sites)
+    Let call_count be proc list_length from List with call_sites
     If call_count is equal to 0:
         Note: No call sites found, nothing to inline
+        proc destroy from List with call_sites
         Return 0
     End If
 
-    Note: Inline each call site
+    Note: Generate a unique end-label base for the inlined regions of this
+    Note: function so the jump targets do not collide across call sites.
     Let inlined_count be 0
     Let i be 0
     While i is less than call_count:
-        Let call_site be proc get from List with call_sites, i
+        Let call_site be proc list_get from List with call_sites, i
 
-        Note: Clone function body
+        Note: Clone the function body for this call site.
         Let cloned_body be proc clone_node from HIRCloner with func_body
 
-        Note: Get call arguments
-        Let call_args be value at (call_site plus HIRNodes.CALL_ARGS_OFFSET)
-        Let arg_count be List.length(call_args)
+        Note: Get the call's positional arguments.
+        Let arg_handle be proc hir_get_call_arguments from HIRNodes with call_site
+        Let call_args be proc hir_get_positional_args from HIRNodes with arg_handle
+        Let arg_count be proc list_length from List with call_args
 
-        Note: Verify argument count matches parameter count
+        Note: Verify argument count matches parameter count.
         If arg_count is not equal to param_count:
-            Display "Warning: Inline failed - argument count mismatch"
+            Display "Warning: Inline skipped - argument count mismatch"
             Set i to (i plus 1)
-            Continue
+        Otherwise:
+            Note: Build the parameter-name -> argument-expression mapping that
+            Note: substitute_variables consumes (identifiers are name-keyed).
+            Let param_map be proc create from Dict
+            Let p be 0
+            While p is less than param_count:
+                Let param be proc list_get from List with param_list, p
+                Let arg be proc list_get from List with call_args, p
+                Let param_name be proc hir_get_parameter_name from HIRNodes with param
+                If param_name is not equal to 0:
+                    proc set from Dict with param_map, param_name, arg
+                End If
+                Set p to (p plus 1)
+            End While
+
+            Note: Substitute all parameter references in the cloned body.
+            proc substitute_variables from HIRCloner with cloned_body, param_map
+
+            Note: Rewrite return statements in the cloned body into assignments
+            Note: into the inline result variable plus a jump to the end label.
+            Note: Each cloned body is self-contained and spliced into its own
+            Note: parent slot, so a fixed synthetic result-variable name and
+            Note: end-label name are unique within every inlined region.
+            Let result_var be "__inline_result"
+            Let end_label be "__inline_end"
+            proc convert_returns_to_assignments from HIRCloner with cloned_body, result_var, end_label
+
+            Note: Replace the call expression with the inlined body in its
+            Note: parent slot (real parent pointer at HIRNode offset 64).
+            Let parent_block be proc memory_get_int64 from Layout with call_site, NODE_PARENT_OFFSET
+            If parent_block is not equal to 0:
+                proc replace_node from HIRCloner with parent_block, call_site, cloned_body
+                Set inlined_count to (inlined_count plus 1)
+            End If
+
+            proc destroy from Dict with param_map
+            Set i to (i plus 1)
         End If
-
-        Note: Create parameter → argument mapping
-        Let param_map be Dictionary.create()
-        Let p be 0
-        While p is less than param_count:
-            Let param be proc get from List with param_list, p
-            Let arg be proc get from List with call_args, p
-            Let param_id be value at (param plus HIRNodes.VAR_ID_OFFSET)
-            proc set from Dictionary with param_map, param_id, arg
-            Set p to (p plus 1)
-        End While
-
-        Note: Substitute all parameter references in cloned body
-        proc substitute_variables from HIRNodes with cloned_body, param_map
-
-        Note: Handle return statements in cloned body
-        Note: Get the result variable for the call (if any)
-        Let call_result be value at (call_site plus HIRNodes.CALL_RESULT_OFFSET)
-        proc convert_returns_to_assignments from HIRNodes with cloned_body, call_result
-
-        Note: Replace call site with inlined body
-        Let parent_block be value at (call_site plus HIRNodes.EXPR_PARENT_OFFSET)
-        proc replace_node from HIRNodes with parent_block, call_site, cloned_body
-
-        Set inlined_count to (inlined_count plus 1)
-        Set i to (i plus 1)
     End While
 
-    Note: Mark function as inlined
-    Let flags_ptr be (target plus HIRNodes.PROCESS_FLAGS_OFFSET)
-    Let flags be value at flags_ptr
-    Let inline_flag be (flags bitwise or HIRNodes.FLAG_INLINE)
-    Set flags_ptr to inline_flag
+    proc destroy from List with call_sites
+
+    Note: Mark the function as inlined via the real metadata flag mechanism.
+    proc hir_set_metadata from HIRNodes with base_node, "inlined", 1
 
     Return inlined_count
 End Process
@@ -900,111 +1250,166 @@ and enable better instruction scheduling. This requires:
 @End Implementation
 
 Process called "apply_loop_unroll_optimization" that takes target as Integer returns Integer:
-    Note: Get loop iteration range
-    Let loop_type be value at (target plus HIRNodes.STMT_TYPE_OFFSET)
-
-    Note: Only handle For loops with known iteration counts
-    If loop_type is not equal to HIRNodes.STMT_FOR:
+    If target is equal to 0:
         Return 0
     End If
 
-    Note: Get loop bounds
-    Let iterator_var be value at (target plus HIRNodes.FOR_ITERATOR_OFFSET)
-    Let start_expr be value at (target plus HIRNodes.FOR_START_OFFSET)
-    Let end_expr be value at (target plus HIRNodes.FOR_END_OFFSET)
-    Let loop_body be value at (target plus HIRNodes.FOR_BODY_OFFSET)
-
-    Note: Check if bounds are compile-time constants
-    Let start_type be value at (start_expr plus HIRNodes.EXPR_TYPE_OFFSET)
-    Let end_type be value at (end_expr plus HIRNodes.EXPR_TYPE_OFFSET)
-
-    If start_type is not equal to HIRNodes.EXPR_INT_LITERAL:
-        Note: Start bound is not constant, cannot unroll
+    Note: Only handle C-style For loops, whose init/condition/update clauses
+    Note: expose a compile-time-constant trip count.
+    Let loop_type be proc memory_get_int64 from Layout with target, NODE_KIND_OFFSET
+    If loop_type is not equal to HIRNodes.HIR_FOR:
         Return 0
     End If
 
-    If end_type is not equal to HIRNodes.EXPR_INT_LITERAL:
+    Let loop_body be proc hir_get_for_body from HIRNodes with target
+    Let init_clause be proc hir_get_for_init from HIRNodes with target
+    Let cond_clause be proc hir_get_for_condition from HIRNodes with target
 
-            Note: End bound is not constant, cannot unroll
+    If loop_body is equal to 0:
+        Return 0
+    End If
+    If init_clause is equal to 0:
+        Return 0
+    End If
+    If cond_clause is equal to 0:
         Return 0
     End If
 
-    Note: Extract constant bounds
-    Let start_value be value at (start_expr plus HIRNodes.LITERAL_VALUE_OFFSET)
-    Let end_value be value at (end_expr plus HIRNodes.LITERAL_VALUE_OFFSET)
+    Note: The start bound is the int-literal initializer of the iterator; the
+    Note: iterator name and end bound come from the loop condition, which must
+    Note: be "iterator < end_literal" (HIR_BINARY_EXPR).
+    Let start_value be loop_init_constant with init_clause
+    If start_value is less than 0:
+        Return 0
+    End If
 
-    Note: Calculate iteration count
+    Let cond_kind be proc memory_get_int64 from Layout with cond_clause, NODE_KIND_OFFSET
+    If cond_kind is not equal to HIRNodes.HIR_BINARY_EXPR:
+        Return 0
+    End If
+
+    Let iterator_name be 0
+    Let cond_left be proc hir_get_binary_left from HIRNodes with cond_clause
+    If cond_left is not equal to 0:
+        Let left_kind be proc memory_get_int64 from Layout with cond_left, NODE_KIND_OFFSET
+        If left_kind is equal to HIRNodes.HIR_IDENTIFIER:
+            Set iterator_name to proc memory_get_int64 from Layout with cond_left, NODE_VALUE_OFFSET
+        End If
+    End If
+    If iterator_name is equal to 0:
+        Return 0
+    End If
+
+    Let cond_right be proc hir_get_binary_right from HIRNodes with cond_clause
+    If cond_right is equal to 0:
+        Return 0
+    End If
+    Let right_kind be proc memory_get_int64 from Layout with cond_right, NODE_KIND_OFFSET
+    If right_kind is not equal to HIRNodes.HIR_INT_LITERAL:
+        Return 0
+    End If
+    Let end_value be proc memory_get_int64 from Layout with cond_right, NODE_VALUE_OFFSET
+
+    Note: Calculate iteration count.
     Let iteration_count be (end_value minus start_value)
 
-    Note: Check if loop is worth unrolling
+    Note: Check if loop is worth unrolling.
     If iteration_count is less than 2:
-        Note: Too few iterations to benefit from unrolling
         Return 0
     End If
-
     If iteration_count is greater than 32:
-        Note: Too many iterations, would cause code bloat
         Return 0
     End If
 
-    Note: Estimate body size
-    Let body_size be HIRNodes.estimate_node_size(loop_body)
+    Note: Estimate body size.
+    Let body_size be proc estimate_node_size from HIRCloner with loop_body
     If body_size is greater than 20:
-        Note: Body too large for unrolling
         Return 0
     End If
 
-    Note: Determine unroll factor
+    Note: Determine unroll factor.
     Let unroll_factor be iteration_count
     If iteration_count is greater than 8:
-        Set unroll_factor to 4  Note: Partial unroll for larger loops
+        Set unroll_factor to 4
     End If
 
-    Note: Get iterator variable ID for substitution
-    Let iterator_id be value at (iterator_var plus HIRNodes.VAR_ID_OFFSET)
+    Note: Get parent block to insert unrolled statements.
+    Let parent_block be proc memory_get_int64 from Layout with target, NODE_PARENT_OFFSET
+    If parent_block is equal to 0:
+        Return 0
+    End If
 
-    Note: Get parent block to insert unrolled statements
-    Let parent_block be value at (target plus HIRNodes.STMT_PARENT_OFFSET)
-
-    Note: Unroll the loop
+    Note: Unroll: clone the body once per unrolled iteration, substituting the
+    Note: iterator identifier with the iteration's constant value, and splice
+    Note: each clone before the loop.
     Let i be 0
     Let current_iteration be start_value
     While i is less than unroll_factor:
-        Note: Clone loop body
         Let cloned_body be proc clone_node from HIRCloner with loop_body
 
-        Note: Create constant expression for current iteration
-        Let iter_const be HIRNodes.create_int_literal(current_iteration)
+        Let iter_const be proc create_int_literal from HIRCloner with current_iteration
 
-        Note: Substitute iterator variable with constant
-        Let subst_map be Dictionary.create()
-        proc set from Dictionary with subst_map, iterator_id, iter_const
-        proc substitute_variables from HIRNodes with cloned_body, subst_map
+        Let subst_map be proc create from Dict
+        proc set from Dict with subst_map, iterator_name, iter_const
+        proc substitute_variables from HIRCloner with cloned_body, subst_map
+        proc destroy from Dict with subst_map
 
-        Note: Insert unrolled iteration before the loop
-        proc insert_before from HIRNodes with parent_block, target, cloned_body
+        proc insert_before from HIRCloner with parent_block, target, cloned_body
 
         Set current_iteration to (current_iteration plus 1)
         Set i to (i plus 1)
     End While
 
-    Note: If fully unrolled, remove original loop
+    Note: If fully unrolled, remove the original loop; otherwise advance the
+    Note: condition's end bound past the unrolled prefix so the residual loop
+    Note: covers the remaining iterations.
     If unroll_factor is equal to iteration_count:
-        proc remove_node from HIRNodes with parent_block, target
+        proc remove_node from HIRCloner with parent_block, target
     Otherwise:
-        Note: Partially unrolled, adjust loop bounds
         Let new_start be (start_value plus unroll_factor)
-        Let new_start_expr be HIRNodes.create_int_literal(new_start)
-        proc memory_set_qword from Layout with target, HIRNodes.FOR_START_OFFSET, new_start_expr
+        Let new_start_expr be proc create_int_literal from HIRCloner with new_start
+        proc hir_set_for_init from HIRNodes with target, new_start_expr
     End If
 
-    Note: Mark as unrolled
-    Let flags_ptr be (target plus HIRNodes.STMT_FLAGS_OFFSET)
-    Let flags be value at flags_ptr
-    Let unroll_flag be (flags bitwise or HIRNodes.FLAG_UNROLLED)
-    Set flags_ptr to unroll_flag
+    Note: Mark as unrolled via the real metadata flag.
+    proc hir_set_metadata from HIRNodes with target, "unrolled", 1
 
     Return unroll_factor
+End Process
+
+@Reasoning
+Extracts the constant start value from a C-style for-loop init clause. The
+init clause is an assignment or let whose initializer is an integer literal.
+Returns the literal value, or -1 when the start bound is not a compile-time
+constant.
+@End Reasoning
+Process called "loop_init_constant" that takes init_clause as Integer returns Integer:
+    If init_clause is equal to 0:
+        Return -1
+    End If
+
+    Let init_kind be proc memory_get_int64 from Layout with init_clause, NODE_KIND_OFFSET
+
+    Note: Assignment form: iterator = start_literal.
+    If init_kind is equal to HIRNodes.HIR_ASSIGN_EXPR:
+        Let rhs be proc hir_get_assign_rhs from HIRNodes with init_clause
+        If rhs is equal to 0:
+            Return -1
+        End If
+        Let rhs_kind be proc memory_get_int64 from Layout with rhs, NODE_KIND_OFFSET
+        If rhs_kind is equal to HIRNodes.HIR_INT_LITERAL:
+            Return proc memory_get_int64 from Layout with rhs, NODE_VALUE_OFFSET
+        End If
+        Return -1
+    End If
+
+    Note: Expression-statement wrapper around the assignment.
+    If init_kind is equal to HIRNodes.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIRNodes with init_clause
+        Return loop_init_constant with inner
+    End If
+
+    Return -1
 End Process
 
 Note:
@@ -1023,20 +1428,20 @@ interaction effects and CPU-specific optimizations.
 @End Reasoning
 
 Process called "estimate_performance_impact" that takes spec_ctx as Integer returns Integer:
-    Let opt_list be value at (spec_ctx plus 16)
-    Let opt_count be proc size from List with opt_list
+    Let opt_list be proc memory_get_int64 from Layout with spec_ctx, CTX_OPTIMIZATIONS_OFFSET
+    Let opt_count be proc list_length from List with opt_list
 
     Let total_speedup be 0
     Let total_size_delta be 0
 
     Let opt_idx be 0
     While opt_idx is less than opt_count:
-        Let opt be proc get from List with opt_list, opt_idx
+        Let opt be proc list_get from List with opt_list, opt_idx
 
-        Let applied be value at (opt plus 16)
+        Let applied be proc memory_get_int64 from Layout with opt, OPTREC_APPLIED_OFFSET
         If applied is equal to 1:
-            Let speedup be value at (opt plus 8)
-            Let size_delta be value at (opt plus 12)
+            Let speedup be proc memory_get_int64 from Layout with opt, OPTREC_SPEEDUP_OFFSET
+            Let size_delta be proc memory_get_int64 from Layout with opt, OPTREC_SIZE_DELTA_OFFSET
 
             Set total_speedup to (total_speedup plus speedup)
             Set total_size_delta to (total_size_delta plus size_delta)
@@ -1046,8 +1451,8 @@ Process called "estimate_performance_impact" that takes spec_ctx as Integer retu
     End While
 
     Note: Update context with totals
-    proc memory_set_qword from Layout with spec_ctx, 28, total_speedup
-    proc memory_set_qword from Layout with spec_ctx, 32, total_size_delta
+    proc memory_set_qword from Layout with spec_ctx, CTX_SPEEDUP_OFFSET, total_speedup
+    proc memory_set_qword from Layout with spec_ctx, CTX_SIZE_DELTA_OFFSET, total_size_delta
 
     Return 0
 End Process
@@ -1065,20 +1470,20 @@ structure with the provided parameters.
 
 Process called "create_optimization" that takes type as Integer, target as Integer, speedup as Integer, size_delta as Integer returns Integer:
     Note: Allocate Optimization (64 bytes - Tier 3: OWNED HEAP)
-    Let opt be proc memory_allocate from Layout with 64, 8
+    Let opt be proc allocate from Layout with OPTREC_RECORD_SIZE
 
-    proc memory_set_qword from Layout with opt, 0, type
-    proc memory_set_qword from Layout with opt, 4, target
-    proc memory_set_qword from Layout with opt, 8, speedup
-    proc memory_set_qword from Layout with opt, 12, size_delta
-    proc memory_set_qword from Layout with opt, 16, 0
-    proc memory_set_qword from Layout with opt, 20, 0
+    proc memory_set_qword from Layout with opt, OPTREC_TYPE_OFFSET, type
+    proc memory_set_qword from Layout with opt, OPTREC_TARGET_OFFSET, target
+    proc memory_set_qword from Layout with opt, OPTREC_SPEEDUP_OFFSET, speedup
+    proc memory_set_qword from Layout with opt, OPTREC_SIZE_DELTA_OFFSET, size_delta
+    proc memory_set_qword from Layout with opt, OPTREC_APPLIED_OFFSET, 0
+    proc memory_set_qword from Layout with opt, OPTREC_DESCRIPTION_OFFSET, 0
 
-    Note: Zero reserved fields
-    Let reserved_idx be 24
-    While reserved_idx is less than 64:
+    Note: Zero remaining reserved fields (8-byte slots up to the record size).
+    Let reserved_idx be 48
+    While reserved_idx is less than OPTREC_RECORD_SIZE:
         proc memory_set_qword from Layout with opt, reserved_idx, 0
-        Set reserved_idx to (reserved_idx plus 4)
+        Set reserved_idx to (reserved_idx plus 8)
     End While
 
     Return opt
@@ -1094,40 +1499,52 @@ Process called "estimate_statement_count" that takes stmt as Integer returns Int
         Return 0
     End If
 
-    Let stmt_kind be value at (stmt plus HIRNodes.STMT_KIND_OFFSET)
+    Let stmt_kind be proc memory_get_int64 from Layout with stmt, NODE_KIND_OFFSET
     Let count be 1
 
-    If stmt_kind is equal to HIRNodes.STMT_BLOCK:
-        Let stmts_ptr be (stmt plus HIRNodes.STMT_BLOCK_STMTS_OFFSET)
-        Let stmts be value at stmts_ptr
-        Let stmt_count be value at (stmt plus HIRNodes.STMT_BLOCK_COUNT_OFFSET)
+    If stmt_kind is equal to HIRNodes.HIR_BLOCK:
+        Let stmts be proc hir_get_block_statements from HIRNodes with stmt
+        If stmts is not equal to 0:
+            Let stmt_count be proc list_length from List with stmts
+            Let stmt_idx be 0
+            While stmt_idx is less than stmt_count:
+                Let inner_stmt be proc list_get from List with stmts, stmt_idx
+                Let inner_count be estimate_statement_count with inner_stmt
+                Set count to (count plus inner_count)
 
-        Let stmt_idx be 0
-        While stmt_idx is less than stmt_count:
-            Let inner_stmt be value at (stmts plus (stmt_idx multiplied by 8))
-            Let inner_count be estimate_statement_count with inner_stmt
-            Set count to (count plus inner_count)
-
-            Set stmt_idx to (stmt_idx plus 1)
-        End While
+                Set stmt_idx to (stmt_idx plus 1)
+            End While
+        End If
     End If
 
-    If stmt_kind is equal to HIRNodes.STMT_IF:
-        Let then_branch be value at (stmt plus HIRNodes.STMT_IF_THEN_OFFSET)
+    If stmt_kind is equal to HIRNodes.HIR_IF:
+        Let then_branch be proc hir_get_if_then from HIRNodes with stmt
         Let then_count be estimate_statement_count with then_branch
         Set count to (count plus then_count)
 
-        Let else_branch be value at (stmt plus HIRNodes.STMT_IF_ELSE_OFFSET)
+        Let else_branch be proc hir_get_if_else from HIRNodes with stmt
         If else_branch is not equal to 0:
             Let else_count be estimate_statement_count with else_branch
             Set count to (count plus else_count)
         End If
     End If
 
-    If stmt_kind is equal to HIRNodes.STMT_WHILE:
-        Let body be value at (stmt plus HIRNodes.STMT_WHILE_BODY_OFFSET)
+    If stmt_kind is equal to HIRNodes.HIR_WHILE:
+        Let body be proc hir_get_while_body from HIRNodes with stmt
         Let body_count be estimate_statement_count with body
         Set count to (count plus body_count)
+    End If
+
+    If stmt_kind is equal to HIRNodes.HIR_FOR:
+        Let for_body be proc hir_get_for_body from HIRNodes with stmt
+        Let for_count be estimate_statement_count with for_body
+        Set count to (count plus for_count)
+    End If
+
+    If stmt_kind is equal to HIRNodes.HIR_FOR_IN:
+        Let forin_body be proc hir_get_for_in_body from HIRNodes with stmt
+        Let forin_count be estimate_statement_count with forin_body
+        Set count to (count plus forin_count)
     End If
 
     Return count
