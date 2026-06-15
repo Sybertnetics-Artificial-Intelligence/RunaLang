@@ -648,6 +648,336 @@ Process called "align_buffer" takes buffer_ptr as Integer, alignment as Integer 
     
     Let current_pos be get_buffer_position(buffer_ptr)
     Let aligned_pos be ((current_pos plus alignment minus 1) divided by alignment) multiplied by alignment
-    
+
     Return set_buffer_position(buffer_ptr, aligned_pos)
+End Process
+
+Note: ============================================================================
+Note: GENERIC ENCODER API DELEGATES (powerpc_encode_*)
+Note: ============================================================================
+Note:
+These functions implement the 12-entry-point generic machine-code encoder
+contract defined at the top of
+compiler/frontend/primitives/assembly/machine_code.runa. The platform-agnostic
+dispatcher fans out to these by compile-time platform index (16 = powerpc).
+Each delegate maps an abstract operation onto the real low-level PowerPC
+encoders above. No delegate reimplements an encoding; every byte comes from the
+verified low-level encoders (encode_mr, encode_add, encode_lwz, encode_stw,
+encode_b, encode_blr, encode_li).
+
+BUFFER MODEL: The low-level PowerPC encoders in this module operate on a
+position-prefixed instruction buffer: the first 4 bytes of `buffer_ptr` hold the
+current write position, and each instruction is written at `buffer_ptr + pos + 4`
+(then pos advances by 4). The generic delegates honor that native convention:
+they reset the position word to 0 before delegating, so the single emitted
+instruction lands at `buffer_ptr + 4`. PowerPC is fixed-width (RISC), so a
+successfully emitted instruction is exactly 4 bytes; the delegates return 4 on
+success and 0 on failure. The low-level encoders return the post-write position
+(>= 4) on success and 0 on failure, so a non-zero result means the encode
+committed and the delegate reports the 4-byte length.
+
+ABSTRACT OPCODE IDS (identical id set across all platform delegates; see the
+assembly/machine_code.runa header for the canonical description):
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg   (mr rd, rs -> OR rs,r0,rd alias)
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (add rd, rd, rs)
+  3  = SUB    -- see SUB GAP below
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=disp  (lwz rd, disp(ra))
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=disp  (stw rs, disp(ra))
+  6  = JUMP   operand_a=rel_offset (byte displacement)  (b)
+  7  = CALL   operand_a=rel_offset (byte displacement)  (bl, link=1)
+  8  = RETURN (blr)
+  9  = NOP    -- see NOP GAP below
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate  (li rd, imm, 16-bit signed)
+  11 = CMP    -- see CMP GAP below
+  12 = PUSH   -- see PUSH/POP GAP below
+  13 = POP    -- see PUSH/POP GAP below
+
+SUB GAP: This module provides no subtract encoder (no subf/sub low-level
+function exists here despite the file header listing SUB; only the data-movement,
+add, load/store, and branch encoders are implemented). Rather than emit a wrong
+or fabricated encoding, opcode id 3 returns 0 (unavailable). AOTT lowers
+subtraction on PowerPC by negating the operand into a temporary and adding, or
+via subf once a subf encoder is added; either way that lowering is the caller's
+responsibility, not a fabricated single-instruction here.
+
+NOP GAP: The canonical PowerPC NOP is `ori r0, r0, 0` (0x60000000). This module
+provides no ORI encoder, and the available encoders cannot synthesize a true
+no-op without clobbering architectural state (e.g. `addi r0,0,0` would set r0 to
+0, not preserve it). Rather than fabricate an encoding, opcode id 9 and
+powerpc_get_nop_instruction return 0 (unavailable) until an ORI encoder is added.
+
+CMP GAP: No compare encoder (cmp/cmpw) is implemented in this module, so opcode
+id 11 returns 0 (unavailable).
+
+PUSH/POP GAP: PowerPC has no single push/pop instruction; stack traffic is
+frame-based (stw/std to an explicit stack-pointer-relative slot at prologue,
+lwz/ld at epilogue). Opcode ids 12 and 13 therefore return 0 (unavailable); the
+caller realizes stack slots via STORE/LOAD against the stack pointer register.
+:End Note
+
+Process called "powerpc_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the
+    Note: correct low-level PowerPC encoder and returns the encoded length (4 on
+    Note: success, 0 when unavailable on this target).
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Note: Reset the position-prefix word so the instruction is written at buffer_ptr+4.
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    If opcode_id is equal to 1:
+        Let r be encode_mr(buffer_ptr, operand_a, operand_b)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    If opcode_id is equal to 2:
+        Let r be encode_add(buffer_ptr, operand_a, operand_a, operand_b)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    Note: opcode id 3 (SUB) is unavailable on this target (no subtract encoder).
+    If opcode_id is equal to 4:
+        Let r be encode_lwz(buffer_ptr, operand_a, operand_b, operand_c)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    If opcode_id is equal to 5:
+        Let r be encode_stw(buffer_ptr, operand_a, operand_b, operand_c)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    If opcode_id is equal to 6:
+        Note: target = instruction_addr (buffer_ptr+4 at pos 0) + rel_offset, so
+        Note: encode_b's internal (target - instruction_addr)/4 yields rel_offset/4.
+        Let r be encode_b(buffer_ptr, buffer_ptr plus 4 plus operand_a, 0)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    If opcode_id is equal to 7:
+        Let r be encode_b(buffer_ptr, buffer_ptr plus 4 plus operand_a, 1)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    If opcode_id is equal to 8:
+        Let r be encode_blr(buffer_ptr)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    Note: opcode id 9 (NOP) is unavailable on this target (no ORI encoder).
+    If opcode_id is equal to 10:
+        Let r be encode_li(buffer_ptr, operand_a, operand_b)
+        If r is equal to 0:
+            Return 0
+        End If
+        Return 4
+    End If
+    Note: opcode id 11 (CMP) is unavailable on this target (no compare encoder).
+    Note: opcode ids 12 (PUSH) and 13 (POP) are unavailable (frame-based on PowerPC).
+    Return 0
+End Process
+
+Process called "powerpc_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Return the encoded byte length of an instruction. PowerPC is fixed-width:
+    Note: every encodable instruction is exactly 4 bytes. Ids that do not encode on
+    Note: this target (3 SUB, 9 NOP, 11 CMP, 12 PUSH, 13 POP, and any unrecognized
+    Note: id) report length 0, matching powerpc_encode_instruction returning 0.
+    If opcode_id is equal to 1:
+        Return 4
+    End If
+    If opcode_id is equal to 2:
+        Return 4
+    End If
+    If opcode_id is equal to 4:
+        Return 4
+    End If
+    If opcode_id is equal to 5:
+        Return 4
+    End If
+    If opcode_id is equal to 6:
+        Return 4
+    End If
+    If opcode_id is equal to 7:
+        Return 4
+    End If
+    If opcode_id is equal to 8:
+        Return 4
+    End If
+    If opcode_id is equal to 10:
+        Return 4
+    End If
+    Return 0
+End Process
+
+Process called "powerpc_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg (three-operand `add rd, ra, rb` with
+    Note: ra = rd). `value` mirrors the uniform cross-platform signature; the
+    Note: register-register ADD is the canonical add (immediate adds are emitted by
+    Note: the caller via MOVI + ADD). Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_add(buffer_ptr, dest_reg, dest_reg, src_reg)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB is unavailable on this target: this module provides no subtract
+    Note: (subf/sub) encoder, so a faithful single-instruction subtract cannot be
+    Note: emitted. Returns 0 honestly rather than fabricating an encoding. The caller
+    Note: lowers subtraction (negate-and-add, or subf once a subf encoder is added).
+    Return 0
+End Process
+
+Process called "powerpc_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV dest_reg <- src_reg via `mr rd, rs` (OR rs, r0, rd alias).
+    Note: Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_mr(buffer_ptr, dest_reg, src_reg)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD dest_reg <- [base_reg + displacement] via `lwz rd, disp(ra)` (D-form,
+    Note: 16-bit signed displacement). Returns 4 on success, 0 on failure (including
+    Note: displacement out of 16-bit signed range, rejected by encode_lwz).
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_lwz(buffer_ptr, dest_reg, base_reg, displacement)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [base_reg + displacement] <- src_reg via `stw rs, disp(ra)` (D-form,
+    Note: 16-bit signed displacement). Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_stw(buffer_ptr, src_reg, base_reg, displacement)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset via `b` (unconditional branch, link=0). encode_b
+    Note: takes an absolute target and computes (target - instruction_addr)/4
+    Note: internally; with the position word reset to 0 the instruction address is
+    Note: buffer_ptr+4, so passing target = buffer_ptr+4+rel_offset yields the correct
+    Note: PC-relative word offset rel_offset/4. Returns 4 on success, 0 on failure
+    Note: (including offset out of 24-bit signed range, rejected by encode_b).
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_b(buffer_ptr, buffer_ptr plus 4 plus rel_offset, 0)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset via `bl` (branch with link, link=1). Same PC-relative
+    Note: target computation as powerpc_encode_jump. Returns 4 on success, 0 on
+    Note: failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_b(buffer_ptr, buffer_ptr plus 4 plus rel_offset, 1)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN via `blr` (branch to link register). Returns 4 on success, 0 on
+    Note: failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int32 from Memory with buffer_ptr, 0, 0
+    Let r be encode_blr(buffer_ptr)
+    If r is equal to 0:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "powerpc_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: NOP is unavailable on this target: the canonical PowerPC nop is
+    Note: `ori r0, r0, 0` and this module provides no ORI encoder; no other available
+    Note: encoder can synthesize a true no-op without clobbering architectural state.
+    Note: Returns 0 honestly rather than fabricating an encoding.
+    Return 0
+End Process
+
+Process called "powerpc_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence, using
+    Note: the same 32-byte record layout as the other platform delegates (four
+    Note: little-endian 8-byte fields: opcode_id, operand_a, operand_b, operand_c).
+    Note: Running on the operation records (not raw bytes) keeps peepholes valid for
+    Note: the fixed-width PowerPC ISA.
+    Note: ---
+    Note: Implemented peephole (semantics-preserving on PowerPC):
+    Note:   Redundant self-move elimination: MOV rd, rd (opcode 1, operand_a ==
+    Note:   operand_b) is `mr rd, rd` (OR rd, r0... alias), a true no-op. It is
+    Note:   rewritten in place to NOP (opcode 9). Because powerpc_encode_instruction
+    Note:   reports NOP as unavailable on this target, a later assembly pass drops the
+    Note:   opcode-9 records entirely rather than emitting them; rewriting to 9
+    Note:   (instead of physical removal) preserves the record count and any branch
+    Note:   offsets until that drop pass runs.
+    Note: PUSH/POP round-trip elimination is intentionally not applied on PowerPC
+    Note: because per-register push/pop is not realized on this target (stack traffic
+    Note: is frame-based; see PUSH/POP GAP above).
+    Note: Returns the number of records rewritten (0 when already optimal -- correct
+    Note: identity behavior).
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return optimized_count
 End Process

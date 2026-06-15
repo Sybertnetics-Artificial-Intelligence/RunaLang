@@ -418,3 +418,219 @@ Process called "align_code" takes buffer as Integer, offset_arg as Integer, alig
     End While
     Return current_offset
 End Process
+
+Note: ============================================================================
+Note: GENERIC ENCODER API DELEGATES (mips64_encode_*)
+Note: ============================================================================
+Note:
+These functions implement the 12-entry-point generic machine-code encoder
+contract defined at the top of
+compiler/frontend/primitives/assembly/machine_code.runa. The platform-agnostic
+dispatcher fans out to these by compile-time platform index (mips64 = 5). Each
+delegate maps an abstract operation onto the real low-level MIPS64 emitters above
+(emit_or/emit_daddu/emit_dsubu/emit_ld/emit_sd/emit_beq/emit_bgezal/emit_jr/
+emit_nop/emit_ori), writing the encoded bytes into the caller-supplied code buffer
+and returning the number of bytes written. MIPS is fixed-width, so every emitted
+instruction is exactly 4 bytes. No delegate reimplements an encoding.
+
+BUFFER MODEL: the low-level emit_* functions take (buffer, offset, operands...),
+write the 4-byte little-endian word at buffer + offset, and return offset + 4 (the
+next write offset). The generic contract hands a destination buffer whose first
+byte receives the instruction and expects the encoded byte length back. The two
+models align directly: each delegate calls the emitter with offset 0, so the
+instruction lands at buffer_ptr + 0 and the emitter's return of 0 + 4 = 4 IS the
+encoded length. No scratch buffer or copy is needed.
+
+ABSTRACT OPCODE IDS (identical id set across all platform delegates; see the
+x86_64 delegate header for the canonical description):
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (dest <- dest + src)
+  3  = SUB    operand_a=dest_reg, operand_b=src_reg   (dest <- dest - src)
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=disp
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=disp
+  6  = JUMP   operand_a=rel_offset (byte displacement)
+  7  = CALL   operand_a=rel_offset (byte displacement)
+  8  = RETURN
+  9  = NOP
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate (low 16 bits, zero-extended)
+  11 = CMP    operand_a=reg1, operand_b=reg2   -- unavailable on MIPS (see below)
+  12 = PUSH   operand_a=reg   -- unavailable as a single MIPS instruction (see below)
+  13 = POP    operand_a=reg   -- unavailable as a single MIPS instruction (see below)
+
+MIPS REGISTER USAGE: $zero (id 0) is the hardwired-zero register; $ra (id 31) is
+the return-address register per the MIPS calling convention.
+  MOV    -> OR    rd, rs, $zero        (canonical MIPS register move = `move`)
+  ADD    -> DADDU rd, rd, rs           (64-bit wrap-safe doubleword add, natural width)
+  SUB    -> DSUBU rd, rd, rs           (64-bit wrap-safe doubleword subtract)
+  LOAD   -> LD    rt, disp(base)       (MIPS64 doubleword load, 64-bit natural width)
+  STORE  -> SD    rt, disp(base)       (MIPS64 doubleword store, 64-bit natural width)
+  JUMP   -> B     pc+rel_offset        (BEQ $zero,$zero,off -- unconditional branch)
+  CALL   -> BAL   pc+rel_offset        (BGEZAL $zero,off -- PC-relative branch-and-link)
+  RETURN -> JR    $ra                  (jump register to return address)
+  NOP    -> SLL   $zero,$zero,0        (the all-zero canonical MIPS NOP)
+  MOVI   -> ORI   rt, $zero, imm       (load 16-bit zero-extended immediate)
+
+BRANCH OFFSET BRIDGE: MIPS branch targets are (PC + 4) + (branch_offset << 2),
+where branch_offset is the 16-bit instruction-count field. Given a byte
+rel_offset (target - PC), the field is (rel_offset - 4) / 4. JUMP and CALL compute
+this and pass it to emit_beq / emit_bgezal. PC-relative B/BAL forms are used rather
+than the absolute-region J/JAL forms because the contract supplies a PC-relative
+byte displacement, not an absolute region word address; J/JAL cannot be derived
+from rel_offset without the final program counter.
+
+CMP GAP: MIPS has no condition-flags compare instruction. The architectural
+equivalent is SLT-family, which writes a boolean result to a destination register
+(SLT rd, rs, rt). The generic CMP contract supplies only the two source registers
+and no destination, so a faithful CMP cannot be encoded without clobbering an
+unspecified register. Opcode 11 therefore returns 0 (unavailable) rather than
+silently overwriting a temporary; comparison on MIPS is realized by the caller as
+SLT-into-explicit-dest followed by a branch.
+
+PUSH/POP GAP: MIPS has no push/pop opcode; the ABI adjusts $sp with DADDIU and uses
+SD/LD for stack traffic. A single-register push is not one instruction, so opcode
+ids 12 and 13 return 0 (unavailable), matching the frame-based strategy rather than
+emitting a wrong encoding.
+:End Note
+
+Process called "mips64_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the
+    Note: correct low-level MIPS64 emitter and returns the encoded length (4 on success,
+    Note: 0 when the op has no single-instruction MIPS64 encoding). Each emitter writes at
+    Note: offset 0 and returns 0 + 4 = 4, which is exactly the encoded length.
+    If opcode_id is equal to 1:
+        Return emit_or(buffer_ptr, 0, operand_a, operand_b, 0)
+    End If
+    If opcode_id is equal to 2:
+        Return emit_daddu(buffer_ptr, 0, operand_a, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 3:
+        Return emit_dsubu(buffer_ptr, 0, operand_a, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 4:
+        Return emit_ld(buffer_ptr, 0, operand_a, operand_b, operand_c)
+    End If
+    If opcode_id is equal to 5:
+        Return emit_sd(buffer_ptr, 0, operand_a, operand_b, operand_c)
+    End If
+    If opcode_id is equal to 6:
+        Let branch_field be (operand_a minus 4) divided by 4
+        Return emit_beq(buffer_ptr, 0, 0, 0, branch_field)
+    End If
+    If opcode_id is equal to 7:
+        Let branch_field be (operand_a minus 4) divided by 4
+        Return emit_bgezal(buffer_ptr, 0, 0, branch_field)
+    End If
+    If opcode_id is equal to 8:
+        Return emit_jr(buffer_ptr, 0, 31)
+    End If
+    If opcode_id is equal to 9:
+        Return emit_nop(buffer_ptr, 0)
+    End If
+    If opcode_id is equal to 10:
+        Return emit_ori(buffer_ptr, 0, operand_a, 0, operand_b)
+    End If
+    Note: opcode 11 (CMP) has no destination-free MIPS encoding (see CMP GAP);
+    Note: opcode ids 12 (PUSH) and 13 (POP) are not single MIPS instructions (see GAP notes).
+    Return 0
+End Process
+
+Process called "mips64_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Return the encoded byte length of an instruction. MIPS64 is fixed-width: every
+    Note: encodable instruction is exactly 4 bytes. Ids that do not encode on this target
+    Note: (11 CMP, 12 PUSH, 13 POP, and any unrecognized id) report length 0, matching
+    Note: mips64_encode_instruction returning 0 for them.
+    If opcode_id is less than 1:
+        Return 0
+    End If
+    If opcode_id is greater than 10:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "mips64_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg via DADDU (64-bit wrap-safe doubleword add
+    Note: with rs = rd). `value` mirrors the uniform cross-platform signature; the
+    Note: register-register add is the canonical add here (immediate adds use MOVI + ADD).
+    Return emit_daddu(buffer_ptr, 0, dest_reg, dest_reg, src_reg)
+End Process
+
+Process called "mips64_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB dest_reg <- dest_reg - src_reg via DSUBU (64-bit doubleword subtract with
+    Note: rs = rd). `value` mirrors the uniform cross-platform signature.
+    Return emit_dsubu(buffer_ptr, 0, dest_reg, dest_reg, src_reg)
+End Process
+
+Process called "mips64_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV dest_reg <- src_reg via OR rd, rs, $zero (canonical MIPS `move`).
+    Return emit_or(buffer_ptr, 0, dest_reg, src_reg, 0)
+End Process
+
+Process called "mips64_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD dest_reg <- [base_reg + displacement] via LD (MIPS64 doubleword load).
+    Return emit_ld(buffer_ptr, 0, dest_reg, base_reg, displacement)
+End Process
+
+Process called "mips64_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [base_reg + displacement] <- src_reg via SD (MIPS64 doubleword store).
+    Return emit_sd(buffer_ptr, 0, src_reg, base_reg, displacement)
+End Process
+
+Process called "mips64_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset via B (BEQ $zero,$zero,off). The 16-bit branch field
+    Note: is (rel_offset - 4) / 4 because the MIPS branch target is (PC + 4) + (field << 2).
+    Let branch_field be (rel_offset minus 4) divided by 4
+    Return emit_beq(buffer_ptr, 0, 0, 0, branch_field)
+End Process
+
+Process called "mips64_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset via BAL (BGEZAL $zero,off), the PC-relative branch-and-link
+    Note: that stores the return address in $ra. Branch field = (rel_offset - 4) / 4.
+    Let branch_field be (rel_offset minus 4) divided by 4
+    Return emit_bgezal(buffer_ptr, 0, 0, branch_field)
+End Process
+
+Process called "mips64_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN via JR $ra (jump register to the return address).
+    Return emit_jr(buffer_ptr, 0, 31)
+End Process
+
+Process called "mips64_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a NOP (SLL $zero,$zero,0 = all-zero word) for padding/alignment.
+    Return emit_nop(buffer_ptr, 0)
+End Process
+
+Process called "mips64_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence, using
+    Note: the same 32-byte record layout as every platform delegate (four little-endian
+    Note: 8-byte fields: opcode_id, operand_a, operand_b, operand_c). Running on the
+    Note: operation records (not raw bytes) keeps peepholes valid for the fixed-width
+    Note: MIPS64 ISA.
+    Note: ---
+    Note: Implemented peephole (semantics-preserving on MIPS64):
+    Note:   Redundant self-move elimination: MOV rd, rd (opcode 1, operand_a == operand_b)
+    Note:   is OR rd, rd, $zero, a true no-op, rewritten in place to NOP (opcode 9).
+    Note: Records are rewritten to NOP rather than removed so branch offsets and the
+    Note: record count are preserved; a later assembly pass drops NOP records. Returns
+    Note: the number of records rewritten (0 when already optimal -- correct identity
+    Note: behavior). PUSH/POP round-trip elimination is intentionally not applied on
+    Note: MIPS64 because per-register push/pop is not realized on this target (see GAP
+    Note: note above); stack traffic uses frame-based SD/LD instead.
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return optimized_count
+End Process

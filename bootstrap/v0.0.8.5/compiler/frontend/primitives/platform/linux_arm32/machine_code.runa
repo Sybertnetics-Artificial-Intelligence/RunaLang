@@ -45,6 +45,7 @@ Dependencies: memory_core.runa for buffer operations
 :End Note
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
 Note: INSTRUCTION BUFFER OPERATIONS
@@ -880,4 +881,328 @@ Process called "operand2_register_shift_reg" takes rm as Integer, shift_type as 
     Let shift_type_bits be shift_type shifted left by 5
     Let rs_bits be rs shifted left by 8
     Return rm_bits bitwise or bit4 bitwise or shift_type_bits bitwise or rs_bits
+End Process
+
+Note: ============================================================================
+Note: GENERIC ENCODER API DELEGATES (linux_arm32_encode_*)
+Note: ============================================================================
+Note:
+These functions implement the 12-entry-point generic machine-code encoder
+contract defined at the top of
+compiler/frontend/primitives/assembly/machine_code.runa. The platform-agnostic
+dispatcher fans out to these by compile-time platform index (3 = linux_arm32).
+Each delegate maps an abstract operation onto the real low-level ARM32
+(ARM-mode, A32) encoders above. No delegate reimplements an encoding; every byte
+comes from the verified emit_* encoders.
+
+BUFFER MODEL: The low-level ARM32 emit_* encoders take (buffer, offset, ...) and
+write the instruction at `buffer + offset`, returning the next offset
+(offset + bytes_written) on success, or -1 for an out-of-range branch. The
+generic delegates write at offset 0, so the encoder's return value IS the number
+of bytes written. ARM (A32) mode is fixed-width: a single instruction is 4 bytes,
+so most delegates return 4. The one exception is MOVI: emit_mov_imm emits a
+single MOV/MVN (4 bytes) when the immediate fits the rotated-imm8 encoding, and
+otherwise falls back to a MOVW (+ MOVT when the high half is non-zero) sequence
+of up to 8 bytes; the delegate returns whatever real length emit_mov_imm reports.
+The condition field is ALWAYS (AL = 14) for every emitted instruction. Branch
+delegates return 0 (not the encoder's -1) when the target is out of A32 branch
+range, matching the contract's "0 = unavailable / encode error".
+
+ABSTRACT OPCODE IDS (identical id set across all platform delegates; see the
+assembly/machine_code.runa header for the canonical description):
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg   (MOV Rd, Rm)
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (ADD Rd, Rd, Rm)
+  3  = SUB    operand_a=dest_reg, operand_b=src_reg   (SUB Rd, Rd, Rm)
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=disp  (LDR Rd, [Rn, #disp])
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=disp  (STR Rd, [Rn, #disp])
+  6  = JUMP   operand_a=rel_offset (byte displacement)  (B)
+  7  = CALL   operand_a=rel_offset (byte displacement)  (BL)
+  8  = RETURN (BX LR)
+  9  = NOP    (MOV R0, R0)
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate  (MOV/MVN imm, or MOVW/MOVT)
+  11 = CMP    operand_a=reg1, operand_b=reg2  (CMP Rn, Rm)
+  12 = PUSH   operand_a=reg   (PUSH {Rn} == STMDB SP!, {Rn})
+  13 = POP    operand_a=reg   (POP {Rn}  == LDMIA SP!, {Rn})
+
+PUSH/POP: ARM32 has real single-instruction PUSH/POP (block transfer with the
+stack pointer, write-back). The abstract op carries a single register id in
+operand_a; the delegate forms the one-bit register-list mask (1 << reg) the
+emit_push/emit_pop encoders expect, so PUSH/POP of one register encode faithfully
+as STMDB SP!, {Rn} / LDMIA SP!, {Rn}.
+:End Note
+
+Process called "linux_arm32_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the
+    Note: correct low-level ARM32 encoder and returns the encoded length in bytes
+    Note: (4 for fixed-width A32 instructions, up to 8 for a MOVI that lowers to
+    Note: MOVW/MOVT, 0 when unavailable or out of branch range).
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Let cond_al be 14
+    If opcode_id is equal to 1:
+        Return emit_mov(buffer_ptr, 0, operand_a, operand_b, cond_al)
+    End If
+    If opcode_id is equal to 2:
+        Return emit_add(buffer_ptr, 0, operand_a, operand_a, operand_b, cond_al)
+    End If
+    If opcode_id is equal to 3:
+        Return emit_sub(buffer_ptr, 0, operand_a, operand_a, operand_b, cond_al)
+    End If
+    If opcode_id is equal to 4:
+        Return emit_ldr(buffer_ptr, 0, operand_a, operand_b, operand_c, cond_al)
+    End If
+    If opcode_id is equal to 5:
+        Return emit_str(buffer_ptr, 0, operand_a, operand_b, operand_c, cond_al)
+    End If
+    If opcode_id is equal to 6:
+        Note: B: target = (pc + 8) + rel_offset with pc = 0 yields branch delta = rel_offset.
+        Let r6 be emit_b(buffer_ptr, 0, operand_a plus 8, 0, cond_al)
+        If r6 is less than 0:
+            Return 0
+        End If
+        Return r6
+    End If
+    If opcode_id is equal to 7:
+        Let r7 be emit_bl(buffer_ptr, 0, operand_a plus 8, 0, cond_al)
+        If r7 is less than 0:
+            Return 0
+        End If
+        Return r7
+    End If
+    If opcode_id is equal to 8:
+        Note: RETURN via BX LR (LR = R14).
+        Return emit_bx(buffer_ptr, 0, 14, cond_al)
+    End If
+    If opcode_id is equal to 9:
+        Return emit_nop(buffer_ptr, 0)
+    End If
+    If opcode_id is equal to 10:
+        Return emit_mov_imm(buffer_ptr, 0, operand_a, operand_b, cond_al)
+    End If
+    If opcode_id is equal to 11:
+        Return emit_cmp(buffer_ptr, 0, operand_a, operand_b, cond_al)
+    End If
+    If opcode_id is equal to 12:
+        Note: PUSH {Rn}: single-register list mask = 1 << reg.
+        Let mask12 be 1 shifted left by operand_a
+        Return emit_push(buffer_ptr, 0, mask12, cond_al)
+    End If
+    If opcode_id is equal to 13:
+        Let mask13 be 1 shifted left by operand_a
+        Return emit_pop(buffer_ptr, 0, mask13, cond_al)
+    End If
+    Return 0
+End Process
+
+Process called "linux_arm32_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Return the encoded byte length of an instruction without committing it to a
+    Note: caller buffer. Every A32 instruction this delegate emits is fixed at 4 bytes
+    Note: EXCEPT MOVI (id 10), which emit_mov_imm may lower to a MOVW/MOVT sequence of
+    Note: up to 8 bytes depending on the immediate. For MOVI we therefore encode into a
+    Note: scratch buffer (the same strategy the x86_64 delegate uses for its
+    Note: variable-length ISA) and return the resulting length. All other recognized
+    Note: ids return 4; unrecognized ids return 0. Branch ids (6 JUMP, 7 CALL) report
+    Note: their nominal 4-byte length here; an out-of-range target is only detectable
+    Note: at encode time and surfaces as 0 from linux_arm32_encode_instruction.
+    If opcode_id is equal to 10:
+        Let scratch be proc allocate from Layout with 16
+        If scratch is equal to 0:
+            Return 0
+        End If
+        Return emit_mov_imm(scratch, 0, operand_a, operand_b, 14)
+    End If
+    If opcode_id is equal to 1:
+        Return 4
+    End If
+    If opcode_id is equal to 2:
+        Return 4
+    End If
+    If opcode_id is equal to 3:
+        Return 4
+    End If
+    If opcode_id is equal to 4:
+        Return 4
+    End If
+    If opcode_id is equal to 5:
+        Return 4
+    End If
+    If opcode_id is equal to 6:
+        Return 4
+    End If
+    If opcode_id is equal to 7:
+        Return 4
+    End If
+    If opcode_id is equal to 8:
+        Return 4
+    End If
+    If opcode_id is equal to 9:
+        Return 4
+    End If
+    If opcode_id is equal to 11:
+        Return 4
+    End If
+    If opcode_id is equal to 12:
+        Return 4
+    End If
+    If opcode_id is equal to 13:
+        Return 4
+    End If
+    Return 0
+End Process
+
+Process called "linux_arm32_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg (three-operand `ADD Rd, Rn, Rm` with
+    Note: Rn = Rd). `value` mirrors the uniform cross-platform signature; the
+    Note: register-register ADD is the canonical add (immediate adds are emitted by
+    Note: the caller via MOVI + ADD). Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_add(buffer_ptr, 0, dest_reg, dest_reg, src_reg, 14)
+End Process
+
+Process called "linux_arm32_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB dest_reg <- dest_reg - src_reg (three-operand `SUB Rd, Rn, Rm` with
+    Note: Rn = Rd). `value` mirrors the uniform cross-platform signature.
+    Note: Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_sub(buffer_ptr, 0, dest_reg, dest_reg, src_reg, 14)
+End Process
+
+Process called "linux_arm32_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV dest_reg <- src_reg (`MOV Rd, Rm`). Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_mov(buffer_ptr, 0, dest_reg, src_reg, 14)
+End Process
+
+Process called "linux_arm32_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD dest_reg <- [base_reg + displacement] (`LDR Rd, [Rn, #disp]`,
+    Note: pre-indexed, 12-bit signed displacement with U-bit selecting sign).
+    Note: Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_ldr(buffer_ptr, 0, dest_reg, base_reg, displacement, 14)
+End Process
+
+Process called "linux_arm32_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [base_reg + displacement] <- src_reg (`STR Rd, [Rn, #disp]`,
+    Note: pre-indexed, 12-bit unsigned displacement). Returns 4 on success, 0 on
+    Note: failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_str(buffer_ptr, 0, src_reg, base_reg, displacement, 14)
+End Process
+
+Process called "linux_arm32_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset (`B` unconditional). emit_b computes the branch
+    Note: as (target - (pc + 8)); passing pc = 0 and target = rel_offset + 8 yields a
+    Note: branch delta of exactly rel_offset, so the encoder's PC-relative word offset
+    Note: equals rel_offset/4. Returns 4 on success, 0 on failure (including an
+    Note: out-of-range target, which emit_b reports as -1).
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Let r be emit_b(buffer_ptr, 0, rel_offset plus 8, 0, 14)
+    If r is less than 0:
+        Return 0
+    End If
+    Return r
+End Process
+
+Process called "linux_arm32_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset (`BL` branch with link). Same PC-relative target
+    Note: computation as linux_arm32_encode_jump. Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Let r be emit_bl(buffer_ptr, 0, rel_offset plus 8, 0, 14)
+    If r is less than 0:
+        Return 0
+    End If
+    Return r
+End Process
+
+Process called "linux_arm32_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN via `BX LR` (branch and exchange to the link register, R14).
+    Note: Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_bx(buffer_ptr, 0, 14, 14)
+End Process
+
+Process called "linux_arm32_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a NOP (`MOV R0, R0`) for code padding/alignment.
+    Note: Returns 4 on success, 0 on failure.
+    If buffer_ptr is equal to 0:
+        Return 0
+    End If
+    Return emit_nop(buffer_ptr, 0)
+End Process
+
+Process called "linux_arm32_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence, using
+    Note: the same 32-byte record layout as the other platform delegates (four
+    Note: little-endian 8-byte fields: opcode_id, operand_a, operand_b, operand_c).
+    Note: Running on the operation records (not raw bytes) keeps peepholes valid for
+    Note: the fixed-width ARM32 (A32) ISA.
+    Note: ---
+    Note: Implemented peepholes (semantics-preserving on ARM32):
+    Note:   1. Redundant self-move elimination: MOV Rd, Rd (opcode 1, operand_a ==
+    Note:      operand_b) is a true no-op and is rewritten in place to NOP (opcode 9,
+    Note:      MOV R0, R0). The data-processing MOV with Rd = Rm and no flag update
+    Note:      changes no architectural state.
+    Note:   2. Push/pop round-trip elimination: PUSH {Rn} (opcode 12) immediately
+    Note:      followed by POP {Rn} (opcode 13) of the SAME register restores the
+    Note:      register and the stack pointer (STMDB SP!, {Rn} then LDMIA SP!, {Rn}),
+    Note:      so both records are rewritten to NOP (opcode 9). ARM32 realizes
+    Note:      single-register push/pop directly (unlike ARM64), so this round-trip
+    Note:      peephole is valid here.
+    Note: Records are rewritten to NOP rather than physically removed so caller branch
+    Note: offsets and the record count are preserved; a later assembly pass drops NOP
+    Note: records. Returns the number of records rewritten (0 when already optimal --
+    Note: correct identity behavior).
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Let j be 0
+    While j is less than (count minus 1):
+        Let base_j be instructions_ptr plus (j multiplied by record_size)
+        Let next_base be instructions_ptr plus ((j plus 1) multiplied by record_size)
+        Let op_j be proc memory_get_int64 from Memory with base_j, 0
+        Let op_next be proc memory_get_int64 from Memory with next_base, 0
+        If op_j is equal to 12:
+            If op_next is equal to 13:
+                Let reg_j be proc memory_get_int64 from Memory with base_j, 8
+                Let reg_next be proc memory_get_int64 from Memory with next_base, 8
+                If reg_j is equal to reg_next:
+                    proc memory_set_int64 from Memory with base_j, 0, 9
+                    proc memory_set_int64 from Memory with next_base, 0, 9
+                    Set optimized_count to optimized_count plus 2
+                End If
+            End If
+        End If
+        Set j to j plus 1
+    End While
+    Return optimized_count
 End Process

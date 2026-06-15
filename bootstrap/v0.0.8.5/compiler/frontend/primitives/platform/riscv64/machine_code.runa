@@ -48,6 +48,7 @@ Dependencies: registers.runa for register number mappings
 
 Import "compiler/frontend/primitives/platform/riscv64/registers.runa" as Registers
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
 Note: INSTRUCTION BUFFER OPERATIONS
@@ -934,6 +935,291 @@ Process called "align_buffer" takes buffer_ptr as Integer, alignment as Integer 
     
     Let current_pos be get_buffer_position(buffer_ptr)
     Let aligned_pos be ((current_pos plus alignment minus 1) divided by alignment) multiplied by alignment
-    
+
     Return set_buffer_position(buffer_ptr, aligned_pos)
+End Process
+
+Note: ============================================================================
+Note: GENERIC ENCODER API DELEGATES (riscv64_encode_*)
+Note: ============================================================================
+Note:
+These functions implement the 12-entry-point generic machine-code encoder
+contract defined at the top of
+compiler/frontend/primitives/assembly/machine_code.runa. The platform-agnostic
+dispatcher fans out to these by compile-time platform index (riscv64 = 18).
+Each delegate maps an abstract operation onto the real low-level RV64I encoders
+above (encode_addi/encode_add/encode_sub/encode_ld/encode_sd/encode_jal/
+encode_jalr), writing the encoded bytes into the caller-supplied code buffer and
+returning the number of bytes written. RISC-V is fixed-width, so every emitted
+instruction is exactly 4 bytes. No delegate reimplements an encoding.
+
+BUFFER-MODEL BRIDGE: the low-level RV64 encoders are position-managed -- they
+read a 4-byte position header at the start of their buffer and write the next
+instruction at (buffer + position + 4), returning 1 on success / 0 on failure
+rather than a byte length. The generic contract instead hands a raw destination
+buffer whose first byte receives the instruction and expects the encoded byte
+length back. To bridge the two faithfully without reimplementing any encoding,
+each delegate allocates a small private 16-byte scratch buffer, initializes its
+position header (init_instruction_buffer sets position = 4, so the first
+instruction lands at scratch + 8), invokes the real encoder, and -- on success
+-- copies the produced 4 bytes from scratch+8 to the caller's buffer at offset 0,
+returning 4. On encoder failure (validation reject / out-of-range immediate) the
+delegate returns 0, honestly signalling "nothing encoded" with no invented bytes.
+
+ABSTRACT OPCODE IDS (identical id set across all platform delegates; see the
+x86_64 delegate header for the canonical description):
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (dest <- dest + src)
+  3  = SUB    operand_a=dest_reg, operand_b=src_reg   (dest <- dest - src)
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=disp
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=disp
+  6  = JUMP   operand_a=rel_offset (byte displacement)
+  7  = CALL   operand_a=rel_offset (byte displacement)
+  8  = RETURN
+  9  = NOP
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate (12-bit signed)
+  11 = CMP    operand_a=reg1, operand_b=reg2
+  12 = PUSH   operand_a=reg   -- unavailable as a single RV instruction (see below)
+  13 = POP    operand_a=reg   -- unavailable as a single RV instruction (see below)
+
+RV REGISTER USAGE: x0 (id 0) is the hardwired-zero register; x1 (id 1) is the
+return-address register (ra) per the RV calling convention.
+  MOV    -> ADDI rd, rs, 0          (canonical RV register move / `mv` alias)
+  ADD    -> ADD  rd, rd, rs
+  SUB    -> SUB  rd, rd, rs
+  LOAD   -> LD   rd, disp(base)      (RV64 doubleword load -- 64-bit natural width)
+  STORE  -> SD   rs, disp(base)      (RV64 doubleword store -- 64-bit natural width)
+  JUMP   -> JAL  x0, pc+rel_offset   (link to x0 = plain jump, return addr discarded)
+  CALL   -> JAL  x1, pc+rel_offset   (link to ra = call)
+  RETURN -> JALR x0, ra, 0           (jump to ra, discard link = `ret`)
+  NOP    -> ADDI x0, x0, 0           (canonical RV NOP)
+  MOVI   -> ADDI rd, x0, imm         (load 12-bit signed immediate in one insn)
+
+JAL OFFSET BRIDGE: encode_jal takes an ABSOLUTE target and internally computes
+offset = target - (buffer + position + 4). Because the delegate encodes into a
+private scratch buffer, it passes target = (scratch + 8) + rel_offset so the
+internal subtraction cancels the scratch base and the emitted PC-relative
+immediate encodes exactly the caller-supplied rel_offset -- correct for the final
+placement, with no hand-rolled immediate math.
+
+CMP GAP: RV64I has no condition-flags compare instruction; comparison is done
+with SLT-family + branch. This module exposes no SLT encoder, so opcode 11 (CMP)
+returns 0 (unavailable). When an encode_slt encoder is added, id 11 should be
+wired to `SLT rd, reg1, reg2`.
+
+PUSH/POP GAP: RISC-V has no push/pop opcode; the ABI uses frame-based ADDI sp
+adjustment plus SD/LD. A single-register push is not one instruction, so opcode
+ids 12 and 13 return 0 (unavailable), matching the architecturally correct
+frame-based strategy rather than emitting a wrong encoding.
+:End Note
+
+Process called "riscv64_alloc_scratch_buffer" returns Integer:
+    Note: Allocate and position-initialize a private 16-byte RV64 working buffer.
+    Note: init_instruction_buffer sets the position header to 4, so the first
+    Note: instruction encoded into it lands at scratch + 8. Returns 0 on failure.
+    Let scratch be proc allocate from Layout with 16
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let init_ok be init_instruction_buffer(scratch, 16)
+    If init_ok is equal to 0:
+        Return 0
+    End If
+    Return scratch
+End Process
+
+Process called "riscv64_commit_scratch" takes scratch as Integer, encode_result as Integer, buffer_ptr as Integer returns Integer:
+    Note: Bridge a position-managed RV64 encoder result into the generic contract.
+    Note: encode_result is 1 on success / 0 on failure. On success copy the 4 emitted
+    Note: bytes from scratch + 8 to the caller buffer at offset 0 and return length 4;
+    Note: on failure return 0 (nothing encoded).
+    If encode_result is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with buffer_ptr, scratch plus 8, 4
+    Return 4
+End Process
+
+Process called "riscv64_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the
+    Note: correct low-level RV64 encoder and returns the encoded length (4 on success,
+    Note: 0 when the op has no single-instruction RV64 encoding or the encoder rejects).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    If opcode_id is equal to 1:
+        Return riscv64_commit_scratch(scratch, encode_addi(scratch, operand_a, operand_b, 0), buffer_ptr)
+    End If
+    If opcode_id is equal to 2:
+        Return riscv64_commit_scratch(scratch, encode_add(scratch, operand_a, operand_a, operand_b), buffer_ptr)
+    End If
+    If opcode_id is equal to 3:
+        Return riscv64_commit_scratch(scratch, encode_sub(scratch, operand_a, operand_a, operand_b), buffer_ptr)
+    End If
+    If opcode_id is equal to 4:
+        Return riscv64_commit_scratch(scratch, encode_ld(scratch, operand_a, operand_b, operand_c), buffer_ptr)
+    End If
+    If opcode_id is equal to 5:
+        Return riscv64_commit_scratch(scratch, encode_sd(scratch, operand_a, operand_b, operand_c), buffer_ptr)
+    End If
+    If opcode_id is equal to 6:
+        Let target_jump be scratch plus 8 plus operand_a
+        Return riscv64_commit_scratch(scratch, encode_jal(scratch, 0, target_jump), buffer_ptr)
+    End If
+    If opcode_id is equal to 7:
+        Let target_call be scratch plus 8 plus operand_a
+        Return riscv64_commit_scratch(scratch, encode_jal(scratch, 1, target_call), buffer_ptr)
+    End If
+    If opcode_id is equal to 8:
+        Return riscv64_commit_scratch(scratch, encode_jalr(scratch, 0, 1, 0), buffer_ptr)
+    End If
+    If opcode_id is equal to 9:
+        Return riscv64_commit_scratch(scratch, encode_addi(scratch, 0, 0, 0), buffer_ptr)
+    End If
+    If opcode_id is equal to 10:
+        Return riscv64_commit_scratch(scratch, encode_addi(scratch, operand_a, 0, operand_b), buffer_ptr)
+    End If
+    Note: opcode 11 (CMP) has no single-instruction RV64 encoder in this module (no SLT);
+    Note: opcode ids 12 (PUSH) and 13 (POP) are not single RV instructions (see GAP notes).
+    Return 0
+End Process
+
+Process called "riscv64_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Return the encoded byte length of an instruction. RV64 is fixed-width: every
+    Note: encodable instruction is exactly 4 bytes. Ids that do not encode on this target
+    Note: (11 CMP, 12 PUSH, 13 POP, and any unrecognized id) report length 0, matching
+    Note: riscv64_encode_instruction returning 0 for them.
+    If opcode_id is less than 1:
+        Return 0
+    End If
+    If opcode_id is greater than 10:
+        Return 0
+    End If
+    Return 4
+End Process
+
+Process called "riscv64_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg (RV64 three-operand form with rs1 = rd).
+    Note: `value` mirrors the uniform cross-platform signature; the register-register
+    Note: ADD is the canonical add here (immediate adds are emitted via MOVI + ADD).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_add(scratch, dest_reg, dest_reg, src_reg), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB dest_reg <- dest_reg - src_reg (RV64 three-operand form with rs1 = rd).
+    Note: `value` mirrors the uniform cross-platform signature.
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_sub(scratch, dest_reg, dest_reg, src_reg), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV dest_reg <- src_reg via ADDI rd, rs, 0 (canonical RV register move).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_addi(scratch, dest_reg, src_reg, 0), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD dest_reg <- [base_reg + displacement] via LD (RV64 doubleword load).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_ld(scratch, dest_reg, base_reg, displacement), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [base_reg + displacement] <- src_reg via SD (RV64 doubleword store).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_sd(scratch, src_reg, base_reg, displacement), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset via JAL x0, target (link discarded). target is
+    Note: formed as (scratch + 8) + rel_offset so encode_jal's internal
+    Note: target - (scratch + 8) subtraction yields exactly rel_offset.
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let target_addr be scratch plus 8 plus rel_offset
+    Return riscv64_commit_scratch(scratch, encode_jal(scratch, 0, target_addr), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset via JAL x1 (ra), storing the return address in ra. target
+    Note: is formed as (scratch + 8) + rel_offset so the emitted PC-relative immediate
+    Note: encodes exactly rel_offset.
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let target_addr be scratch plus 8 plus rel_offset
+    Return riscv64_commit_scratch(scratch, encode_jal(scratch, 1, target_addr), buffer_ptr)
+End Process
+
+Process called "riscv64_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN via JALR x0, ra, 0 (jump to return address, discard link = `ret`).
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_jalr(scratch, 0, 1, 0), buffer_ptr)
+End Process
+
+Process called "riscv64_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a NOP via ADDI x0, x0, 0 (canonical RV NOP) for padding/alignment.
+    Let scratch be riscv64_alloc_scratch_buffer()
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Return riscv64_commit_scratch(scratch, encode_addi(scratch, 0, 0, 0), buffer_ptr)
+End Process
+
+Process called "riscv64_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence, using
+    Note: the same 32-byte record layout as every platform delegate (four little-endian
+    Note: 8-byte fields: opcode_id, operand_a, operand_b, operand_c). Running on the
+    Note: operation records (not raw bytes) keeps peepholes valid for the fixed-width
+    Note: RV64 ISA.
+    Note: ---
+    Note: Implemented peephole (semantics-preserving on RV64):
+    Note:   Redundant self-move elimination: MOV rd, rd (opcode 1, operand_a == operand_b)
+    Note:   is ADDI rd, rd, 0, a true no-op, rewritten in place to NOP (opcode 9).
+    Note: Records are rewritten to NOP rather than removed so branch offsets and the
+    Note: record count are preserved; a later assembly pass drops NOP records. Returns
+    Note: the number of records rewritten (0 when already optimal -- correct identity
+    Note: behavior). PUSH/POP round-trip elimination is intentionally not applied on
+    Note: RV64 because per-register push/pop is not realized on this target (see GAP
+    Note: note above); stack traffic uses frame-based SD/LD instead.
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return optimized_count
 End Process

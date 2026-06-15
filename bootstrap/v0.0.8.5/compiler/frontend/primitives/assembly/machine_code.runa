@@ -15,42 +15,100 @@ limitations under the License.
 :End Note
 
 Note:
-PLATFORM ABSTRACTION LAYER: Machine Code Generation
+PLATFORM ABSTRACTION LAYER: Machine Code Generation (Generic Encoder API)
 
-This file provides a platform-agnostic interface for machine code generation.
-It imports all platform-specific machine code implementations and dispatches
-to the correct one based on the target platform selected at compile time.
+This file is the platform-agnostic machine-code encoder dispatcher. It is the
+runtime-callable foundation that the AOTT (All-Of-The-Time) optimizer uses to
+emit native code at RUNTIME and that inline_asm consumes to lower assembly
+fragments. It exposes a single, stable, ISA-independent encoder API and fans
+each call out to the correct platform backend selected at compile time.
 
-Architecture:
-- This file defines the common API that all Runa code uses
-- Platform-specific implementations are in platform/{platform}/machine_code.runa
-- The compiler driver passes (os, arch) to select the target platform
-- Imports delegate to the correct platform-specific implementation
+Dispatch model:
+- Selection is a compile-time fold on the builtin `__TARGET_PLATFORM_INDEX__`.
+  The compiler driver resolves (os, arch) to a fixed integer index and folds the
+  ladder below to the single matching branch for the target being built, so the
+  cross-platform import set carries zero runtime dispatch cost. This mirrors the
+  reworked sibling dispatchers (syscall.runa, threading.runa, atomic.runa,
+  register_map.runa) which all switch on `__TARGET_PLATFORM_INDEX__`.
+- Each platform module exposes `<arch>_encode_*` delegates (e.g.
+  linux_x86_64_encode_mov) that map the generic ops onto that platform's rich
+  low-level encoders. This file never reimplements an encoding; it only routes.
 
-Machine code encoding is 100% platform-specific:
-- x86_64: Variable-length instructions with ModR/M, SIB, REX prefixes
-- ARM64: Fixed 32-bit instructions
-- MIPS: Fixed 32-bit MIPS instruction format
-- RISC-V: Variable-length compressed/uncompressed instructions
-- Each platform has completely different encoding schemes
+Backend index mapping (shared with all sibling dispatchers):
+  1=linux_x86_64, 2=linux_arm64, 3=linux_arm32, 4=mips32, 5=mips64,
+  6=darwin_x86_64, 7=darwin_arm64, 8=freebsd_x64, 9=freebsd_arm64,
+  10=netbsd_x64, 11=netbsd_arm64, 12=openbsd_x64, 13=openbsd_arm64,
+  14=windows_x86_64, 15=windows_arm64, 16=powerpc, 17=riscv32, 18=riscv64
+:End Note
 
-Example x86_64:
-  MOV RAX, RBX → 48 89 D8 (3 bytes: REX.W + opcode + ModR/M)
+Note:
+=============================================================================
+THE GENERIC ENCODER API CONTRACT (12 entry points)
+=============================================================================
 
-Example ARM64:
-  MOV X0, X1 → AA0103E0 (4 bytes: fixed format)
+All operands are register ids and integer immediates/displacements; encoded
+bytes are written into a caller-supplied code buffer (`buffer_ptr`) and the
+number of bytes written (the instruction length) is returned. A return of 0
+means "nothing encoded" and is treated as an encode error / unavailable-op by
+callers. Register ids are the platform's own register numbering (the ids the
+platform low-level encoders expect); AOTT/inline_asm obtain them from the
+platform register map. The buffer must have room for at least the platform's
+maximum instruction length (15 bytes on x86_64; 4 bytes on fixed-width RISC).
 
-Usage:
-All code should call functions from this file (e.g., encode_instruction, encode_mov).
-The platform-specific implementation is automatically selected based on the
-platform selected by the compiler driver.
+Abstract opcode ids (used by encode_instruction / get_instruction_length),
+honored identically by every platform delegate:
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (dest <- dest + src)
+  3  = SUB    operand_a=dest_reg, operand_b=src_reg   (dest <- dest - src)
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=displacement
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=displacement
+  6  = JUMP   operand_a=rel_offset (byte displacement to target)
+  7  = CALL   operand_a=rel_offset (byte displacement to target)
+  8  = RETURN
+  9  = NOP
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate
+  11 = CMP    operand_a=reg1, operand_b=reg2
+  12 = PUSH   operand_a=reg
+  13 = POP    operand_a=reg
+
+The 12 entry points:
+  1.  encode_instruction(opcode_id, operand_a, operand_b, operand_c, buffer_ptr) -> length
+        Encode one instruction selected by abstract opcode id. The universal
+        emit primitive for AOTT/inline_asm.
+  2.  get_instruction_length(opcode_id, operand_a, operand_b, operand_c) -> length
+        Encoded length in bytes without committing to the caller buffer
+        (variable-length targets encode into scratch; fixed-width return 4).
+  3.  encode_add(dest_reg, src_reg, value, buffer_ptr) -> length
+        dest_reg <- dest_reg + src_reg. `value` is reserved for the uniform
+        cross-platform register/immediate-form signature.
+  4.  encode_sub(dest_reg, src_reg, value, buffer_ptr) -> length
+        dest_reg <- dest_reg - src_reg.
+  5.  encode_mov(dest_reg, src_reg, buffer_ptr) -> length
+        dest_reg <- src_reg (register to register).
+  6.  encode_load(dest_reg, base_reg, displacement, buffer_ptr) -> length
+        dest_reg <- [base_reg + displacement].
+  7.  encode_store(src_reg, base_reg, displacement, buffer_ptr) -> length
+        [base_reg + displacement] <- src_reg.
+  8.  encode_jump(rel_offset, buffer_ptr) -> length
+        Unconditional jump to pc + rel_offset.
+  9.  encode_call(rel_offset, buffer_ptr) -> length
+        Call pc + rel_offset.
+  10. encode_return(buffer_ptr) -> length
+        Function return.
+  11. get_nop_instruction(buffer_ptr) -> length
+        Encode a NOP for padding/alignment.
+  12. optimize_instruction_sequence(instructions_ptr, count) -> optimized_count
+        Peephole pass over an array of `count` 32-byte instruction records
+        (fields: opcode_id, operand_a, operand_b, operand_c, each little-endian
+        8 bytes). Rewrites redundant operations to NOP in place (preserving
+        record count and branch offsets) and returns the number of records
+        optimized. Returns 0 for an already-optimal sequence (correct identity).
 :End Note
 
 Note: ============================================================================
 Note: PLATFORM IMPORTS
 Note: ============================================================================
 
-Import "compiler/frontend/primitives/assembly/register_map.runa" as RegisterMap
 Import "compiler/frontend/primitives/platform/linux_x86_64/machine_code.runa" as LinuxX86_64
 Import "compiler/frontend/primitives/platform/linux_arm64/machine_code.runa" as LinuxARM64
 Import "compiler/frontend/primitives/platform/linux_arm32/machine_code.runa" as LinuxARM32
@@ -74,54 +132,51 @@ Note: ==========================================================================
 Note: GENERIC INSTRUCTION ENCODING (Platform-Agnostic Interface)
 Note: ============================================================================
 
-Process called "encode_instruction" takes instruction_ptr as Integer returns Integer:
-    Note: Encode instruction to machine code bytes
-    Note: Returns pointer to encoded bytes, or 0 on error
-    Note: Delegates to platform-specific encoder
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_instruction from LinuxX86_64 with instruction_ptr End If
-    If idx is equal to 2: Return proc encode_instruction from LinuxARM64 with instruction_ptr End If
-    If idx is equal to 3: Return proc encode_instruction from LinuxARM32 with instruction_ptr End If
-    If idx is equal to 4: Return proc encode_instruction from MIPS32 with instruction_ptr End If
-    If idx is equal to 5: Return proc encode_instruction from MIPS64 with instruction_ptr End If
-    If idx is equal to 6: Return proc encode_instruction from DarwinX86_64 with instruction_ptr End If
-    If idx is equal to 7: Return proc encode_instruction from DarwinARM64 with instruction_ptr End If
-    If idx is equal to 8: Return proc encode_instruction from FreeBSDX64 with instruction_ptr End If
-    If idx is equal to 9: Return proc encode_instruction from FreeBSDARM64 with instruction_ptr End If
-    If idx is equal to 10: Return proc encode_instruction from NetBSDX64 with instruction_ptr End If
-    If idx is equal to 11: Return proc encode_instruction from NetBSDARM64 with instruction_ptr End If
-    If idx is equal to 12: Return proc encode_instruction from OpenBSDX64 with instruction_ptr End If
-    If idx is equal to 13: Return proc encode_instruction from OpenBSDARM64 with instruction_ptr End If
-    If idx is equal to 14: Return proc encode_instruction from WindowsX86_64 with instruction_ptr End If
-    If idx is equal to 15: Return proc encode_instruction from WindowsARM64 with instruction_ptr End If
-    If idx is equal to 16: Return proc encode_instruction from PowerPC with instruction_ptr End If
-    If idx is equal to 17: Return proc encode_instruction from RISCV32 with instruction_ptr End If
-    If idx is equal to 18: Return proc encode_instruction from RISCV64 with instruction_ptr End If
+Process called "encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode one instruction selected by abstract opcode id into buffer_ptr.
+    Note: Returns encoded length in bytes, or 0 on error / unavailable op.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_instruction from LinuxX86_64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_instruction from LinuxARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_instruction from LinuxARM32 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_instruction from MIPS32 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_instruction from MIPS64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_instruction from DarwinX86_64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_instruction from DarwinARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_instruction from FreeBSDX64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_instruction from FreeBSDARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_instruction from NetBSDX64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_instruction from NetBSDARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_instruction from OpenBSDX64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_instruction from OpenBSDARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_instruction from WindowsX86_64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_instruction from WindowsARM64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_instruction from PowerPC with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_instruction from RISCV32 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_instruction from RISCV64 with opcode_id, operand_a, operand_b, operand_c, buffer_ptr End If
     Return 0
 End Process
 
-Process called "get_instruction_length" takes instruction_ptr as Integer returns Integer:
-    Note: Get encoded length in bytes for instruction
-    Note: Platform-specific (x86_64: variable, ARM64: fixed 4 bytes)
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc get_instruction_length from LinuxX86_64 with instruction_ptr End If
-    If idx is equal to 2: Return proc get_instruction_length from LinuxARM64 with instruction_ptr End If
-    If idx is equal to 3: Return proc get_instruction_length from LinuxARM32 with instruction_ptr End If
-    If idx is equal to 4: Return proc get_instruction_length from MIPS32 with instruction_ptr End If
-    If idx is equal to 5: Return proc get_instruction_length from MIPS64 with instruction_ptr End If
-    If idx is equal to 6: Return proc get_instruction_length from DarwinX86_64 with instruction_ptr End If
-    If idx is equal to 7: Return proc get_instruction_length from DarwinARM64 with instruction_ptr End If
-    If idx is equal to 8: Return proc get_instruction_length from FreeBSDX64 with instruction_ptr End If
-    If idx is equal to 9: Return proc get_instruction_length from FreeBSDARM64 with instruction_ptr End If
-    If idx is equal to 10: Return proc get_instruction_length from NetBSDX64 with instruction_ptr End If
-    If idx is equal to 11: Return proc get_instruction_length from NetBSDARM64 with instruction_ptr End If
-    If idx is equal to 12: Return proc get_instruction_length from OpenBSDX64 with instruction_ptr End If
-    If idx is equal to 13: Return proc get_instruction_length from OpenBSDARM64 with instruction_ptr End If
-    If idx is equal to 14: Return proc get_instruction_length from WindowsX86_64 with instruction_ptr End If
-    If idx is equal to 15: Return proc get_instruction_length from WindowsARM64 with instruction_ptr End If
-    If idx is equal to 16: Return proc get_instruction_length from PowerPC with instruction_ptr End If
-    If idx is equal to 17: Return proc get_instruction_length from RISCV32 with instruction_ptr End If
-    If idx is equal to 18: Return proc get_instruction_length from RISCV64 with instruction_ptr End If
+Process called "get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Get encoded length in bytes for an instruction without committing it.
+    Note: Platform-specific (x86_64: variable; fixed-width RISC: 4).
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_get_instruction_length from LinuxX86_64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_get_instruction_length from LinuxARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_get_instruction_length from LinuxARM32 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_get_instruction_length from MIPS32 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_get_instruction_length from MIPS64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_get_instruction_length from DarwinX86_64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_get_instruction_length from DarwinARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_get_instruction_length from FreeBSDX64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_get_instruction_length from FreeBSDARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_get_instruction_length from NetBSDX64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_get_instruction_length from NetBSDARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_get_instruction_length from OpenBSDX64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_get_instruction_length from OpenBSDARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_get_instruction_length from WindowsX86_64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_get_instruction_length from WindowsARM64 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_get_instruction_length from PowerPC with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_get_instruction_length from RISCV32 with opcode_id, operand_a, operand_b, operand_c End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_get_instruction_length from RISCV64 with opcode_id, operand_a, operand_b, operand_c End If
     Return 0
 End Process
 
@@ -129,209 +184,210 @@ Note: ==========================================================================
 Note: COMMON INSTRUCTION ENCODERS (Platform-Agnostic Interface)
 Note: ============================================================================
 
-Process called "encode_mov" takes dest_reg as Integer, src_reg as Integer returns Integer:
-    Note: Encode MOV/ORR instruction (register to register)
-    Note: x86_64: MOV dest, src
-    Note: ARM64: ORR Xd, XZR, Xm (MOV is alias)
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_mov from LinuxX86_64 with dest_reg, src_reg End If
-    If idx is equal to 2: Return proc encode_mov from LinuxARM64 with dest_reg, src_reg End If
-    If idx is equal to 3: Return proc encode_mov from LinuxARM32 with dest_reg, src_reg End If
-    If idx is equal to 4: Return proc encode_mov from MIPS32 with dest_reg, src_reg End If
-    If idx is equal to 5: Return proc encode_mov from MIPS64 with dest_reg, src_reg End If
-    If idx is equal to 6: Return proc encode_mov from DarwinX86_64 with dest_reg, src_reg End If
-    If idx is equal to 7: Return proc encode_mov from DarwinARM64 with dest_reg, src_reg End If
-    If idx is equal to 8: Return proc encode_mov from FreeBSDX64 with dest_reg, src_reg End If
-    If idx is equal to 9: Return proc encode_mov from FreeBSDARM64 with dest_reg, src_reg End If
-    If idx is equal to 10: Return proc encode_mov from NetBSDX64 with dest_reg, src_reg End If
-    If idx is equal to 11: Return proc encode_mov from NetBSDARM64 with dest_reg, src_reg End If
-    If idx is equal to 12: Return proc encode_mov from OpenBSDX64 with dest_reg, src_reg End If
-    If idx is equal to 13: Return proc encode_mov from OpenBSDARM64 with dest_reg, src_reg End If
-    If idx is equal to 14: Return proc encode_mov from WindowsX86_64 with dest_reg, src_reg End If
-    If idx is equal to 15: Return proc encode_mov from WindowsARM64 with dest_reg, src_reg End If
-    If idx is equal to 16: Return proc encode_mov from PowerPC with dest_reg, src_reg End If
-    If idx is equal to 17: Return proc encode_mov from RISCV32 with dest_reg, src_reg End If
-    If idx is equal to 18: Return proc encode_mov from RISCV64 with dest_reg, src_reg End If
+Process called "encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode ADD: dest_reg <- dest_reg + src_reg. Returns encoded length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_add from LinuxX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_add from LinuxARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_add from LinuxARM32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_add from MIPS32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_add from MIPS64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_add from DarwinX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_add from DarwinARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_add from FreeBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_add from FreeBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_add from NetBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_add from NetBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_add from OpenBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_add from OpenBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_add from WindowsX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_add from WindowsARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_add from PowerPC with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_add from RISCV32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_add from RISCV64 with dest_reg, src_reg, value, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer returns Integer:
-    Note: Encode ADD instruction
-    Note: Delegates to platform-specific implementation
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_add from LinuxX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 2: Return proc encode_add from LinuxARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 3: Return proc encode_add from LinuxARM32 with dest_reg, src_reg, value End If
-    If idx is equal to 4: Return proc encode_add from MIPS32 with dest_reg, src_reg, value End If
-    If idx is equal to 5: Return proc encode_add from MIPS64 with dest_reg, src_reg, value End If
-    If idx is equal to 6: Return proc encode_add from DarwinX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 7: Return proc encode_add from DarwinARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 8: Return proc encode_add from FreeBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 9: Return proc encode_add from FreeBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 10: Return proc encode_add from NetBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 11: Return proc encode_add from NetBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 12: Return proc encode_add from OpenBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 13: Return proc encode_add from OpenBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 14: Return proc encode_add from WindowsX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 15: Return proc encode_add from WindowsARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 16: Return proc encode_add from PowerPC with dest_reg, src_reg, value End If
-    If idx is equal to 17: Return proc encode_add from RISCV32 with dest_reg, src_reg, value End If
-    If idx is equal to 18: Return proc encode_add from RISCV64 with dest_reg, src_reg, value End If
+Process called "encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode SUB: dest_reg <- dest_reg - src_reg. Returns encoded length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_sub from LinuxX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_sub from LinuxARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_sub from LinuxARM32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_sub from MIPS32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_sub from MIPS64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_sub from DarwinX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_sub from DarwinARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_sub from FreeBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_sub from FreeBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_sub from NetBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_sub from NetBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_sub from OpenBSDX64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_sub from OpenBSDARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_sub from WindowsX86_64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_sub from WindowsARM64 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_sub from PowerPC with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_sub from RISCV32 with dest_reg, src_reg, value, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_sub from RISCV64 with dest_reg, src_reg, value, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer returns Integer:
-    Note: Encode SUB instruction
-    Note: Delegates to platform-specific implementation
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_sub from LinuxX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 2: Return proc encode_sub from LinuxARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 3: Return proc encode_sub from LinuxARM32 with dest_reg, src_reg, value End If
-    If idx is equal to 4: Return proc encode_sub from MIPS32 with dest_reg, src_reg, value End If
-    If idx is equal to 5: Return proc encode_sub from MIPS64 with dest_reg, src_reg, value End If
-    If idx is equal to 6: Return proc encode_sub from DarwinX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 7: Return proc encode_sub from DarwinARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 8: Return proc encode_sub from FreeBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 9: Return proc encode_sub from FreeBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 10: Return proc encode_sub from NetBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 11: Return proc encode_sub from NetBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 12: Return proc encode_sub from OpenBSDX64 with dest_reg, src_reg, value End If
-    If idx is equal to 13: Return proc encode_sub from OpenBSDARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 14: Return proc encode_sub from WindowsX86_64 with dest_reg, src_reg, value End If
-    If idx is equal to 15: Return proc encode_sub from WindowsARM64 with dest_reg, src_reg, value End If
-    If idx is equal to 16: Return proc encode_sub from PowerPC with dest_reg, src_reg, value End If
-    If idx is equal to 17: Return proc encode_sub from RISCV32 with dest_reg, src_reg, value End If
-    If idx is equal to 18: Return proc encode_sub from RISCV64 with dest_reg, src_reg, value End If
+Process called "encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode MOV: dest_reg <- src_reg (register to register). Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_mov from LinuxX86_64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_mov from LinuxARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_mov from LinuxARM32 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_mov from MIPS32 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_mov from MIPS64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_mov from DarwinX86_64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_mov from DarwinARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_mov from FreeBSDX64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_mov from FreeBSDARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_mov from NetBSDX64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_mov from NetBSDARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_mov from OpenBSDX64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_mov from OpenBSDARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_mov from WindowsX86_64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_mov from WindowsARM64 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_mov from PowerPC with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_mov from RISCV32 with dest_reg, src_reg, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_mov from RISCV64 with dest_reg, src_reg, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_load" takes dest_reg as Integer, memory_addr as Integer returns Integer:
-    Note: Encode LOAD/MOV from memory instruction
-    Note: x86_64: MOV dest, [addr]
-    Note: ARM64: LDR Xd, [addr]
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_load from LinuxX86_64 with dest_reg, memory_addr End If
-    If idx is equal to 2: Return proc encode_load from LinuxARM64 with dest_reg, memory_addr End If
-    If idx is equal to 3: Return proc encode_load from LinuxARM32 with dest_reg, memory_addr End If
-    If idx is equal to 4: Return proc encode_load from MIPS32 with dest_reg, memory_addr End If
-    If idx is equal to 5: Return proc encode_load from MIPS64 with dest_reg, memory_addr End If
-    If idx is equal to 6: Return proc encode_load from DarwinX86_64 with dest_reg, memory_addr End If
-    If idx is equal to 7: Return proc encode_load from DarwinARM64 with dest_reg, memory_addr End If
-    If idx is equal to 8: Return proc encode_load from FreeBSDX64 with dest_reg, memory_addr End If
-    If idx is equal to 9: Return proc encode_load from FreeBSDARM64 with dest_reg, memory_addr End If
-    If idx is equal to 10: Return proc encode_load from NetBSDX64 with dest_reg, memory_addr End If
-    If idx is equal to 11: Return proc encode_load from NetBSDARM64 with dest_reg, memory_addr End If
-    If idx is equal to 12: Return proc encode_load from OpenBSDX64 with dest_reg, memory_addr End If
-    If idx is equal to 13: Return proc encode_load from OpenBSDARM64 with dest_reg, memory_addr End If
-    If idx is equal to 14: Return proc encode_load from WindowsX86_64 with dest_reg, memory_addr End If
-    If idx is equal to 15: Return proc encode_load from WindowsARM64 with dest_reg, memory_addr End If
-    If idx is equal to 16: Return proc encode_load from PowerPC with dest_reg, memory_addr End If
-    If idx is equal to 17: Return proc encode_load from RISCV32 with dest_reg, memory_addr End If
-    If idx is equal to 18: Return proc encode_load from RISCV64 with dest_reg, memory_addr End If
+Process called "encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode LOAD: dest_reg <- [base_reg + displacement]. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_load from LinuxX86_64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_load from LinuxARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_load from LinuxARM32 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_load from MIPS32 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_load from MIPS64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_load from DarwinX86_64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_load from DarwinARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_load from FreeBSDX64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_load from FreeBSDARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_load from NetBSDX64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_load from NetBSDARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_load from OpenBSDX64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_load from OpenBSDARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_load from WindowsX86_64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_load from WindowsARM64 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_load from PowerPC with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_load from RISCV32 with dest_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_load from RISCV64 with dest_reg, base_reg, displacement, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_store" takes src_reg as Integer, memory_addr as Integer returns Integer:
-    Note: Encode STORE/MOV to memory instruction
-    Note: x86_64: MOV [addr], src
-    Note: ARM64: STR Xs, [addr]
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_store from LinuxX86_64 with src_reg, memory_addr End If
-    If idx is equal to 2: Return proc encode_store from LinuxARM64 with src_reg, memory_addr End If
-    If idx is equal to 3: Return proc encode_store from LinuxARM32 with src_reg, memory_addr End If
-    If idx is equal to 4: Return proc encode_store from MIPS32 with src_reg, memory_addr End If
-    If idx is equal to 5: Return proc encode_store from MIPS64 with src_reg, memory_addr End If
-    If idx is equal to 6: Return proc encode_store from DarwinX86_64 with src_reg, memory_addr End If
-    If idx is equal to 7: Return proc encode_store from DarwinARM64 with src_reg, memory_addr End If
-    If idx is equal to 8: Return proc encode_store from FreeBSDX64 with src_reg, memory_addr End If
-    If idx is equal to 9: Return proc encode_store from FreeBSDARM64 with src_reg, memory_addr End If
-    If idx is equal to 10: Return proc encode_store from NetBSDX64 with src_reg, memory_addr End If
-    If idx is equal to 11: Return proc encode_store from NetBSDARM64 with src_reg, memory_addr End If
-    If idx is equal to 12: Return proc encode_store from OpenBSDX64 with src_reg, memory_addr End If
-    If idx is equal to 13: Return proc encode_store from OpenBSDARM64 with src_reg, memory_addr End If
-    If idx is equal to 14: Return proc encode_store from WindowsX86_64 with src_reg, memory_addr End If
-    If idx is equal to 15: Return proc encode_store from WindowsARM64 with src_reg, memory_addr End If
-    If idx is equal to 16: Return proc encode_store from PowerPC with src_reg, memory_addr End If
-    If idx is equal to 17: Return proc encode_store from RISCV32 with src_reg, memory_addr End If
-    If idx is equal to 18: Return proc encode_store from RISCV64 with src_reg, memory_addr End If
+Process called "encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode STORE: [base_reg + displacement] <- src_reg. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_store from LinuxX86_64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_store from LinuxARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_store from LinuxARM32 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_store from MIPS32 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_store from MIPS64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_store from DarwinX86_64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_store from DarwinARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_store from FreeBSDX64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_store from FreeBSDARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_store from NetBSDX64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_store from NetBSDARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_store from OpenBSDX64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_store from OpenBSDARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_store from WindowsX86_64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_store from WindowsARM64 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_store from PowerPC with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_store from RISCV32 with src_reg, base_reg, displacement, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_store from RISCV64 with src_reg, base_reg, displacement, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_jump" takes target_addr as Integer returns Integer:
-    Note: Encode unconditional jump instruction
-    Note: x86_64: JMP target
-    Note: ARM64: B target
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_jump from LinuxX86_64 with target_addr End If
-    If idx is equal to 2: Return proc encode_jump from LinuxARM64 with target_addr End If
-    If idx is equal to 3: Return proc encode_jump from LinuxARM32 with target_addr End If
-    If idx is equal to 4: Return proc encode_jump from MIPS32 with target_addr End If
-    If idx is equal to 5: Return proc encode_jump from MIPS64 with target_addr End If
-    If idx is equal to 6: Return proc encode_jump from DarwinX86_64 with target_addr End If
-    If idx is equal to 7: Return proc encode_jump from DarwinARM64 with target_addr End If
-    If idx is equal to 8: Return proc encode_jump from FreeBSDX64 with target_addr End If
-    If idx is equal to 9: Return proc encode_jump from FreeBSDARM64 with target_addr End If
-    If idx is equal to 10: Return proc encode_jump from NetBSDX64 with target_addr End If
-    If idx is equal to 11: Return proc encode_jump from NetBSDARM64 with target_addr End If
-    If idx is equal to 12: Return proc encode_jump from OpenBSDX64 with target_addr End If
-    If idx is equal to 13: Return proc encode_jump from OpenBSDARM64 with target_addr End If
-    If idx is equal to 14: Return proc encode_jump from WindowsX86_64 with target_addr End If
-    If idx is equal to 15: Return proc encode_jump from WindowsARM64 with target_addr End If
-    If idx is equal to 16: Return proc encode_jump from PowerPC with target_addr End If
-    If idx is equal to 17: Return proc encode_jump from RISCV32 with target_addr End If
-    If idx is equal to 18: Return proc encode_jump from RISCV64 with target_addr End If
+Process called "encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode unconditional jump to pc + rel_offset. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_jump from LinuxX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_jump from LinuxARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_jump from LinuxARM32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_jump from MIPS32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_jump from MIPS64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_jump from DarwinX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_jump from DarwinARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_jump from FreeBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_jump from FreeBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_jump from NetBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_jump from NetBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_jump from OpenBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_jump from OpenBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_jump from WindowsX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_jump from WindowsARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_jump from PowerPC with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_jump from RISCV32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_jump from RISCV64 with rel_offset, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_call" takes target_addr as Integer returns Integer:
-    Note: Encode function call instruction
-    Note: x86_64: CALL target
-    Note: ARM64: BL target
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_call from LinuxX86_64 with target_addr End If
-    If idx is equal to 2: Return proc encode_call from LinuxARM64 with target_addr End If
-    If idx is equal to 3: Return proc encode_call from LinuxARM32 with target_addr End If
-    If idx is equal to 4: Return proc encode_call from MIPS32 with target_addr End If
-    If idx is equal to 5: Return proc encode_call from MIPS64 with target_addr End If
-    If idx is equal to 6: Return proc encode_call from DarwinX86_64 with target_addr End If
-    If idx is equal to 7: Return proc encode_call from DarwinARM64 with target_addr End If
-    If idx is equal to 8: Return proc encode_call from FreeBSDX64 with target_addr End If
-    If idx is equal to 9: Return proc encode_call from FreeBSDARM64 with target_addr End If
-    If idx is equal to 10: Return proc encode_call from NetBSDX64 with target_addr End If
-    If idx is equal to 11: Return proc encode_call from NetBSDARM64 with target_addr End If
-    If idx is equal to 12: Return proc encode_call from OpenBSDX64 with target_addr End If
-    If idx is equal to 13: Return proc encode_call from OpenBSDARM64 with target_addr End If
-    If idx is equal to 14: Return proc encode_call from WindowsX86_64 with target_addr End If
-    If idx is equal to 15: Return proc encode_call from WindowsARM64 with target_addr End If
-    If idx is equal to 16: Return proc encode_call from PowerPC with target_addr End If
-    If idx is equal to 17: Return proc encode_call from RISCV32 with target_addr End If
-    If idx is equal to 18: Return proc encode_call from RISCV64 with target_addr End If
+Process called "encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode function call to pc + rel_offset. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_call from LinuxX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_call from LinuxARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_call from LinuxARM32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_call from MIPS32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_call from MIPS64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_call from DarwinX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_call from DarwinARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_call from FreeBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_call from FreeBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_call from NetBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_call from NetBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_call from OpenBSDX64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_call from OpenBSDARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_call from WindowsX86_64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_call from WindowsARM64 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_call from PowerPC with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_call from RISCV32 with rel_offset, buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_call from RISCV64 with rel_offset, buffer_ptr End If
     Return 0
 End Process
 
-Process called "encode_return" returns Integer:
-    Note: Encode function return instruction
-    Note: x86_64: RET
-    Note: ARM64: RET
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc encode_return from LinuxX86_64 End If
-    If idx is equal to 2: Return proc encode_return from LinuxARM64 End If
-    If idx is equal to 3: Return proc encode_return from LinuxARM32 End If
-    If idx is equal to 4: Return proc encode_return from MIPS32 End If
-    If idx is equal to 5: Return proc encode_return from MIPS64 End If
-    If idx is equal to 6: Return proc encode_return from DarwinX86_64 End If
-    If idx is equal to 7: Return proc encode_return from DarwinARM64 End If
-    If idx is equal to 8: Return proc encode_return from FreeBSDX64 End If
-    If idx is equal to 9: Return proc encode_return from FreeBSDARM64 End If
-    If idx is equal to 10: Return proc encode_return from NetBSDX64 End If
-    If idx is equal to 11: Return proc encode_return from NetBSDARM64 End If
-    If idx is equal to 12: Return proc encode_return from OpenBSDX64 End If
-    If idx is equal to 13: Return proc encode_return from OpenBSDARM64 End If
-    If idx is equal to 14: Return proc encode_return from WindowsX86_64 End If
-    If idx is equal to 15: Return proc encode_return from WindowsARM64 End If
-    If idx is equal to 16: Return proc encode_return from PowerPC End If
-    If idx is equal to 17: Return proc encode_return from RISCV32 End If
-    If idx is equal to 18: Return proc encode_return from RISCV64 End If
+Process called "encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: Encode function return. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_encode_return from LinuxX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_encode_return from LinuxARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_encode_return from LinuxARM32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_encode_return from MIPS32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_encode_return from MIPS64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_encode_return from DarwinX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_encode_return from DarwinARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_encode_return from FreeBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_encode_return from FreeBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_encode_return from NetBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_encode_return from NetBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_encode_return from OpenBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_encode_return from OpenBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_encode_return from WindowsX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_encode_return from WindowsARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_encode_return from PowerPC with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_encode_return from RISCV32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_encode_return from RISCV64 with buffer_ptr End If
+    Return 0
+End Process
+
+Process called "get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a NOP (no-operation) for padding/alignment. Returns length.
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_get_nop_instruction from LinuxX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_get_nop_instruction from LinuxARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_get_nop_instruction from LinuxARM32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_get_nop_instruction from MIPS32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_get_nop_instruction from MIPS64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_get_nop_instruction from DarwinX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_get_nop_instruction from DarwinARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_get_nop_instruction from FreeBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_get_nop_instruction from FreeBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_get_nop_instruction from NetBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_get_nop_instruction from NetBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_get_nop_instruction from OpenBSDX64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_get_nop_instruction from OpenBSDARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_get_nop_instruction from WindowsX86_64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_get_nop_instruction from WindowsARM64 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_get_nop_instruction from PowerPC with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_get_nop_instruction from RISCV32 with buffer_ptr End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_get_nop_instruction from RISCV64 with buffer_ptr End If
     Return 0
 End Process
 
@@ -340,52 +396,25 @@ Note: INSTRUCTION OPTIMIZATION (Platform-Agnostic Interface)
 Note: ============================================================================
 
 Process called "optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
-    Note: Optimize sequence of instructions for target platform
-    Note: Platform-specific optimizations (e.g., peephole optimization)
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc optimize_instruction_sequence from LinuxX86_64 with instructions_ptr, count End If
-    If idx is equal to 2: Return proc optimize_instruction_sequence from LinuxARM64 with instructions_ptr, count End If
-    If idx is equal to 3: Return proc optimize_instruction_sequence from LinuxARM32 with instructions_ptr, count End If
-    If idx is equal to 4: Return proc optimize_instruction_sequence from MIPS32 with instructions_ptr, count End If
-    If idx is equal to 5: Return proc optimize_instruction_sequence from MIPS64 with instructions_ptr, count End If
-    If idx is equal to 6: Return proc optimize_instruction_sequence from DarwinX86_64 with instructions_ptr, count End If
-    If idx is equal to 7: Return proc optimize_instruction_sequence from DarwinARM64 with instructions_ptr, count End If
-    If idx is equal to 8: Return proc optimize_instruction_sequence from FreeBSDX64 with instructions_ptr, count End If
-    If idx is equal to 9: Return proc optimize_instruction_sequence from FreeBSDARM64 with instructions_ptr, count End If
-    If idx is equal to 10: Return proc optimize_instruction_sequence from NetBSDX64 with instructions_ptr, count End If
-    If idx is equal to 11: Return proc optimize_instruction_sequence from NetBSDARM64 with instructions_ptr, count End If
-    If idx is equal to 12: Return proc optimize_instruction_sequence from OpenBSDX64 with instructions_ptr, count End If
-    If idx is equal to 13: Return proc optimize_instruction_sequence from OpenBSDARM64 with instructions_ptr, count End If
-    If idx is equal to 14: Return proc optimize_instruction_sequence from WindowsX86_64 with instructions_ptr, count End If
-    If idx is equal to 15: Return proc optimize_instruction_sequence from WindowsARM64 with instructions_ptr, count End If
-    If idx is equal to 16: Return proc optimize_instruction_sequence from PowerPC with instructions_ptr, count End If
-    If idx is equal to 17: Return proc optimize_instruction_sequence from RISCV32 with instructions_ptr, count End If
-    If idx is equal to 18: Return proc optimize_instruction_sequence from RISCV64 with instructions_ptr, count End If
-    Return 0
-End Process
-
-Process called "get_nop_instruction" returns Integer:
-    Note: Get NOP (no-operation) instruction for padding
-    Note: x86_64: 0x90 (NOP)
-    Note: ARM64: 0xD503201F (NOP)
-    Let idx be proc _ensure_backend_selected from RegisterMap
-    If idx is equal to 1: Return proc get_nop_instruction from LinuxX86_64 End If
-    If idx is equal to 2: Return proc get_nop_instruction from LinuxARM64 End If
-    If idx is equal to 3: Return proc get_nop_instruction from LinuxARM32 End If
-    If idx is equal to 4: Return proc get_nop_instruction from MIPS32 End If
-    If idx is equal to 5: Return proc get_nop_instruction from MIPS64 End If
-    If idx is equal to 6: Return proc get_nop_instruction from DarwinX86_64 End If
-    If idx is equal to 7: Return proc get_nop_instruction from DarwinARM64 End If
-    If idx is equal to 8: Return proc get_nop_instruction from FreeBSDX64 End If
-    If idx is equal to 9: Return proc get_nop_instruction from FreeBSDARM64 End If
-    If idx is equal to 10: Return proc get_nop_instruction from NetBSDX64 End If
-    If idx is equal to 11: Return proc get_nop_instruction from NetBSDARM64 End If
-    If idx is equal to 12: Return proc get_nop_instruction from OpenBSDX64 End If
-    If idx is equal to 13: Return proc get_nop_instruction from OpenBSDARM64 End If
-    If idx is equal to 14: Return proc get_nop_instruction from WindowsX86_64 End If
-    If idx is equal to 15: Return proc get_nop_instruction from WindowsARM64 End If
-    If idx is equal to 16: Return proc get_nop_instruction from PowerPC End If
-    If idx is equal to 17: Return proc get_nop_instruction from RISCV32 End If
-    If idx is equal to 18: Return proc get_nop_instruction from RISCV64 End If
+    Note: Run the target platform's peephole pass over the instruction-record
+    Note: sequence. Returns the number of records optimized (0 when already optimal).
+    If __TARGET_PLATFORM_INDEX__ is equal to 1: Return proc linux_x86_64_optimize_instruction_sequence from LinuxX86_64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 2: Return proc linux_arm64_optimize_instruction_sequence from LinuxARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 3: Return proc linux_arm32_optimize_instruction_sequence from LinuxARM32 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 4: Return proc mips32_optimize_instruction_sequence from MIPS32 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 5: Return proc mips64_optimize_instruction_sequence from MIPS64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 6: Return proc darwin_x86_64_optimize_instruction_sequence from DarwinX86_64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 7: Return proc darwin_arm64_optimize_instruction_sequence from DarwinARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 8: Return proc freebsd_x64_optimize_instruction_sequence from FreeBSDX64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 9: Return proc freebsd_arm64_optimize_instruction_sequence from FreeBSDARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 10: Return proc netbsd_x64_optimize_instruction_sequence from NetBSDX64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 11: Return proc netbsd_arm64_optimize_instruction_sequence from NetBSDARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 12: Return proc openbsd_x64_optimize_instruction_sequence from OpenBSDX64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 13: Return proc openbsd_arm64_optimize_instruction_sequence from OpenBSDARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 14: Return proc windows_x86_64_optimize_instruction_sequence from WindowsX86_64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 15: Return proc windows_arm64_optimize_instruction_sequence from WindowsARM64 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 16: Return proc powerpc_optimize_instruction_sequence from PowerPC with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 17: Return proc riscv32_optimize_instruction_sequence from RISCV32 with instructions_ptr, count End If
+    If __TARGET_PLATFORM_INDEX__ is equal to 18: Return proc riscv64_optimize_instruction_sequence from RISCV64 with instructions_ptr, count End If
     Return 0
 End Process

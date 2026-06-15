@@ -730,3 +730,196 @@ Process called "get_instruction_size" returns Integer:
     Note: Get size of single ARM64 instruction
     Return 4  Note: All ARM64 instructions are 4 bytes
 End Process
+
+Note: ============================================================================
+Note: GENERIC ENCODER API DELEGATES (freebsd_arm64_encode_*)
+Note: ============================================================================
+Note:
+These functions implement the 12-entry-point generic machine-code encoder
+contract defined at the top of
+compiler/frontend/primitives/assembly/machine_code.runa. The platform-agnostic
+dispatcher fans out to these by compile-time platform index (freebsd_arm64 = 9).
+Each delegate maps an abstract operation onto the low-level ARM64 (AArch64)
+encoders above, writing the encoded bytes into the caller-supplied code buffer
+and returning the number of bytes written. ARM64 is fixed-width, so every
+emitted instruction is exactly 4 bytes. No delegate reimplements an encoding.
+
+NOTE ON CALLING CONVENTION: the low-level encoders in this module take the
+buffer pointer as their FIRST argument (encode_X(buffer_ptr, ...)) and write at
+buffer offset 0 via write_instruction, returning offset+4 = 4 on success. The
+generic delegates accept the buffer pointer LAST (per the cross-platform
+contract signature) and reorder the arguments accordingly.
+
+ABSTRACT OPCODE IDS (identical id set across all platform delegates so AOTT and
+inline_asm can target any ISA uniformly):
+  1  = MOV    operand_a=dest_reg, operand_b=src_reg
+  2  = ADD    operand_a=dest_reg, operand_b=src_reg   (dest <- dest + src)
+  3  = SUB    operand_a=dest_reg, operand_b=src_reg   (dest <- dest - src)
+  4  = LOAD   operand_a=dest_reg, operand_b=base_reg, operand_c=disp
+  5  = STORE  operand_a=src_reg,  operand_b=base_reg, operand_c=disp
+  6  = JUMP   operand_a=rel_offset (bytes)
+  7  = CALL   operand_a=rel_offset (bytes)
+  8  = RETURN
+  9  = NOP
+  10 = MOVI   operand_a=dest_reg, operand_b=immediate (low 16 bits, no shift)
+  11 = CMP    operand_a=reg1, operand_b=reg2
+  12 = PUSH   operand_a=reg   -- NOT a single ARM64 instruction (see note below)
+  13 = POP    operand_a=reg   -- NOT a single ARM64 instruction (see note below)
+
+PUSH/POP GAP: ARM64 has no single push/pop opcode. A single-register stack push
+is the pre-indexed store `STR Xt, [SP, #-16]!` and pop is the post-indexed load
+`LDR Xt, [SP], #16`. The low-level encoders in this module (encode_str_immediate
+/ encode_ldr_immediate) emit only the unsigned-offset addressing form with NO
+base-register writeback, so they cannot adjust SP and therefore cannot
+faithfully realize PUSH/POP. Rather than emit a wrong encoding, opcode ids 12 and
+13 return 0 (nothing written) on ARM64, signalling to the caller that the
+operation is unavailable as a single instruction on this target. AOTT lowers
+stack traffic on ARM64 via STP/LDP pair frames (encode_stp / encode_ldp) at
+function prologue/epilogue rather than per-register push/pop, which is the
+architecturally correct strategy.
+:End Note
+
+Process called "freebsd_arm64_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the
+    Note: correct low-level ARM64 encoder and returns the encoded length (4 on success).
+    If opcode_id is equal to 1:
+        Return encode_mov_register(buffer_ptr, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 2:
+        Return encode_add_register(buffer_ptr, operand_a, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 3:
+        Return encode_sub_register(buffer_ptr, operand_a, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 4:
+        Return encode_ldr_immediate(buffer_ptr, operand_a, operand_b, operand_c)
+    End If
+    If opcode_id is equal to 5:
+        Return encode_str_immediate(buffer_ptr, operand_a, operand_b, operand_c)
+    End If
+    If opcode_id is equal to 6:
+        Return encode_b(buffer_ptr, operand_a)
+    End If
+    If opcode_id is equal to 7:
+        Return encode_bl(buffer_ptr, operand_a)
+    End If
+    If opcode_id is equal to 8:
+        Return encode_ret(buffer_ptr)
+    End If
+    If opcode_id is equal to 9:
+        Return encode_nop(buffer_ptr)
+    End If
+    If opcode_id is equal to 10:
+        Return encode_movz(buffer_ptr, operand_a, operand_b, 0)
+    End If
+    If opcode_id is equal to 11:
+        Return encode_cmp_register(buffer_ptr, operand_a, operand_b)
+    End If
+    Note: opcode ids 12 (PUSH) and 13 (POP) are unavailable as single ARM64
+    Note: instructions with the encoders present in this module (see GAP note above).
+    Return 0
+End Process
+
+Process called "freebsd_arm64_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: Return the encoded byte length of an instruction. ARM64 is fixed-width: every
+    Note: encodable instruction is exactly 4 bytes. Ids that do not encode on this
+    Note: target (12 PUSH, 13 POP, and any unrecognized id) report length 0, matching
+    Note: freebsd_arm64_encode_instruction returning 0 for them.
+    If opcode_id is equal to 12:
+        Return 0
+    End If
+    If opcode_id is equal to 13:
+        Return 0
+    End If
+    If opcode_id is less than 1:
+        Return 0
+    End If
+    If opcode_id is greater than 13:
+        Return 0
+    End If
+    Return get_instruction_size()
+End Process
+
+Process called "freebsd_arm64_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg (64-bit, three-operand ARM64 form with
+    Note: Rn = Rd). `value` mirrors the uniform cross-platform signature; the
+    Note: register-register ADD is the canonical add here (immediate adds are emitted
+    Note: by the caller via MOVI + ADD).
+    Return encode_add_register(buffer_ptr, dest_reg, dest_reg, src_reg)
+End Process
+
+Process called "freebsd_arm64_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB dest_reg <- dest_reg - src_reg (64-bit, three-operand ARM64 form with
+    Note: Rn = Rd). `value` mirrors the uniform cross-platform signature.
+    Return encode_sub_register(buffer_ptr, dest_reg, dest_reg, src_reg)
+End Process
+
+Process called "freebsd_arm64_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV Xd <- Xm (ORR Xd, XZR, Xm alias).
+    Return encode_mov_register(buffer_ptr, dest_reg, src_reg)
+End Process
+
+Process called "freebsd_arm64_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD Xt <- [Xn + displacement] (LDR, unsigned scaled offset).
+    Return encode_ldr_immediate(buffer_ptr, dest_reg, base_reg, displacement)
+End Process
+
+Process called "freebsd_arm64_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [Xn + displacement] <- Xt (STR, unsigned scaled offset).
+    Return encode_str_immediate(buffer_ptr, src_reg, base_reg, displacement)
+End Process
+
+Process called "freebsd_arm64_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset (B, unconditional, byte displacement).
+    Return encode_b(buffer_ptr, rel_offset)
+End Process
+
+Process called "freebsd_arm64_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset (BL, branch with link, byte displacement).
+    Return encode_bl(buffer_ptr, rel_offset)
+End Process
+
+Process called "freebsd_arm64_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN (RET X30).
+    Return encode_ret(buffer_ptr)
+End Process
+
+Process called "freebsd_arm64_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a NOP (0xD503201F) for code padding/alignment.
+    Return encode_nop(buffer_ptr)
+End Process
+
+Process called "freebsd_arm64_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence, using
+    Note: the same 32-byte record layout as the x86_64 delegate (four little-endian
+    Note: 8-byte fields: opcode_id, operand_a, operand_b, operand_c). Running on the
+    Note: operation records (not raw bytes) keeps peepholes valid for the fixed-width
+    Note: ARM64 ISA.
+    Note: ---
+    Note: Implemented peephole (semantics-preserving on ARM64):
+    Note:   Redundant self-move elimination: MOV Xd, Xd (opcode 1, operand_a == operand_b)
+    Note:   is `ORR Xd, XZR, Xd`, a true no-op, rewritten in place to NOP (opcode 9).
+    Note: Records are rewritten to NOP rather than removed so branch offsets and the
+    Note: record count are preserved; a later assembly pass drops NOP records. Returns
+    Note: the number of records rewritten (0 when already optimal -- correct identity
+    Note: behavior). PUSH/POP round-trip elimination is intentionally not applied on
+    Note: ARM64 because per-register push/pop is not realized on this target (see GAP
+    Note: note above); stack traffic uses STP/LDP frames instead.
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return optimized_count
+End Process

@@ -45,6 +45,7 @@ Dependencies: memory_core.runa for buffer operations
 :End Note
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
 Note: INSTRUCTION BUFFER OPERATIONS
@@ -718,4 +719,208 @@ End Process
 Process called "get_max_instruction_size" returns Integer:
     Note: Get maximum x86-64 instruction size
     Return 15  Note: x86-64 instructions can be up to 15 bytes
+End Process
+
+Note: ============================================================================
+Note: GENERIC MACHINE-CODE ENCODER API (#520)
+Note: ============================================================================
+Note: These darwin_x86_64_* delegates map the platform-independent abstract opcode
+Note: contract (see compiler/frontend/primitives/assembly/machine_code.runa) onto the
+Note: concrete macOS/x86_64 low-level encoders defined above. The dispatcher routes
+Note: __TARGET_PLATFORM_INDEX__ == 6 to these by name.
+Note: ---
+Note: ENCODER-SET DIFFERENCE FROM linux_x86_64: this Darwin module exposes a SMALLER
+Note: encoder set with a DIFFERENT signature convention. Its low-level encoders take
+Note: (buffer_ptr, offset, ...) and RETURN THE NEW OFFSET (the buffer write position
+Note: after the instruction). Because each generic delegate writes a single instruction
+Note: starting at the beginning of buffer_ptr, we pass offset = 0, so the returned new
+Note: offset IS the encoded byte length — matching the generic contract's "bytes written"
+Note: return value. Encoder name mapping (vs. the linux_x86_64 names):
+Note:   encode_mov_reg_reg / encode_mov_reg_imm64 / encode_add_reg_reg /
+Note:   encode_sub_reg_reg / encode_cmp_reg_reg / encode_jmp_rel32 / encode_call_rel32 /
+Note:   encode_ret / encode_nop / encode_push_reg / encode_pop_reg.
+Note: ---
+Note: ABSENT PRIMITIVES (honest unavailable -> delegate returns 0): this module has NO
+Note: memory-operand MOV encoder (no register<-[base+disp] load and no [base+disp]<-register
+Note: store form), so the LOAD (4) and STORE (5) abstract opcodes are genuinely
+Note: unencodable here and their delegates return 0. No encoding is invented and no
+Note: nonexistent encoder is called.
+Note: Abstract opcode ids:
+Note:   1=MOV 2=ADD 3=SUB 4=LOAD 5=STORE 6=JUMP 7=CALL 8=RETURN 9=NOP
+Note:   10=MOVI 11=CMP 12=PUSH 13=POP
+
+Process called "darwin_x86_64_encode_instruction" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer, buffer_ptr as Integer returns Integer:
+    Note: Generic single-instruction encoder. Routes an abstract opcode id to the correct
+    Note: low-level macOS/x86_64 encoder. Each low-level encoder takes (buffer_ptr, offset,
+    Note: ...) and returns the new offset; we pass offset 0 so the return value is the
+    Note: encoded length in bytes.
+    If opcode_id is equal to 1:
+        Return encode_mov_reg_reg(buffer_ptr, 0, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 2:
+        Return encode_add_reg_reg(buffer_ptr, 0, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 3:
+        Return encode_sub_reg_reg(buffer_ptr, 0, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 4:
+        Note: LOAD (reg <- [base+disp]) has no memory-operand MOV encoder in this module.
+        Return 0
+    End If
+    If opcode_id is equal to 5:
+        Note: STORE ([base+disp] <- reg) has no memory-operand MOV encoder in this module.
+        Return 0
+    End If
+    If opcode_id is equal to 6:
+        Return encode_jmp_rel32(buffer_ptr, 0, operand_a)
+    End If
+    If opcode_id is equal to 7:
+        Return encode_call_rel32(buffer_ptr, 0, operand_a)
+    End If
+    If opcode_id is equal to 8:
+        Return encode_ret(buffer_ptr, 0)
+    End If
+    If opcode_id is equal to 9:
+        Return encode_nop(buffer_ptr, 0)
+    End If
+    If opcode_id is equal to 10:
+        Return encode_mov_reg_imm64(buffer_ptr, 0, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 11:
+        Return encode_cmp_reg_reg(buffer_ptr, 0, operand_a, operand_b)
+    End If
+    If opcode_id is equal to 12:
+        Return encode_push_reg(buffer_ptr, 0, operand_a)
+    End If
+    If opcode_id is equal to 13:
+        Return encode_pop_reg(buffer_ptr, 0, operand_a)
+    End If
+    Return 0
+End Process
+
+Process called "darwin_x86_64_get_instruction_length" takes opcode_id as Integer, operand_a as Integer, operand_b as Integer, operand_c as Integer returns Integer:
+    Note: x86_64 is variable-length; the only correct way to know an instruction's length
+    Note: is to encode it. We encode into a 16-byte Tier-3 scratch buffer (the x86_64
+    Note: maximum instruction length is 15 bytes) and return the resulting length.
+    Let scratch be proc allocate from Layout with 16
+    Return darwin_x86_64_encode_instruction(opcode_id, operand_a, operand_b, operand_c, scratch)
+End Process
+
+Process called "darwin_x86_64_encode_add" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: ADD dest_reg <- dest_reg + src_reg (64-bit register form). `value` mirrors the
+    Note: uniform cross-platform signature; the register-to-register ADD is the canonical
+    Note: add on x86_64 (immediate adds are emitted by the caller via MOVI + ADD). The
+    Note: low-level encoder returns the new offset, which from offset 0 is the length.
+    Return encode_add_reg_reg(buffer_ptr, 0, dest_reg, src_reg)
+End Process
+
+Process called "darwin_x86_64_encode_sub" takes dest_reg as Integer, src_reg as Integer, value as Integer, buffer_ptr as Integer returns Integer:
+    Note: SUB dest_reg <- dest_reg - src_reg (64-bit register form). `value` mirrors the
+    Note: uniform cross-platform signature; the register-to-register SUB is canonical.
+    Return encode_sub_reg_reg(buffer_ptr, 0, dest_reg, src_reg)
+End Process
+
+Process called "darwin_x86_64_encode_mov" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: MOV dest_reg <- src_reg (64-bit register to register).
+    Return encode_mov_reg_reg(buffer_ptr, 0, dest_reg, src_reg)
+End Process
+
+Process called "darwin_x86_64_encode_load" takes dest_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: LOAD dest_reg <- [base_reg + displacement]. This module provides no
+    Note: memory-operand MOV encoder, so the load form is genuinely unavailable here;
+    Note: returning 0 is the honest "encode error / unavailable" contract value.
+    Return 0
+End Process
+
+Process called "darwin_x86_64_encode_store" takes src_reg as Integer, base_reg as Integer, displacement as Integer, buffer_ptr as Integer returns Integer:
+    Note: STORE [base_reg + displacement] <- src_reg. This module provides no
+    Note: memory-operand MOV encoder, so the store form is genuinely unavailable here;
+    Note: returning 0 is the honest "encode error / unavailable" contract value.
+    Return 0
+End Process
+
+Process called "darwin_x86_64_encode_jump" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: JUMP pc <- pc + rel_offset (near unconditional JMP rel32). rel_offset is the
+    Note: byte displacement from the end of this instruction to the target.
+    Return encode_jmp_rel32(buffer_ptr, 0, rel_offset)
+End Process
+
+Process called "darwin_x86_64_encode_call" takes rel_offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: CALL pc + rel_offset (near CALL rel32). rel_offset is the byte displacement
+    Note: from the end of this instruction to the call target.
+    Return encode_call_rel32(buffer_ptr, 0, rel_offset)
+End Process
+
+Process called "darwin_x86_64_encode_return" takes buffer_ptr as Integer returns Integer:
+    Note: RETURN (near RET).
+    Return encode_ret(buffer_ptr, 0)
+End Process
+
+Process called "darwin_x86_64_get_nop_instruction" takes buffer_ptr as Integer returns Integer:
+    Note: Encode a single-byte NOP for code padding/alignment.
+    Return encode_nop(buffer_ptr, 0)
+End Process
+
+Process called "darwin_x86_64_optimize_instruction_sequence" takes instructions_ptr as Integer, count as Integer returns Integer:
+    Note: Peephole optimizer over an already-encoded instruction-record sequence.
+    Note: ---
+    Note: The sequence is an array of `count` instruction records, each 32 bytes, laid
+    Note: out as four little-endian 8-byte fields:
+    Note:   field 0 (offset 0)  = opcode_id   (abstract opcode id, see id table above)
+    Note:   field 1 (offset 8)  = operand_a
+    Note:   field 2 (offset 16) = operand_b
+    Note:   field 3 (offset 24) = operand_c
+    Note: This is the canonical in-memory instruction-record form the emitter builds
+    Note: before committing bytes, so peepholes run on operations (not raw bytes) and
+    Note: remain valid regardless of each instruction's encoded length.
+    Note: ---
+    Note: Implemented peepholes (semantics-preserving on x86_64):
+    Note:   1. Redundant self-move elimination: MOV r, r (opcode 1, operand_a == operand_b)
+    Note:      is a true no-op and is rewritten in place to NOP (opcode 9). The 64-bit
+    Note:      reg<->reg MOV does not clear the upper bits differently than identity, so
+    Note:      removing it preserves all architectural state.
+    Note:   2. Push/pop round-trip elimination: PUSH r (opcode 12) immediately followed by
+    Note:      POP r (opcode 13) of the SAME register restores the register and the stack
+    Note:      pointer to their prior values, so both records are rewritten to NOP (opcode 9).
+    Note: Records are rewritten to NOP rather than physically removed so that caller branch
+    Note: offsets and the record count are preserved; a later assembly pass drops NOP
+    Note: records. The function returns the number of records optimized (rewritten to NOP),
+    Note: which is 0 when no peephole applied (correct identity behavior for an already-
+    Note: optimal sequence).
+    Let optimized_count be 0
+    Let i be 0
+    Let record_size be 32
+    While i is less than count:
+        Let base be instructions_ptr plus (i multiplied by record_size)
+        Let opcode_id be proc memory_get_int64 from Memory with base, 0
+        Let operand_a be proc memory_get_int64 from Memory with base, 8
+        Let operand_b be proc memory_get_int64 from Memory with base, 16
+        If opcode_id is equal to 1:
+            If operand_a is equal to operand_b:
+                proc memory_set_int64 from Memory with base, 0, 9
+                Set optimized_count to optimized_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Let j be 0
+    While j is less than (count minus 1):
+        Let base_j be instructions_ptr plus (j multiplied by record_size)
+        Let next_base be instructions_ptr plus ((j plus 1) multiplied by record_size)
+        Let op_j be proc memory_get_int64 from Memory with base_j, 0
+        Let op_next be proc memory_get_int64 from Memory with next_base, 0
+        If op_j is equal to 12:
+            If op_next is equal to 13:
+                Let reg_j be proc memory_get_int64 from Memory with base_j, 8
+                Let reg_next be proc memory_get_int64 from Memory with next_base, 8
+                If reg_j is equal to reg_next:
+                    proc memory_set_int64 from Memory with base_j, 0, 9
+                    proc memory_set_int64 from Memory with next_base, 0, 9
+                    Set optimized_count to optimized_count plus 2
+                End If
+            End If
+        End If
+        Set j to j plus 1
+    End While
+    Return optimized_count
 End Process
