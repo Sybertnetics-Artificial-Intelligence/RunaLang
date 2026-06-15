@@ -33,10 +33,11 @@ This system provides the most detailed import analytics ever created.
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 Import "compiler/internal/string_utils.runa" as StringUtils
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
-Import "compiler/frontend/primitives/process/process.runa" as ProcessModule
-Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/internal/collections.runa" as HashTable
 
 Note: ============================================================================
 Note: Performance Monitoring
@@ -87,7 +88,7 @@ Process called "get_current_timestamp" that takes context as Integer returns Int
     End If
 
     Note: Call clock_gettime syscall (syscall 228 on x86_64, CLOCK_MONOTONIC = 1)
-    Let result be proc syscall2 from ProcessModule with 228, 1, timespec_buffer
+    Let result be proc syscall_2 from Syscall with 228, 1, timespec_buffer
 
     If result is not equal to 0:
         Note: Arena memory will be cleaned up when arena is reset
@@ -121,7 +122,7 @@ Process called "record_import_start" that takes import_path as Integer, context 
     Note: Classify import type by checking path patterns
     Let is_https be proc string_starts_with from StringCore with import_path, "https://"
     Let is_git be proc string_starts_with from StringCore with import_path, "git://"
-    Let is_registry be proc string_contains from StringCore with import_path, ":"
+    Let is_registry be proc string_contains from StringUtils with import_path, ":"
 
     If is_https is equal to 1:
         Let network_imports be proc memory_get_qword from MemoryCore with performance_monitor, 48
@@ -250,7 +251,7 @@ Process called "build_import_graph" that takes program as Integer, context as In
 
     Let nodes be proc memory_get_qword from MemoryCore with import_graph, 0
     If nodes is equal to 0:
-        Set nodes to proc hash_table_create from HashTable with 32
+        Set nodes to proc hashtable_create from HashTable with 32, arena
         If nodes is equal to 0:
             Return 0
         End If
@@ -259,7 +260,7 @@ Process called "build_import_graph" that takes program as Integer, context as In
 
     Let edges be proc memory_get_qword from MemoryCore with import_graph, 8
     If edges is equal to 0:
-        Set edges to proc hash_table_create from HashTable with 32
+        Set edges to proc hashtable_create from HashTable with 32, arena
         If edges is equal to 0:
             Return 0
         End If
@@ -272,7 +273,7 @@ Process called "build_import_graph" that takes program as Integer, context as In
         Return 0
     End If
 
-    proc hash_table_set from HashTable with nodes, "main", main_node
+    proc hashtable_put from HashTable with nodes, "main", main_node
 
     Note: Process all imports from program AST
     Let import_count be proc memory_get_qword from MemoryCore with program, 40
@@ -321,21 +322,21 @@ Process called "add_import_to_graph" that takes import_path as Integer, parent a
     Let edges be proc memory_get_qword from MemoryCore with graph, 8
 
     Note: Create or get import node
-    Let import_node be proc hash_table_get from HashTable with nodes, import_path
+    Let import_node be proc hashtable_get from HashTable with nodes, import_path
     If import_node is equal to 0:
         Set import_node to proc create_graph_node with import_path, 0, arena
         If import_node is equal to 0:
             Return 0
         End If
-        proc hash_table_set from HashTable with nodes, import_path, import_node
+        proc hashtable_put from HashTable with nodes, import_path, import_node
     End If
 
     Note: Create edge from parent to import (format: "parent -> import")
     Let edge_key be parent joined with " -> " joined with import_path
-    proc hash_table_set from HashTable with edges, edge_key, 1
+    proc hashtable_put from HashTable with edges, edge_key, 1
 
     Note: Update out-degree of parent node
-    Let parent_node be proc hash_table_get from HashTable with nodes, parent
+    Let parent_node be proc hashtable_get from HashTable with nodes, parent
     If parent_node is not equal to 0:
         Let out_degree be proc memory_get_qword from MemoryCore with parent_node, 24
         proc memory_set_qword from MemoryCore with parent_node, 24, out_degree plus 1
@@ -359,8 +360,8 @@ Process called "detect_circular_dependencies" that takes graph as Integer, conte
     Let edges be proc memory_get_qword from MemoryCore with graph, 8
 
     Note: Create visited and recursion stack hash tables for DFS
-    Let visited be proc hash_table_create from HashTable with 16
-    Let recursion_stack be proc hash_table_create from HashTable with 16
+    Let visited be proc hashtable_create from HashTable with 16, arena
+    Let recursion_stack be proc hashtable_create from HashTable with 16, arena
 
     Let cycle_detected be proc dfs_cycle_detection with nodes, edges, visited, recursion_stack, context
     If cycle_detected is equal to 1:
@@ -375,13 +376,19 @@ End Process
 Process called "dfs_cycle_detection" that takes nodes as Integer, edges as Integer, visited as Integer, recursion_stack as Integer, context as Integer returns Integer:
     Note: DFS-based cycle detection algorithm
 
-    Let node_keys be proc hash_table_keys from HashTable with nodes
-    Let key_count be proc hash_table_size from HashTable with nodes
+    Let arena be proc memory_get_qword from MemoryCore with context, 16
+    Let node_keys be proc hashtable_get_keys from HashTable with nodes, arena
+    If node_keys is equal to 0:
+        Return 0
+    End If
+    Note: hashtable_get_keys returns [count, key0, key1, ...]; count is first qword
+    Let key_count be proc memory_get_qword from MemoryCore with node_keys, 0
 
     Let i be 0
     While i is less than key_count:
-        Let node_key be proc memory_get_qword from MemoryCore with node_keys plus i multiplied by 8, 0
-        Let is_visited be proc hash_table_get from HashTable with visited, node_key
+        Note: Skip the leading count qword when reading each key pointer
+        Let node_key be proc memory_get_qword from MemoryCore with node_keys plus 8 plus i multiplied by 8, 0
+        Let is_visited be proc hashtable_get from HashTable with visited, node_key
         If is_visited is equal to 0:
             Let has_cycle be proc dfs_visit with node_key, nodes, edges, visited, recursion_stack, context
             If has_cycle is equal to 1:
@@ -397,8 +404,8 @@ End Process
 Process called "dfs_visit" that takes node as Integer, nodes as Integer, edges as Integer, visited as Integer, recursion_stack as Integer, context as Integer returns Integer:
     Note: DFS visit function for cycle detection using recursion stack
 
-    proc hash_table_set from HashTable with visited, node, 1
-    proc hash_table_set from HashTable with recursion_stack, node, 1
+    proc hashtable_put from HashTable with visited, node, 1
+    proc hashtable_put from HashTable with recursion_stack, node, 1
 
     Note: Check all outgoing edges from this node
     Let outgoing_edges be proc get_outgoing_edges with node, edges, context
@@ -412,13 +419,13 @@ Process called "dfs_visit" that takes node as Integer, nodes as Integer, edges a
             Let target be proc extract_target_from_edge with edge
 
             Note: Check if target is in recursion stack (cycle detected)
-            Let in_rec_stack be proc hash_table_get from HashTable with recursion_stack, target
+            Let in_rec_stack be proc hashtable_get from HashTable with recursion_stack, target
             If in_rec_stack is equal to 1:
                 Return 1  Note: Cycle detected
             End If
 
             Note: Recursively visit unvisited nodes
-            Let is_visited be proc hash_table_get from HashTable with visited, target
+            Let is_visited be proc hashtable_get from HashTable with visited, target
             If is_visited is equal to 0:
                 Let has_cycle be proc dfs_visit with target, nodes, edges, visited, recursion_stack, context
                 If has_cycle is equal to 1:
@@ -430,18 +437,22 @@ Process called "dfs_visit" that takes node as Integer, nodes as Integer, edges a
         End While
     End If
 
-    proc hash_table_remove from HashTable with recursion_stack, node
+    proc hashtable_remove from HashTable with recursion_stack, node
     Return 0
 End Process
 
 Process called "get_outgoing_edges" that takes node as Integer, edges as Integer, context as Integer returns Integer:
     Note: Get all outgoing edges from a node (edges where node is source)
 
-    Let edge_count be proc hash_table_size from HashTable with edges
-    Let edge_keys be proc hash_table_keys from HashTable with edges
+    Let arena be proc memory_get_qword from MemoryCore with context, 16
+    Let edge_keys be proc hashtable_get_keys from HashTable with edges, arena
+    If edge_keys is equal to 0:
+        Return 0
+    End If
+    Note: hashtable_get_keys returns [count, key0, key1, ...]; count is first qword
+    Let edge_count be proc memory_get_qword from MemoryCore with edge_keys, 0
 
     Note: Allocate result array (first qword = count, rest = edge keys)
-    Let arena be proc memory_get_qword from MemoryCore with context, 16
     Let outgoing be proc arena_allocate from Layout with arena, edge_count multiplied by 8 plus 8
     If outgoing is equal to 0:
         Return 0
@@ -452,7 +463,8 @@ Process called "get_outgoing_edges" that takes node as Integer, edges as Integer
 
     Let i be 0
     While i is less than edge_count:
-        Let edge_key be proc memory_get_qword from MemoryCore with edge_keys plus i multiplied by 8, 0
+        Note: Skip the leading count qword when reading each key pointer
+        Let edge_key be proc memory_get_qword from MemoryCore with edge_keys plus 8 plus i multiplied by 8, 0
         If edge_key is not equal to 0:
             Note: Check if edge starts with this node
             Let source be proc extract_source_from_edge with edge_key
@@ -477,7 +489,7 @@ End Process
 Process called "extract_source_from_edge" that takes edge_key as Integer returns Integer:
     Note: Extract source node from edge key "source -> target"
 
-    Let edge_str be proc string_to_cstring from StringCore with edge_key
+    Let edge_str be edge_key
     Let edge_len be proc string_length from StringCore with edge_key
 
     Note: Find " -> " separator
@@ -503,7 +515,7 @@ Process called "extract_source_from_edge" that takes edge_key as Integer returns
 
     Note: Extract source (from start to separator)
     Let source_len be separator_pos
-    Let source_node be proc substring from StringCore with edge_key, 0, source_len
+    Let source_node be proc string_substring from StringPrimitive with edge_key, 0, source_len
 
     Return source_node
 End Process
@@ -511,7 +523,7 @@ End Process
 Process called "extract_target_from_edge" that takes edge_key as Integer returns Integer:
     Note: Extract target node from edge key "source -> target"
 
-    Let edge_str be proc string_to_cstring from StringCore with edge_key
+    Let edge_str be edge_key
     Let edge_len be proc string_length from StringCore with edge_key
 
     Note: Find " -> " separator
@@ -538,7 +550,7 @@ Process called "extract_target_from_edge" that takes edge_key as Integer returns
     Note: Extract target (from after " -> " to end)
     Let target_start be separator_pos plus 4  Note: Skip " -> "
     Let target_len be edge_len minus target_start
-    Let target_node be proc substring from StringCore with edge_key, target_start, target_len
+    Let target_node be proc string_substring from StringPrimitive with edge_key, target_start, target_len
 
     Return target_node
 End Process

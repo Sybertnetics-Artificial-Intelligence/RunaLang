@@ -43,6 +43,41 @@ Note: Maximum file size accepted by read_entire_file. Files larger than this
 Note: are rejected to prevent unbounded memory allocation during compiler runs.
 Constant FILE_MAX_SIZE as Integer is 134217728
 
+Note: getcwd syscall number on Linux x86_64. The platform-aware syscall router
+Note: maps this to the correct instruction (or equivalent call) on other targets.
+Constant SYS_GETCWD as Integer is 79
+
+Note: Buffer size for get_cwd_internal, set to the Linux PATH_MAX. Any legal
+Note: absolute path fits within this bound, including its trailing null terminator.
+Constant PATH_BUFFER_SIZE as Integer is 4096
+
+Note: mkdir and unlink syscall numbers on Linux x86_64. The platform-aware
+Note: syscall router maps these to the correct instruction (or equivalent call)
+Note: on other targets.
+Constant SYS_MKDIR as Integer is 83
+Constant SYS_UNLINK as Integer is 87
+
+Note: Default directory permissions for created directories (0755 octal = 493).
+Constant DIR_DEFAULT_PERMS as Integer is 493
+
+Note: Negated errno for "file already exists" (EEXIST = 17 on Linux). mkdir
+Note: returns this when a path component already exists, which recursive
+Note: directory creation treats as success for that component.
+Constant FILE_NEG_EEXIST as Integer is -17
+
+Note: Byte value of the path separator '/'.
+Constant PATH_SEPARATOR_BYTE as Integer is 47
+
+Note: clock_gettime syscall number on Linux x86_64, with CLOCK_REALTIME as the
+Note: wall-clock clock id. The platform-aware syscall router maps the number to
+Note: the correct instruction (or equivalent call) on other targets.
+Constant SYS_CLOCK_GETTIME as Integer is 228
+Constant CLOCK_REALTIME_ID as Integer is 0
+
+Note: Size in bytes of a TimeSpec (8-byte seconds field followed by an 8-byte
+Note: nanoseconds field).
+Constant TIMESPEC_SIZE as Integer is 16
+
 Note: ============================================================================
 Note: SYSCALL WRAPPERS
 Note: ============================================================================
@@ -58,6 +93,13 @@ Process called "fio_syscall1" takes syscall_num as Integer, arg1 as Integer retu
     Note: One-argument syscall. Dispatched through the platform router so the
     Note: same code works on Linux/Darwin/BSD/Windows targets without change.
     Return syscall_1 from Syscall with syscall_num, arg1
+End Process
+
+Process called "fio_syscall2" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer returns Integer:
+    Note: Two-argument syscall, used by getcwd(buf, size). Dispatched through the
+    Note: platform router so the same code resolves to the correct platform
+    Note: syscall instruction across Linux/Darwin/BSD/Windows targets.
+    Return syscall_2 from Syscall with syscall_num, arg1, arg2
 End Process
 
 Process called "fio_syscall3" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
@@ -139,6 +181,128 @@ Process called "fio_file_length" takes fd as Integer returns Integer:
         Return -1
     End If
     Return length
+End Process
+
+Note: Return the process's current working directory as a freshly allocated,
+Note: null-terminated absolute path string. Returns 0 on failure.
+Note: Caller takes ownership of the returned buffer.
+Note: Implemented via the getcwd syscall (x86_64 number 79), routed through the
+Note: platform-aware syscall layer. The kernel writes the absolute path into the
+Note: caller-supplied buffer and returns the number of bytes written including
+Note: the trailing null on success, or a negative errno on failure (most commonly
+Note: -ERANGE when the buffer is too small for the path). PATH_BUFFER_SIZE is set
+Note: to the Linux PATH_MAX (4096), which bounds any legal absolute path.
+Process called "get_cwd_internal" returns Integer:
+    Let buffer be proc allocate from Layout with PATH_BUFFER_SIZE
+    If buffer is equal to 0:
+        Return 0
+    End If
+    Let result be fio_syscall2(SYS_GETCWD, buffer, PATH_BUFFER_SIZE)
+    If result is less than 0:
+        proc deallocate from Layout with buffer
+        Return 0
+    End If
+    Return buffer
+End Process
+
+Note: Delete a file by path via the unlink syscall. Returns 1 on success, 0 on
+Note: failure (for example, the path does not exist or is a directory). A 0 path
+Note: is treated as failure.
+Process called "delete_file" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let result be fio_syscall1(SYS_UNLINK, path)
+    If result is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: Create a directory and every missing parent directory along its path,
+Note: equivalent to "mkdir -p". Returns 1 once the full directory exists, 0 on
+Note: failure. Each path component is created with 0755 permissions; a component
+Note: that already exists (EEXIST) is accepted and traversal continues. A leading
+Note: '/' (absolute path) is handled correctly, and a trailing '/' is tolerated.
+Process called "create_directory_recursive" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+
+    Let path_len be proc string_length from StringCore with path
+    If path_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Work in a private buffer so the caller's string is never mutated. The
+    Note: extra byte holds the trailing null terminator for each prefix probe.
+    Let work be proc allocate from Layout with path_len plus 1
+    If work is equal to 0:
+        Return 0
+    End If
+
+    Let copy_index be 0
+    While copy_index is less than path_len:
+        Let src_byte be proc memory_get_byte from MemoryCore with path, copy_index
+        proc memory_set_byte from MemoryCore with work, copy_index, src_byte
+        Set copy_index to copy_index plus 1
+    End While
+    proc memory_set_byte from MemoryCore with work, path_len, 0
+
+    Note: Create each intermediate directory. Start at index 1 so a leading
+    Note: separator (root of an absolute path) is not treated as an empty
+    Note: component to create.
+    Let i be 1
+    While i is less than path_len:
+        Let current_byte be proc memory_get_byte from MemoryCore with work, i
+        If current_byte is equal to PATH_SEPARATOR_BYTE:
+            Note: Temporarily terminate the prefix at this separator, create it,
+            Note: then restore the separator so the next iteration sees the full
+            Note: working path again.
+            proc memory_set_byte from MemoryCore with work, i, 0
+            Let prefix_result be fio_syscall2(SYS_MKDIR, work, DIR_DEFAULT_PERMS)
+            If prefix_result is less than 0:
+                If prefix_result is not equal to FILE_NEG_EEXIST:
+                    proc deallocate from Layout with work
+                    Return 0
+                End If
+            End If
+            proc memory_set_byte from MemoryCore with work, i, PATH_SEPARATOR_BYTE
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Create the final (deepest) directory component.
+    Let final_result be fio_syscall2(SYS_MKDIR, work, DIR_DEFAULT_PERMS)
+    proc deallocate from Layout with work
+    If final_result is equal to 0:
+        Return 1
+    End If
+    If final_result is equal to FILE_NEG_EEXIST:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: Return the current wall-clock time as whole seconds since the Unix epoch.
+Note: Implemented via clock_gettime(CLOCK_REALTIME) into a 16-byte TimeSpec, then
+Note: reading the seconds field (offset 0). Returns 0 if the clock query fails or
+Note: the scratch buffer cannot be allocated. The unit matches the modification
+Note: time reported by the file metadata layer, so the two are directly
+Note: comparable for staleness checks.
+Process called "get_current_time_seconds" returns Integer:
+    Let timespec be proc allocate from Layout with TIMESPEC_SIZE
+    If timespec is equal to 0:
+        Return 0
+    End If
+    Let result be fio_syscall2(SYS_CLOCK_GETTIME, CLOCK_REALTIME_ID, timespec)
+    If result is less than 0:
+        proc deallocate from Layout with timespec
+        Return 0
+    End If
+    Let seconds be proc memory_get_qword from MemoryCore with timespec, 0
+    proc deallocate from Layout with timespec
+    Return seconds
 End Process
 
 Note: ============================================================================
