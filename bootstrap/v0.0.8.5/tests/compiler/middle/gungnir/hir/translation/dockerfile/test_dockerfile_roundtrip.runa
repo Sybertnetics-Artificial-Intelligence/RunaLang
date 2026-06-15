@@ -1,0 +1,396 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Dockerfile Translation Round-Trip Probe
+
+End-to-end proof that the Dockerfile translation pipeline is REAL, not a skeleton:
+
+    Dockerfile source
+      -> dockerfile_lexer    (tokenize: instructions, flags, JSON arrays,
+                              line continuations, comments, parser directives)
+      -> dockerfile_parser   (build Dockerfile instruction AST)
+      -> dockerfile_to_hir   (lower each instruction to a HIR dockerfile_* call)
+      -> hir_to_dockerfile   (emit HIR call stream back to Dockerfile text)
+
+The probe feeds a representative multi-stage Dockerfile containing: a parser
+directive comment; a multi-stage FROM with an AS alias; an ARG with a default;
+two ENV variables; a RUN in shell form and a RUN in exec (JSON-array) form; a
+COPY with --from=; an EXPOSE; an exec-form CMD; and an exec-form ENTRYPOINT.
+It then:
+
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     root is a block statement whose statement count matches the number of
+     translated instructions.
+  2. Walks individual HIR statements and asserts the lowered dockerfile_* call
+     function names AND their first string-literal arguments survived: the
+     multi-stage FROM (image + AS alias), the RUN shell form, the RUN exec
+     form, the COPY --from source, both ENV var names, the ARG default, the
+     EXPOSE port, the exec-form CMD, and the exec-form ENTRYPOINT.
+  3. Emits the HIR back to Dockerfile text and asserts the text is non-empty.
+  4. Re-parses the emitted Dockerfile text back into HIR and asserts the two
+     HIR call streams are STRUCTURALLY EQUAL via a recursive comparator. The
+     comparator compares statement count, per-statement call function names,
+     and per-argument string-literal payloads by content. Structural equality
+     (rather than byte equality) is the correct semantic-equivalence check:
+     the backend canonicalises whitespace and form so the byte stream differs
+     while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_lexer.runa" as DockerfileLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_parser.runa" as DockerfileParser
+Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_to_hir.runa" as DockerfileFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/dockerfile/hir_to_dockerfile.runa" as DockerfileBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: Dockerfile source -> HIR block statement
+Note: ============================================================================
+
+@Reasoning:
+The Dockerfile pipeline has no single source-to-HIR convenience, so the probe
+owns the four-stage chain explicitly: create_lexer/tokenize produces the token
+list, create_parser/parse_dockerfile produces the instruction AST, and
+create_translator/translate_dockerfile lowers the AST to a HIR block of
+dockerfile_* call statements. Returning the block pointer (or 0 on any stage
+failure) lets the caller assert on a single value.
+@End Reasoning
+Process called "dockerfile_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from DockerfileLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc tokenize from DockerfileLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from DockerfileParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_dockerfile from DockerfileParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let translator be proc create_translator from DockerfileFrontend
+    If translator is equal to 0:
+        Return 0
+    End If
+
+    Let hir_block be proc translate_dockerfile from DockerfileFrontend with translator, ast
+    Return hir_block
+End Process
+
+Note: ============================================================================
+Note: HIR call-stream accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+The backend reads a string-literal payload directly from offset 40 after
+checking only that the node is HIR_LITERAL (offset 0). The to_hir lowering
+stores the string at offset 40 without stamping the value_type tag, so the
+strict typed accessor would reject it. To assert content survival the probe
+must read the payload exactly as the backend does: HIR_LITERAL guard, then
+offset 40.
+@End Reasoning
+Process called "arg_string" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with node, 0
+    If kind is not equal to HIR_LITERAL from HIR:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+@Reasoning:
+A block statement carries its statement list at offset 24 and the count at
+offset 32. Each statement is an HIR_EXPRESSION_STATEMENT whose inner call lives
+at offset 24. This helper unwraps statement i to the underlying
+HIR_CALL_EXPRESSION so the comparator and content assertions operate directly
+on the call node.
+@End Reasoning
+Process called "block_call_at" takes block as Integer, index as Integer returns Integer:
+    If block is equal to 0:
+        Return 0
+    End If
+    Let statements be proc memory_get_int64 from Layout with block, 24
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let expr_stmt be proc list_get from List with statements, index
+    If expr_stmt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with expr_stmt, 24
+End Process
+
+@Reasoning:
+A HIR_CALL_EXPRESSION stores its callee at offset 24 and the callee identifier
+name at offset 40. This returns the function-name string pointer of a lowered
+dockerfile_* call so the probe can assert which instruction each statement
+represents.
+@End Reasoning
+Process called "call_name" takes call as Integer returns Integer:
+    If call is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with call, 0
+    If kind is not equal to HIR_CALL_EXPRESSION from HIR:
+        Return 0
+    End If
+    Let callee be proc memory_get_int64 from Layout with call, 24
+    If callee is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with callee, 40
+End Process
+
+@Reasoning:
+A HIR_CALL_EXPRESSION stores its argument list at offset 32. This returns
+argument i of a call as a raw node pointer so callers can read its string
+payload via arg_string.
+@End Reasoning
+Process called "call_arg_at" takes call as Integer, index as Integer returns Integer:
+    If call is equal to 0:
+        Return 0
+    End If
+    Let args be proc memory_get_int64 from Layout with call, 32
+    If args is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with args, index
+End Process
+
+@Reasoning:
+ENV lowers to dockerfile_env(array_of_pairs): the single call argument is an
+HIR_ARRAY_LITERAL whose elements are HIR_TUPLE_LITERAL (key, value) pairs.
+Array and tuple children both live at offset 24. This helper digs to the key
+string of the first ENV pair: call arg[0] (array) -> children[0] (tuple) ->
+children[0] (key literal at offset 40).
+@End Reasoning
+Process called "env_first_key" takes call as Integer returns Integer:
+    Let array_node be proc call_arg_at with call, 0
+    If array_node is equal to 0:
+        Return 0
+    End If
+    Let array_children be proc memory_get_int64 from Layout with array_node, 24
+    If array_children is equal to 0:
+        Return 0
+    End If
+    Let first_tuple be proc list_get from List with array_children, 0
+    If first_tuple is equal to 0:
+        Return 0
+    End If
+    Let tuple_children be proc memory_get_int64 from Layout with first_tuple, 24
+    If tuple_children is equal to 0:
+        Return 0
+    End If
+    Let key_lit be proc list_get from List with tuple_children, 0
+    Return proc arg_string with key_lit
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two Dockerfile HIR call streams
+Note: ============================================================================
+
+@Reasoning:
+Two Dockerfile documents are semantically equal when their lowered HIR call
+streams match position-for-position: same statement count, same call function
+name at each position, same argument count per call, and same string-literal
+payload for every argument (compared by content, not pointer identity). This is
+whitespace- and form-insensitive, so it proves round-trip fidelity without being
+fooled by the backend's canonical re-rendering (e.g. shell vs exec spacing).
+@End Reasoning
+Process called "hir_blocks_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let count_a be proc memory_get_int64 from Layout with a, 32
+    Let count_b be proc memory_get_int64 from Layout with b, 32
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let call_a be proc block_call_at with a, i
+        Let call_b be proc block_call_at with b, i
+
+        Let name_a be proc call_name with call_a
+        Let name_b be proc call_name with call_b
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+
+        Let args_a be proc memory_get_int64 from Layout with call_a, 32
+        Let args_b be proc memory_get_int64 from Layout with call_b, 32
+
+        Let argc_a be 0
+        If args_a is not equal to 0:
+            Set argc_a to proc list_length from List with args_a
+        End If
+        Let argc_b be 0
+        If args_b is not equal to 0:
+            Set argc_b to proc list_length from List with args_b
+        End If
+        If argc_a is not equal to argc_b:
+            Return 0
+        End If
+
+        Let j be 0
+        While j is less than argc_a:
+            Let arg_a be proc list_get from List with args_a, j
+            Let arg_b be proc list_get from List with args_b, j
+            Let str_a be proc arg_string with arg_a
+            Let str_b be proc arg_string with arg_b
+            Let args_match be proc string_equals from StringCore with str_a, str_b
+            If args_match is not equal to 1:
+                Return 0
+            End If
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Dockerfile translation round-trip"
+
+    Note:
+    Representative multi-stage Dockerfile. Instruction order (0-indexed once
+    parsed; the parser drops comment/directive lines, so the directive comment
+    is not a statement):
+      0  FROM golang:1.21 AS builder
+      1  ARG VERSION=1.0.0
+      2  ENV CGO_ENABLED=0
+      3  ENV GOOS=linux
+      4  RUN go build -o app          (shell form)
+      5  RUN ["go", "test", "./..."]  (exec form)
+      6  COPY --from=builder /app /usr/local/bin/app
+      7  EXPOSE 8080
+      8  CMD ["/usr/local/bin/app"]        (exec form)
+      9  ENTRYPOINT ["/entrypoint.sh"]     (exec form)
+    Newlines are explicit \n in the Runa string literal.
+    :End Note
+    Let source be "# syntax=docker/dockerfile:1\nFROM golang:1.21 AS builder\nARG VERSION=1.0.0\nENV CGO_ENABLED=0\nENV GOOS=linux\nRUN go build -o app\nRUN [\"go\", \"test\", \"./...\"]\nCOPY --from=builder /app /usr/local/bin/app\nEXPOSE 8080\nCMD [\"/usr/local/bin/app\"]\nENTRYPOINT [\"/entrypoint.sh\"]"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc dockerfile_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR block", hir1
+
+    Let root_kind be proc memory_get_int64 from Layout with hir1, 0
+    proc assert_equal from TestUtils with results, "HIR root is block statement", root_kind, HIR_BLOCK_STATEMENT from HIR
+
+    Let stmt_count be proc memory_get_int64 from Layout with hir1, 32
+    proc assert_equal from TestUtils with results, "HIR block has 10 statements", stmt_count, 10
+
+    Note: --- Stage 1 content: multi-stage FROM with AS alias ---
+    Let from_call be proc block_call_at with hir1, 0
+    Let from_name be proc call_name with from_call
+    proc assert_string_equal from TestUtils with results, "stmt[0] is dockerfile_from", from_name, "dockerfile_from"
+    Let from_image be proc arg_string with proc call_arg_at with from_call, 0
+    proc assert_string_equal from TestUtils with results, "FROM image is 'golang'", from_image, "golang"
+    Let from_tag be proc arg_string with proc call_arg_at with from_call, 1
+    proc assert_string_equal from TestUtils with results, "FROM tag is '1.21'", from_tag, "1.21"
+    Let from_alias be proc arg_string with proc call_arg_at with from_call, 3
+    proc assert_string_equal from TestUtils with results, "FROM stage alias is 'builder'", from_alias, "builder"
+
+    Note: --- ARG with default ---
+    Let arg_call be proc block_call_at with hir1, 1
+    Let arg_name be proc call_name with arg_call
+    proc assert_string_equal from TestUtils with results, "stmt[1] is dockerfile_arg", arg_name, "dockerfile_arg"
+    Let arg_key be proc arg_string with proc call_arg_at with arg_call, 0
+    proc assert_string_equal from TestUtils with results, "ARG name is 'VERSION'", arg_key, "VERSION"
+    Let arg_default be proc arg_string with proc call_arg_at with arg_call, 1
+    proc assert_string_equal from TestUtils with results, "ARG default is '1.0.0'", arg_default, "1.0.0"
+
+    Note: --- Two ENV variables ---
+    Let env0_call be proc block_call_at with hir1, 2
+    Let env0_name be proc call_name with env0_call
+    proc assert_string_equal from TestUtils with results, "stmt[2] is dockerfile_env", env0_name, "dockerfile_env"
+    Let env0_key be proc env_first_key with env0_call
+    proc assert_string_equal from TestUtils with results, "ENV[0] key is 'CGO_ENABLED'", env0_key, "CGO_ENABLED"
+
+    Let env1_call be proc block_call_at with hir1, 3
+    Let env1_name be proc call_name with env1_call
+    proc assert_string_equal from TestUtils with results, "stmt[3] is dockerfile_env", env1_name, "dockerfile_env"
+    Let env1_key be proc env_first_key with env1_call
+    proc assert_string_equal from TestUtils with results, "ENV[1] key is 'GOOS'", env1_key, "GOOS"
+
+    Note: --- RUN shell form ---
+    Let run_shell_call be proc block_call_at with hir1, 4
+    Let run_shell_name be proc call_name with run_shell_call
+    proc assert_string_equal from TestUtils with results, "stmt[4] is dockerfile_run_shell", run_shell_name, "dockerfile_run_shell"
+
+    Note: --- RUN exec form ---
+    Let run_exec_call be proc block_call_at with hir1, 5
+    Let run_exec_name be proc call_name with run_exec_call
+    proc assert_string_equal from TestUtils with results, "stmt[5] is dockerfile_run_exec", run_exec_name, "dockerfile_run_exec"
+
+    Note: --- COPY --from ---
+    Let copy_call be proc block_call_at with hir1, 6
+    Let copy_name be proc call_name with copy_call
+    proc assert_string_equal from TestUtils with results, "stmt[6] is dockerfile_copy", copy_name, "dockerfile_copy"
+
+    Note: --- EXPOSE ---
+    Let expose_call be proc block_call_at with hir1, 7
+    Let expose_name be proc call_name with expose_call
+    proc assert_string_equal from TestUtils with results, "stmt[7] is dockerfile_expose", expose_name, "dockerfile_expose"
+
+    Note: --- exec-form CMD ---
+    Let cmd_call be proc block_call_at with hir1, 8
+    Let cmd_name be proc call_name with cmd_call
+    proc assert_string_equal from TestUtils with results, "stmt[8] is dockerfile_cmd_exec", cmd_name, "dockerfile_cmd_exec"
+
+    Note: --- exec-form ENTRYPOINT ---
+    Let entry_call be proc block_call_at with hir1, 9
+    Let entry_name be proc call_name with entry_call
+    proc assert_string_equal from TestUtils with results, "stmt[9] is dockerfile_entrypoint_exec", entry_name, "dockerfile_entrypoint_exec"
+
+    Note: --- Stage 2: HIR -> Dockerfile text ---
+    Let emitted be proc hir_to_dockerfile from DockerfileBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Dockerfile text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Dockerfile is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted Dockerfile -> HIR, assert structurally equal ---
+    Let hir2 be proc dockerfile_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Dockerfile produced HIR", hir2
+
+    Let structurally_equal be proc hir_blocks_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

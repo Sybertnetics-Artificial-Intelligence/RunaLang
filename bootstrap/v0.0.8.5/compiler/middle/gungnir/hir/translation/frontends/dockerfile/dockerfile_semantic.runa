@@ -12,8 +12,46 @@ Note: ===================================================================
 Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_parser.runa" as Parser
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/internal/string_utils.runa" as StringUtils
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ===================================================================
+Note: AST NODE TYPE TAGS (mirror of dockerfile_parser.runa node constants)
+Note: ===================================================================
+
+@Reasoning:
+The analyzer reads the integer node_type tag stored at offset 0 of every
+instruction node produced by the parser. The bootstrap compiler resolves
+Constants per-module, so the analyzer keeps a byte-for-byte copy of the
+parser's NODE_* tag values rather than importing them. These map directly
+to the instruction keyword each tag represents.
+@End Reasoning
+
+@Implementation:
+One Constant per Dockerfile instruction kind, matching the values declared
+in dockerfile_parser.runa (NODE_DOCKERFILE = 1000 root, FROM = 1001, ...).
+@End Implementation
+
+Constant NODE_DOCKERFILE as Integer is 1000
+Constant NODE_FROM as Integer is 1001
+Constant NODE_RUN as Integer is 1002
+Constant NODE_CMD as Integer is 1003
+Constant NODE_LABEL as Integer is 1004
+Constant NODE_EXPOSE as Integer is 1005
+Constant NODE_ENV as Integer is 1006
+Constant NODE_ADD as Integer is 1007
+Constant NODE_COPY as Integer is 1008
+Constant NODE_ENTRYPOINT as Integer is 1009
+Constant NODE_VOLUME as Integer is 1010
+Constant NODE_USER as Integer is 1011
+Constant NODE_WORKDIR as Integer is 1012
+Constant NODE_ARG as Integer is 1013
+Constant NODE_ONBUILD as Integer is 1014
+Constant NODE_STOPSIGNAL as Integer is 1015
+Constant NODE_HEALTHCHECK as Integer is 1016
+Constant NODE_SHELL as Integer is 1017
+Constant NODE_MAINTAINER as Integer is 1018
 
 Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
@@ -30,12 +68,12 @@ the reporter can apply distinct severity rules.
 @End Reasoning
 
 @Implementation:
-17 x i64 record (136 bytes, offsets 0..128): each registry slot is a Dict
-(string-keyed lookups like environment_vars) or List (ordered streams like
-exposed_ports/security_issues). current_stage points to the active stage
-Dict during a walk; layer_count is bumped on every RUN/ADD/COPY/etc. The
-error_message + has_error pair behaves identically to the cmake/cpp
-analyzers (sticky first-error).
+17 x i64 record (136 bytes, offsets 0..128): each registry slot is a List
+(ordered streams like exposed_ports/security_issues; the metadata slots
+environment_vars/labels/args store "key=value" strings). current_stage
+points to the active stage index during a walk; layer_count is bumped on
+every RUN/COPY/etc. The error_message + has_error pair behaves identically
+to the cmake/cpp analyzers (sticky first-error).
 @End Implementation
 
 Type called "DockerfileSemanticAnalyzer":
@@ -77,13 +115,10 @@ Downstream tooling treats each tier differently.
 
 @Implementation:
 Allocates a 136-byte record via Layout.allocate; returns 0 if it fails.
-Creates 11 Lists (base_images, stages, exposed_ports, volumes, workdirs,
-users, security_issues, optimization_warnings, validation_errors,
-validation_warnings) and 3 Dicts (environment_vars, labels, args), wiring
-them into the analyzer at fixed offsets 0..64. Initialises counter slots:
-offset 72 (current_stage) = 0, offset 80 (layer_count) = 0, offset 120
-(error_message) = 0, offset 128 (has_error) = 0. Returns the analyzer
-handle as an opaque Integer.
+Creates 13 Lists wired into the analyzer at fixed offsets 0..64 and 88..112.
+Initialises counter slots: offset 72 (current_stage) = 0, offset 80
+(layer_count) = 0, offset 120 (error_message) = 0, offset 128 (has_error)
+= 0. Returns the analyzer handle as an opaque Integer.
 @End Implementation
 
 Process called "create_dockerfile_semantic_analyzer" returns Integer:
@@ -96,19 +131,19 @@ Process called "create_dockerfile_semantic_analyzer" returns Integer:
         Return 0
     End If
 
-    Let base_images be proc create from List
-    Let stages be proc create from List
-    Let exposed_ports be proc create from List
-    Let environment_vars be proc create from Dict
-    Let volumes be proc create from List
-    Let workdirs be proc create from List
-    Let users be proc create from List
-    Let labels be proc create from Dict
-    Let args be proc create from Dict
-    Let security_issues be proc create from List
-    Let optimization_warnings be proc create from List
-    Let validation_errors be proc create from List
-    Let validation_warnings be proc create from List
+    Let base_images be proc list_create from List
+    Let stages be proc list_create from List
+    Let exposed_ports be proc list_create from List
+    Let environment_vars be proc list_create from List
+    Let volumes be proc list_create from List
+    Let workdirs be proc list_create from List
+    Let users be proc list_create from List
+    Let labels be proc list_create from List
+    Let args be proc list_create from List
+    Let security_issues be proc list_create from List
+    Let optimization_warnings be proc list_create from List
+    Let validation_errors be proc list_create from List
+    Let validation_warnings be proc list_create from List
 
     proc memory_set_int64 from Layout with analyzer, 0, base_images
     proc memory_set_int64 from Layout with analyzer, 8, stages
@@ -129,6 +164,328 @@ Process called "create_dockerfile_semantic_analyzer" returns Integer:
     proc memory_set_int64 from Layout with analyzer, 128, 0  Note: has_error
 
     Return analyzer
+End Process
+
+Note: ===================================================================
+Note: AST ACCESSORS
+Note: ===================================================================
+
+@Reasoning:
+The analyzer walks the parser's DockerfileAST root, whose instruction list
+lives at offset 8 (a list_create list of instruction-node pointers). This
+accessor isolates that single field read so the rest of the analyzer never
+touches the AST layout directly - if the parser node layout changes, only
+this proc updates.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null AST. Otherwise reads the instructions list pointer at
+DockerfileAST offset 8 and returns it. The returned list is owned by the
+AST; the analyzer only reads it.
+@End Implementation
+
+Process called "get_dockerfile_instructions" takes dockerfile_ast as Integer returns Integer:
+    Note: Return the ordered instruction list from a parsed Dockerfile AST
+
+    If dockerfile_ast is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with dockerfile_ast, 8
+End Process
+
+@Reasoning:
+Every analysis pass dispatches on the instruction keyword (FROM/RUN/COPY/...)
+but the parser stores the kind as an integer node_type tag at offset 0, not
+a string. This accessor maps the tag to its canonical keyword string so the
+Match/string_equals based dispatch elsewhere works against human-readable
+keywords. Unknown tags return "UNKNOWN" so the unknown-instruction warning
+path can fire.
+@End Reasoning
+
+@Implementation:
+Reads node_type at instruction offset 0, then returns the matching keyword
+for each NODE_* constant. Null node yields "UNKNOWN".
+@End Implementation
+
+Process called "get_instruction_type" takes instruction as Integer returns Integer:
+    Note: Map an instruction node's integer tag to its Dockerfile keyword
+
+    If instruction is equal to 0:
+        Return "UNKNOWN"
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+    If node_type is equal to NODE_FROM:
+        Return "FROM"
+    End If
+    If node_type is equal to NODE_RUN:
+        Return "RUN"
+    End If
+    If node_type is equal to NODE_CMD:
+        Return "CMD"
+    End If
+    If node_type is equal to NODE_LABEL:
+        Return "LABEL"
+    End If
+    If node_type is equal to NODE_EXPOSE:
+        Return "EXPOSE"
+    End If
+    If node_type is equal to NODE_ENV:
+        Return "ENV"
+    End If
+    If node_type is equal to NODE_ADD:
+        Return "ADD"
+    End If
+    If node_type is equal to NODE_COPY:
+        Return "COPY"
+    End If
+    If node_type is equal to NODE_ENTRYPOINT:
+        Return "ENTRYPOINT"
+    End If
+    If node_type is equal to NODE_VOLUME:
+        Return "VOLUME"
+    End If
+    If node_type is equal to NODE_USER:
+        Return "USER"
+    End If
+    If node_type is equal to NODE_WORKDIR:
+        Return "WORKDIR"
+    End If
+    If node_type is equal to NODE_ARG:
+        Return "ARG"
+    End If
+    If node_type is equal to NODE_ONBUILD:
+        Return "ONBUILD"
+    End If
+    If node_type is equal to NODE_STOPSIGNAL:
+        Return "STOPSIGNAL"
+    End If
+    If node_type is equal to NODE_HEALTHCHECK:
+        Return "HEALTHCHECK"
+    End If
+    If node_type is equal to NODE_SHELL:
+        Return "SHELL"
+    End If
+    If node_type is equal to NODE_MAINTAINER:
+        Return "MAINTAINER"
+    End If
+
+    Return "UNKNOWN"
+End Process
+
+@Reasoning:
+The validators consume each instruction's arguments as a uniform ordered
+List of strings regardless of how the parser stored them per node type.
+FROM exposes [image, "AS", stage_name] (so arg_count>2 signals a named
+stage); COPY/ADD expose [source..., destination]; RUN/CMD/ENTRYPOINT
+expose [command]; EXPOSE/VOLUME expose their stored child list directly;
+USER exposes [user, group?]; WORKDIR/ARG/STOPSIGNAL/MAINTAINER expose
+their single string. This normalisation lets every downstream validator
+read args[i] without knowing the node's internal field layout.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 and builds a fresh List per kind from the
+parser's node fields (image at FROM offset 8, stage_name at 32; command
+at RUN/CMD/ENTRYPOINT offset 16; sources list at COPY offset 8 + dest at
+16; ports list at EXPOSE offset 8; user at USER offset 8 + group at 16;
+path at WORKDIR offset 8; name+default at ARG offsets 8/16; signal at
+STOPSIGNAL offset 8; name at MAINTAINER offset 8). EXPOSE/VOLUME forward
+their stored list. Empty strings are not appended so arg_count reflects
+present arguments only.
+@End Implementation
+
+Process called "get_instruction_arguments" takes instruction as Integer returns Integer:
+    Note: Build a uniform argument list for any instruction node
+
+    Let result be proc list_create from List
+    If instruction is equal to 0:
+        Return result
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+    If node_type is equal to NODE_FROM:
+        Let image be proc memory_get_int64 from Layout with instruction, 8
+        Let image_present be string_is_nonempty with image
+        If image_present is equal to 1:
+            proc list_append from List with result, image
+        End If
+        Let stage_name be proc memory_get_int64 from Layout with instruction, 32
+        Let stage_present be string_is_nonempty with stage_name
+        If stage_present is equal to 1:
+            proc list_append from List with result, "AS"
+            proc list_append from List with result, stage_name
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_RUN:
+        Let run_cmd be proc memory_get_int64 from Layout with instruction, 16
+        Let run_present be string_is_nonempty with run_cmd
+        If run_present is equal to 1:
+            proc list_append from List with result, run_cmd
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_CMD:
+        Let cmd_cmd be proc memory_get_int64 from Layout with instruction, 16
+        Let cmd_present be string_is_nonempty with cmd_cmd
+        If cmd_present is equal to 1:
+            proc list_append from List with result, cmd_cmd
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_ENTRYPOINT:
+        Let ep_cmd be proc memory_get_int64 from Layout with instruction, 16
+        Let ep_present be string_is_nonempty with ep_cmd
+        If ep_present is equal to 1:
+            proc list_append from List with result, ep_cmd
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_COPY:
+        Let copy_sources be proc memory_get_int64 from Layout with instruction, 8
+        If copy_sources is not equal to 0:
+            Let src_count be proc list_length from List with copy_sources
+            Let s be 0
+            While s is less than src_count:
+                Let src be proc list_get from List with copy_sources, s
+                proc list_append from List with result, src
+                Set s to s plus 1
+            End While
+        End If
+        Let copy_dest be proc memory_get_int64 from Layout with instruction, 16
+        Let dest_present be string_is_nonempty with copy_dest
+        If dest_present is equal to 1:
+            proc list_append from List with result, copy_dest
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_ADD:
+        Let add_sources be proc memory_get_int64 from Layout with instruction, 8
+        If add_sources is not equal to 0:
+            Let asrc_count be proc list_length from List with add_sources
+            Let a be 0
+            While a is less than asrc_count:
+                Let asrc be proc list_get from List with add_sources, a
+                proc list_append from List with result, asrc
+                Set a to a plus 1
+            End While
+        End If
+        Let add_dest be proc memory_get_int64 from Layout with instruction, 16
+        Let add_dest_present be string_is_nonempty with add_dest
+        If add_dest_present is equal to 1:
+            proc list_append from List with result, add_dest
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_EXPOSE:
+        Let ports be proc memory_get_int64 from Layout with instruction, 8
+        If ports is equal to 0:
+            Return result
+        End If
+        Return ports
+    End If
+
+    If node_type is equal to NODE_VOLUME:
+        Let paths be proc memory_get_int64 from Layout with instruction, 8
+        If paths is equal to 0:
+            Return result
+        End If
+        Return paths
+    End If
+
+    If node_type is equal to NODE_USER:
+        Let user be proc memory_get_int64 from Layout with instruction, 8
+        Let user_present be string_is_nonempty with user
+        If user_present is equal to 1:
+            proc list_append from List with result, user
+        End If
+        Let group be proc memory_get_int64 from Layout with instruction, 16
+        Let group_present be string_is_nonempty with group
+        If group_present is equal to 1:
+            proc list_append from List with result, group
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_WORKDIR:
+        Let path be proc memory_get_int64 from Layout with instruction, 8
+        Let path_present be string_is_nonempty with path
+        If path_present is equal to 1:
+            proc list_append from List with result, path
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_ARG:
+        Let arg_name be proc memory_get_int64 from Layout with instruction, 8
+        Let name_present be string_is_nonempty with arg_name
+        If name_present is equal to 1:
+            proc list_append from List with result, arg_name
+        End If
+        Let arg_default be proc memory_get_int64 from Layout with instruction, 16
+        Let default_present be string_is_nonempty with arg_default
+        If default_present is equal to 1:
+            proc list_append from List with result, arg_default
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_STOPSIGNAL:
+        Let signal be proc memory_get_int64 from Layout with instruction, 8
+        Let signal_present be string_is_nonempty with signal
+        If signal_present is equal to 1:
+            proc list_append from List with result, signal
+        End If
+        Return result
+    End If
+
+    If node_type is equal to NODE_MAINTAINER:
+        Let maint be proc memory_get_int64 from Layout with instruction, 8
+        Let maint_present be string_is_nonempty with maint
+        If maint_present is equal to 1:
+            proc list_append from List with result, maint
+        End If
+        Return result
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+A string-presence predicate is needed across the argument builder: a parser
+field is "present" when it is a non-null pointer to a non-empty string.
+Centralising the test keeps the argument-list logic uniform and avoids
+treating the empty-string sentinel as a real argument.
+@End Reasoning
+
+@Implementation:
+Returns 0 if the handle is 0. Otherwise reads its length via StringCore and
+returns 1 when length > 0, else 0.
+@End Implementation
+
+Process called "string_is_nonempty" takes value as Integer returns Integer:
+    Note: True when value is a non-null handle to a non-empty string
+
+    If value is equal to 0:
+        Return 0
+    End If
+
+    Let length be proc string_length from StringCore with value
+    If length is greater than 0:
+        Return 1
+    End If
+
+    Return 0
 End Process
 
 Note: ===================================================================
@@ -186,7 +543,7 @@ Process called "analyze_dockerfile" takes analyzer as Integer, dockerfile_ast as
     proc analyze_build_stages with analyzer, dockerfile_ast
 
     Note: Phase 3: Validate base images and dependencies
-    proc validate_base_images from analyzer
+    proc validate_base_images with analyzer
 
     Note: Phase 4: Perform security analysis
     proc analyze_dockerfile_security with analyzer, dockerfile_ast
@@ -221,22 +578,26 @@ downstream errors that would result from a missing FROM.
 @End Reasoning
 
 @Implementation:
-Reads instructions list and its count via List.size. If count == 0, adds
-"Empty Dockerfile" validation error and returns. Calls
+Reads instructions list and its count via List.list_length. If count == 0,
+adds "Empty Dockerfile" validation error and returns. Calls
 validate_from_instruction_placement to enforce FROM-first / ARG-before-
 FROM ordering. Then loops i in 0..count-1: pulls instruction at index,
 calls validate_instruction_syntax(analyzer, instruction, i) (i used as
-the 0-based line number for error reporting), and
-collect_instruction_info to populate the per-instruction registries.
-Finally calls validate_required_instructions for whole-file checks
-(e.g., presence of CMD or ENTRYPOINT).
+the 0-based line number for error reporting), and collect_instruction_info
+to populate the per-instruction registries. Finally calls
+validate_required_instructions for whole-file checks.
 @End Implementation
 
 Process called "validate_dockerfile_structure" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Validate Dockerfile instruction sequence and structure
 
-    Let instructions be proc get_dockerfile_instructions from dockerfile_ast
-    Let instruction_count be proc size from List with instructions
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        proc add_dockerfile_validation_error with analyzer, "Empty Dockerfile"
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
 
     If instruction_count is equal to 0:
         proc add_dockerfile_validation_error with analyzer, "Empty Dockerfile"
@@ -249,14 +610,14 @@ Process called "validate_dockerfile_structure" takes analyzer as Integer, docker
     Note: Validate instruction sequence
     Let i be 0
     While i is less than instruction_count:
-        Let instruction be proc get from List with instructions, i
+        Let instruction be proc list_get from List with instructions, i
         proc validate_instruction_syntax with analyzer, instruction, i
         proc collect_instruction_info with analyzer, instruction
         Set i to i plus 1
     End While
 
     Note: Validate required instructions
-    proc validate_required_instructions from analyzer
+    proc validate_required_instructions with analyzer, dockerfile_ast
 End Process
 
 @Reasoning:
@@ -271,27 +632,24 @@ once found, the placement check is satisfied for the rest of the file.
 @End Reasoning
 
 @Implementation:
-Reads instruction_count via List.size. Initialises found_from=0, i=0.
-Loops while i < count AND found_from == 0: pulls instruction, reads
+Reads instruction_count via List.list_length. Initialises found_from=0,
+i=0. Loops while i < count AND found_from == 0: pulls instruction, reads
 instruction_type. If type equals "FROM", sets found_from=1 and writes 0
 to analyzer offset 72 (current_stage = first stage). Otherwise, tests
-for ARG; if NOT ARG, builds an error "FROM instruction must be first
-(found <type> at line <i+1>)", adds it, and returns (early exit
-because a single misplaced instruction is enough to fail this check).
-After the loop, if found_from is still 0, adds "Missing required FROM
-instruction".
+for ARG; if NOT ARG, builds an error and returns. After the loop, if
+found_from is still 0, adds "Missing required FROM instruction".
 @End Implementation
 
 Process called "validate_from_instruction_placement" takes analyzer as Integer, instructions as Integer:
     Note: Validate FROM instruction placement and syntax
 
-    Let instruction_count be proc size from List with instructions
+    Let instruction_count be proc list_length from List with instructions
     Let found_from be 0
     Let i be 0
 
     While i is less than instruction_count and found_from is equal to 0:
-        Let instruction be proc get from List with instructions, i
-        Let instruction_type be proc get_instruction_type from instruction
+        Let instruction be proc list_get from List with instructions, i
+        Let instruction_type be proc get_instruction_type with instruction
 
         Let is_from be proc string_equals from StringCore with instruction_type, "FROM"
         If is_from is equal to 1:
@@ -302,10 +660,11 @@ Process called "validate_from_instruction_placement" takes analyzer as Integer, 
             If is_arg is equal to 0:
                 Note: Non-ARG instruction before FROM
                 Let error be "FROM instruction must be first (found "
-                Set error to proc string_concat from StringCore with error, instruction_type
-                Set error to proc string_concat from StringCore with error, " at line "
-                Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with i plus 1
-                Set error to proc string_concat from StringCore with error, ")"
+                Set error to proc string_concat from StringPrim with error, instruction_type
+                Set error to proc string_concat from StringPrim with error, " at line "
+                Let line_label be proc integer_to_string from StringPrim with i plus 1
+                Set error to proc string_concat from StringPrim with error, line_label
+                Set error to proc string_concat from StringPrim with error, ")"
                 proc add_dockerfile_validation_error with analyzer, error
                 Return
             End If
@@ -341,8 +700,8 @@ warning and adds it to validation_warnings.
 Process called "validate_instruction_syntax" takes analyzer as Integer, instruction as Integer, line_number as Integer:
     Note: Validate individual instruction syntax
 
-    Let instruction_type be proc get_instruction_type from instruction
-    Let args be proc get_instruction_arguments from instruction
+    Let instruction_type be proc get_instruction_type with instruction
+    Let args be proc get_instruction_arguments with instruction
 
     Match instruction_type:
         When "FROM":
@@ -372,9 +731,10 @@ Process called "validate_instruction_syntax" takes analyzer as Integer, instruct
         When "ENTRYPOINT":
             proc validate_entrypoint_instruction with analyzer, args, line_number
         Otherwise:
-            Let warning be proc string_concat from StringCore with "Unknown instruction: ", instruction_type
-            Set warning to proc string_concat from StringCore with warning, " at line "
-            Set warning to proc string_concat from StringCore with warning, proc int_to_string from StringCore with line_number plus 1
+            Let warning be proc string_concat from StringPrim with "Unknown instruction: ", instruction_type
+            Set warning to proc string_concat from StringPrim with warning, " at line "
+            Let warn_line be proc integer_to_string from StringPrim with line_number plus 1
+            Set warning to proc string_concat from StringPrim with warning, warn_line
             proc add_dockerfile_validation_warning with analyzer, warning
     End Match
 End Process
@@ -382,8 +742,7 @@ End Process
 @Reasoning:
 FROM accepts two argument shapes: `FROM <image>` for the simple/default-
 stage case, and `FROM <image> AS <name>` for multi-stage builds where
-the stage gets a referenceable name. Other forms (e.g., 4+ arguments)
-indicate a malformed instruction. Stage names registered here populate
+the stage gets a referenceable name. Stage names registered here populate
 analyzer.stages and are looked up by COPY --from=<name> later. The image
 reference itself is delegated to validate_image_reference because the
 format (registry/repo:tag@digest) is complex enough to warrant its own
@@ -391,12 +750,11 @@ parser.
 @End Reasoning
 
 @Implementation:
-Reads arg_count via List.size. If 0, builds and adds "FROM instruction
-missing image name at line <n+1>" and returns. Reads image_ref at
-args[0] and calls validate_image_reference. If arg_count > 2, reads
-args[1] (expected "AS") and args[2] (stage name); if args[1] equals
-"AS", calls register_build_stage(analyzer, stage_name); otherwise adds
-"Invalid FROM syntax, expected AS keyword at line <n+1>".
+Reads arg_count via List.list_length. If 0, builds and adds "FROM
+instruction missing image name at line <n+1>" and returns. Reads
+image_ref at args[0] and calls validate_image_reference. If arg_count > 2,
+reads args[1] (expected "AS") and args[2] (stage name); if args[1] equals
+"AS", calls register_build_stage; otherwise adds an invalid-syntax error.
 @End Implementation
 
 @Security_Scope:
@@ -409,30 +767,78 @@ correctness.
 Process called "validate_from_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate FROM instruction syntax and image reference
 
-    Let arg_count be proc size from List with args
+    Let arg_count be proc list_length from List with args
     If arg_count is equal to 0:
         Let error be "FROM instruction missing image name at line "
-        Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
         proc add_dockerfile_validation_error with analyzer, error
         Return
     End If
 
-    Let image_ref be proc get from List with args, 0
+    Let image_ref be proc list_get from List with args, 0
     proc validate_image_reference with analyzer, image_ref, line_number
 
     Note: Check for stage name in multi-stage builds
     If arg_count is greater than 2:
-        Let as_keyword be proc get from List with args, 1
-        Let stage_name be proc get from List with args, 2
+        Let as_keyword be proc list_get from List with args, 1
+        Let stage_name be proc list_get from List with args, 2
 
         Let is_as be proc string_equals from StringCore with as_keyword, "AS"
         If is_as is equal to 1:
             proc register_build_stage with analyzer, stage_name
         Otherwise:
-            Set error to "Invalid FROM syntax, expected AS keyword at line "
-            Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
-            proc add_dockerfile_validation_error with analyzer, error
+            Let error2 be "Invalid FROM syntax, expected AS keyword at line "
+            Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+            Set error2 to proc string_concat from StringPrim with error2, line_label2
+            proc add_dockerfile_validation_error with analyzer, error2
         End If
+    End If
+End Process
+
+@Reasoning:
+Validates the image reference string itself: it must be a non-empty
+identifier. Docker rejects FROM lines whose image is blank or whitespace,
+so an empty reference is a hard validation error keyed to the source line.
+@End Reasoning
+
+@Implementation:
+Tests image_ref for non-emptiness via string_is_nonempty. On empty, builds
+"FROM instruction has empty image reference at line <n+1>" and adds it to
+validation_errors. A populated reference passes silently; tag/latest policy
+is enforced later in check_base_image_best_practices.
+@End Implementation
+
+Process called "validate_image_reference" takes analyzer as Integer, image_ref as Integer, line_number as Integer:
+    Note: Validate the FROM image reference is present
+
+    Let present be string_is_nonempty with image_ref
+    If present is equal to 0:
+        Let error be "FROM instruction has empty image reference at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+    End If
+End Process
+
+@Reasoning:
+Registers a named build stage by appending the stage name onto the
+analyzer's stages list (offset 8). This is the canonical record of stage
+names that check_unused_stages and the dependency walks consult.
+@End Reasoning
+
+@Implementation:
+Reads the stages list at offset 8 and appends stage_name when it is a
+non-empty handle.
+@End Implementation
+
+Process called "register_build_stage" takes analyzer as Integer, stage_name as Integer:
+    Note: Record a named multi-stage build stage
+
+    Let present be string_is_nonempty with stage_name
+    If present is equal to 1:
+        Let stages be proc memory_get_int64 from Layout with analyzer, 8
+        proc list_append from List with stages, stage_name
     End If
 End Process
 
@@ -440,42 +846,37 @@ End Process
 RUN creates a new image layer by executing a shell or exec-form command
 at build time, so it has three concerns: syntactic validity, security
 implications (running unauthenticated `curl | sh` or installing packages
-without GPG verification are well-known attack surfaces), and layer-
-cost implications (every RUN adds a layer; combining them with `&&`
-reduces image size). The layer_count counter is bumped here so that
-analyze_layer_optimization can detect when too many separate RUN
-layers exist.
+without verification are well-known attack surfaces), and layer-cost
+implications. The layer_count counter is bumped here so that
+analyze_layer_optimization can detect when too many RUN layers exist.
 @End Reasoning
 
 @Implementation:
-Reads arg_count via List.size. If 0, adds "RUN instruction missing
+Reads arg_count via List.list_length. If 0, adds "RUN instruction missing
 command at line <n+1>" and returns. Reads command at args[0]. Calls
-check_run_security_patterns(analyzer, command, line_number) which
-scans for known anti-patterns. Calls
-analyze_run_layer_optimization(analyzer, command, line_number) which
-warns when commands could be combined. Reads layer_count at offset 80,
-increments and writes back - the analyser's tally for later phase 5.
+check_run_security_patterns and analyze_run_layer_optimization. Reads
+layer_count at offset 80, increments and writes back.
 @End Implementation
 
 @Security_Scope:
 Command string is untrusted input from the Dockerfile. The security
-pattern scanner here is best-effort heuristic; it should not be
-treated as a guarantee of safety - manual review remains required for
-production images.
+pattern scanner here is best-effort heuristic; manual review remains
+required for production images.
 @End Security_Scope
 
 Process called "validate_run_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate RUN instruction and analyze for security issues
 
-    Let arg_count be proc size from List with args
+    Let arg_count be proc list_length from List with args
     If arg_count is equal to 0:
         Let error be "RUN instruction missing command at line "
-        Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
         proc add_dockerfile_validation_error with analyzer, error
         Return
     End If
 
-    Let command be proc get from List with args, 0
+    Let command be proc list_get from List with args, 0
 
     Note: Check for security anti-patterns
     proc check_run_security_patterns with analyzer, command, line_number
@@ -489,50 +890,146 @@ Process called "validate_run_instruction" takes analyzer as Integer, args as Int
 End Process
 
 @Reasoning:
-COPY requires at least one source and exactly one destination - the LAST
-arg is always the destination, regardless of how many sources precede
-it. This shape (`COPY src1 src2 ... dest`) lets a single COPY layer
-bring in multiple files. We must validate each source/dest pair against
-security patterns (no copying credentials/keys/secrets into images) and
-also handle the multi-stage form `COPY --from=stage src dest` which is
-parsed but not specifically validated here (analyze_stage_dependencies
-catches stage-reference errors). Layer count bumps because each COPY is
-its own layer in Docker's storage driver.
+The two most damaging RUN anti-patterns are piping a remote download
+directly into a shell (`curl ... | sh` / `wget ... | sh`), which executes
+unverified code from the network during build, and using `sudo` inside a
+build where there is no interactive session. Both are surfaced as security
+issues rather than warnings because they directly weaken the container's
+trust boundary.
 @End Reasoning
 
 @Implementation:
-Reads arg_count. If < 2 (need at least source + dest), adds "COPY
-instruction requires source and destination at line <n+1>" and returns.
-Reads destination at args[arg_count-1]. Loops i in 0..arg_count-2:
-reads source at args[i], calls
-check_copy_security_patterns(analyzer, source, destination, line_number).
-Reads layer_count at offset 80, increments and persists.
+Returns immediately on an empty command. Scans the command for "curl" or
+"wget" co-occurring with a pipe-to-shell ("| sh" / "| bash"), and for a
+leading/embedded "sudo". Each match appends a line-qualified finding to
+security_issues (offset 88).
 @End Implementation
 
 @Security_Scope:
-Source paths originate from untrusted Dockerfile source. Pattern
-matching catches common credential-leak antipatterns (e.g. `.ssh/`,
-`.aws/`, `id_rsa`, `.env`) but is not exhaustive; explicit `.dockerignore`
-remains the authoritative defense.
+Pattern matching is substring-based and heuristic. It catches the common
+spellings but cannot detect obfuscated equivalents; treat as a hint, not
+a guarantee.
+@End Security_Scope
+
+Process called "check_run_security_patterns" takes analyzer as Integer, command as Integer, line_number as Integer:
+    Note: Scan a RUN command string for known security anti-patterns
+
+    Let present be string_is_nonempty with command
+    If present is equal to 0:
+        Return
+    End If
+
+    Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+    Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+
+    Let has_curl be proc string_contains from StringUtils with command, "curl"
+    Let has_wget be proc string_contains from StringUtils with command, "wget"
+    Let pipe_sh be proc string_contains from StringUtils with command, "| sh"
+    Let pipe_bash be proc string_contains from StringUtils with command, "| bash"
+    Let pipes_to_shell be 0
+    If pipe_sh is equal to 1:
+        Set pipes_to_shell to 1
+    End If
+    If pipe_bash is equal to 1:
+        Set pipes_to_shell to 1
+    End If
+
+    Let downloads be 0
+    If has_curl is equal to 1:
+        Set downloads to 1
+    End If
+    If has_wget is equal to 1:
+        Set downloads to 1
+    End If
+
+    If downloads is equal to 1 and pipes_to_shell is equal to 1:
+        Let issue be "Piping a remote download into a shell at line "
+        Set issue to proc string_concat from StringPrim with issue, line_label
+        proc list_append from List with security_issues, issue
+    End If
+
+    Let has_sudo be proc string_contains from StringUtils with command, "sudo"
+    If has_sudo is equal to 1:
+        Let issue2 be "Use of sudo in RUN command at line "
+        Set issue2 to proc string_concat from StringPrim with issue2, line_label
+        proc list_append from List with security_issues, issue2
+    End If
+End Process
+
+@Reasoning:
+A single RUN that chains multiple `apt-get`/package operations with `&&`
+across many sub-commands is already optimal; but a RUN that runs a package
+install without a matching cache-clean leaves the package index baked into
+the layer. We flag `apt-get install` that lacks a `rm -rf /var/lib/apt`
+cleanup as a size-optimization opportunity.
+@End Reasoning
+
+@Implementation:
+Returns on empty command. If the command contains "apt-get install" but
+not "rm -rf /var/lib/apt/lists", appends a line-qualified hint to
+optimization_warnings (offset 96).
+@End Implementation
+
+Process called "analyze_run_layer_optimization" takes analyzer as Integer, command as Integer, line_number as Integer:
+    Note: Detect package-install RUNs that omit cache cleanup
+
+    Let present be string_is_nonempty with command
+    If present is equal to 0:
+        Return
+    End If
+
+    Let installs be proc string_contains from StringUtils with command, "apt-get install"
+    If installs is equal to 1:
+        Let cleans be proc string_contains from StringUtils with command, "rm -rf /var/lib/apt/lists"
+        If cleans is equal to 0:
+            Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+            Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+            Let warning be "apt-get install without apt-list cleanup bloats the layer at line "
+            Set warning to proc string_concat from StringPrim with warning, line_label
+            proc list_append from List with optimization_warnings, warning
+        End If
+    End If
+End Process
+
+@Reasoning:
+COPY requires at least one source and exactly one destination - the LAST
+arg is always the destination. This shape (`COPY src1 src2 ... dest`) lets
+a single COPY layer bring in multiple files. We validate each source
+against credential-leak patterns and bump the layer count.
+@End Reasoning
+
+@Implementation:
+Reads arg_count. If < 2, adds "COPY instruction requires source and
+destination at line <n+1>" and returns. Reads destination at
+args[arg_count-1]. Loops i in 0..arg_count-2: reads source at args[i],
+calls check_copy_security_patterns. Reads layer_count at offset 80,
+increments and persists.
+@End Implementation
+
+@Security_Scope:
+Source paths originate from untrusted Dockerfile source. Pattern matching
+catches common credential-leak antipatterns but is not exhaustive;
+explicit `.dockerignore` remains the authoritative defense.
 @End Security_Scope
 
 Process called "validate_copy_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate COPY instruction syntax and paths
 
-    Let arg_count be proc size from List with args
+    Let arg_count be proc list_length from List with args
     If arg_count is less than 2:
         Let error be "COPY instruction requires source and destination at line "
-        Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
         proc add_dockerfile_validation_error with analyzer, error
         Return
     End If
 
-    Let destination be proc get from List with args, arg_count minus 1
+    Let destination be proc list_get from List with args, arg_count minus 1
 
     Note: Check for security issues in paths
     Let i be 0
     While i is less than arg_count minus 1:
-        Let source be proc get from List with args, i
+        Let source be proc list_get from List with args, i
         proc check_copy_security_patterns with analyzer, source, destination, line_number
         Set i to i plus 1
     End While
@@ -543,18 +1040,119 @@ Process called "validate_copy_instruction" takes analyzer as Integer, args as In
 End Process
 
 @Reasoning:
-EXPOSE declares container-facing ports; we must reject empty arg lists and
-non-numeric/out-of-range port specs so downstream tooling (compose, runtime
-port maps) never receives a malformed declaration. Valid specs are appended
-to the analyzer's exposed_ports list at offset 16 for later aggregation.
+Copying host credential material into an image layer permanently embeds the
+secret in the image's history even if a later layer deletes it. The well-
+known offenders are SSH keys (`.ssh`, `id_rsa`), cloud credentials
+(`.aws`), and dotenv files (`.env`). Catching these at the source path is
+the syntactic-side defense complementing `.dockerignore`.
 @End Reasoning
 
 @Implementation:
-After confirming at least one arg, walks args via List.size/get, delegating
-each entry to validate_port_specification (which handles single and
-PORT/PROTO forms). Valid entries are added to the analyzer's exposed_ports
-list (offset 16); invalid ones generate a validation error pointing to the
-1-based line number.
+Returns on an empty source. Scans the source path for ".ssh", "id_rsa",
+".aws", and ".env"; any match appends a line-qualified credential-leak
+finding to security_issues (offset 88).
+@End Implementation
+
+@Security_Scope:
+Substring matching only - a path that references a secret by an unusual
+name will not be caught. Defense in depth with `.dockerignore` is required.
+@End Security_Scope
+
+Process called "check_copy_security_patterns" takes analyzer as Integer, source as Integer, destination as Integer, line_number as Integer:
+    Note: Scan a COPY source path for credential-leak antipatterns
+
+    Let present be string_is_nonempty with source
+    If present is equal to 0:
+        Return
+    End If
+
+    Let ssh_dir be proc string_contains from StringUtils with source, ".ssh"
+    Let id_rsa be proc string_contains from StringUtils with source, "id_rsa"
+    Let aws_dir be proc string_contains from StringUtils with source, ".aws"
+    Let dotenv be proc string_contains from StringUtils with source, ".env"
+
+    Let leaks be 0
+    If ssh_dir is equal to 1:
+        Set leaks to 1
+    End If
+    If id_rsa is equal to 1:
+        Set leaks to 1
+    End If
+    If aws_dir is equal to 1:
+        Set leaks to 1
+    End If
+    If dotenv is equal to 1:
+        Set leaks to 1
+    End If
+
+    If leaks is equal to 1:
+        Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Let issue be "COPY of credential-shaped path '"
+        Set issue to proc string_concat from StringPrim with issue, source
+        Set issue to proc string_concat from StringPrim with issue, "' at line "
+        Set issue to proc string_concat from StringPrim with issue, line_label
+        proc list_append from List with security_issues, issue
+    End If
+End Process
+
+@Reasoning:
+ADD is COPY with extra (URL fetch, auto-extract) powers, and Docker best
+practice recommends COPY unless those powers are needed. We validate the
+same source/dest arity, run the same credential-leak scan on sources, bump
+the layer count, and additionally emit a best-practice warning recommending
+COPY where ADD's special behaviour is not required.
+@End Reasoning
+
+@Implementation:
+Reads arg_count. If < 2, adds the source-and-destination error and returns.
+Reads destination at args[arg_count-1]. Loops sources 0..arg_count-2 running
+check_copy_security_patterns. Appends an "ADD instead of COPY" advisory to
+optimization_warnings, then increments layer_count.
+@End Implementation
+
+Process called "validate_add_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate ADD instruction syntax and recommend COPY where possible
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is less than 2:
+        Let error be "ADD instruction requires source and destination at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let destination be proc list_get from List with args, arg_count minus 1
+    Let i be 0
+    While i is less than arg_count minus 1:
+        Let source be proc list_get from List with args, i
+        proc check_copy_security_patterns with analyzer, source, destination, line_number
+        Set i to i plus 1
+    End While
+
+    Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+    Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+    Let warning be "Prefer COPY over ADD unless URL fetch or auto-extract is required at line "
+    Set warning to proc string_concat from StringPrim with warning, line_label2
+    proc list_append from List with optimization_warnings, warning
+
+    Let current_layers be proc memory_get_int64 from Layout with analyzer, 80
+    proc memory_set_int64 from Layout with analyzer, 80, current_layers plus 1
+End Process
+
+@Reasoning:
+EXPOSE declares container-facing ports; we must reject empty arg lists and
+non-numeric/out-of-range port specs so downstream tooling never receives a
+malformed declaration. Valid specs are appended to the analyzer's
+exposed_ports list at offset 16 for later aggregation.
+@End Reasoning
+
+@Implementation:
+After confirming at least one arg, walks args via List.list_length/list_get,
+delegating each entry to validate_port_specification. Valid entries are
+added to the analyzer's exposed_ports list (offset 16); invalid ones
+generate a validation error pointing to the 1-based line number.
 @End Implementation
 
 @Security_Scope:
@@ -565,10 +1163,11 @@ outside 1..65535 to prevent passing bogus port specs to runtime tooling.
 Process called "validate_expose_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
     Note: Validate EXPOSE instruction and track exposed ports
 
-    Let arg_count be proc size from List with args
+    Let arg_count be proc list_length from List with args
     If arg_count is equal to 0:
         Let error be "EXPOSE instruction missing port number at line "
-        Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
         proc add_dockerfile_validation_error with analyzer, error
         Return
     End If
@@ -577,21 +1176,373 @@ Process called "validate_expose_instruction" takes analyzer as Integer, args as 
     Let i be 0
 
     While i is less than arg_count:
-        Let port_spec be proc get from List with args, i
-        Let is_valid_port be proc validate_port_specification from port_spec
+        Let port_spec be proc list_get from List with args, i
+        Let is_valid_port be proc validate_port_specification with port_spec
 
         If is_valid_port is equal to 1:
-            proc add from List with exposed_ports, port_spec
+            proc list_append from List with exposed_ports, port_spec
         Otherwise:
-            Set error to "Invalid port specification '"
-            Set error to proc string_concat from StringCore with error, port_spec
-            Set error to proc string_concat from StringCore with error, "' at line "
-            Set error to proc string_concat from StringCore with error, proc int_to_string from StringCore with line_number plus 1
-            proc add_dockerfile_validation_error with analyzer, error
+            Let error2 be "Invalid port specification '"
+            Set error2 to proc string_concat from StringPrim with error2, port_spec
+            Set error2 to proc string_concat from StringPrim with error2, "' at line "
+            Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+            Set error2 to proc string_concat from StringPrim with error2, line_label2
+            proc add_dockerfile_validation_error with analyzer, error2
         End If
 
         Set i to i plus 1
     End While
+End Process
+
+@Reasoning:
+ENV declares runtime environment variables. The most important syntactic
+check is that the instruction declares at least one variable; beyond that,
+ENV values that look like secrets (containing PASSWORD/SECRET/TOKEN/KEY in
+the key) are surfaced as security issues because they bake credentials into
+the image environment.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "ENV instruction missing variable at line <n+1>".
+The argument list carries the variable key(s)/value(s); each entry is
+scanned for credential-shaped key names and surfaced to security_issues
+(offset 88) when matched.
+@End Implementation
+
+Process called "validate_env_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate ENV instruction and flag secret-shaped variables
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "ENV instruction missing variable at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+    Let i be 0
+    While i is less than arg_count:
+        Let entry be proc list_get from List with args, i
+        Let has_pw be proc string_contains from StringUtils with entry, "PASSWORD"
+        Let has_secret be proc string_contains from StringUtils with entry, "SECRET"
+        Let has_token be proc string_contains from StringUtils with entry, "TOKEN"
+        Let secretish be 0
+        If has_pw is equal to 1:
+            Set secretish to 1
+        End If
+        If has_secret is equal to 1:
+            Set secretish to 1
+        End If
+        If has_token is equal to 1:
+            Set secretish to 1
+        End If
+        If secretish is equal to 1:
+            Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+            Let issue be "ENV defines a credential-shaped variable at line "
+            Set issue to proc string_concat from StringPrim with issue, line_label2
+            proc list_append from List with security_issues, issue
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+WORKDIR sets the working directory for subsequent instructions. Docker best
+practice requires an absolute path; a relative WORKDIR resolves against the
+previous WORKDIR and is a frequent source of surprise. We require a present
+path and warn when it is not absolute.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "WORKDIR instruction missing path at line <n+1>".
+Otherwise reads args[0]; if its first byte is not '/' (ASCII 47), appends a
+relative-path advisory to optimization_warnings (offset 96).
+@End Implementation
+
+Process called "validate_workdir_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate WORKDIR instruction and require absolute paths
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "WORKDIR instruction missing path at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let path be proc list_get from List with args, 0
+    Let path_len be proc string_length from StringCore with path
+    If path_len is greater than 0:
+        Let first_char be proc string_char_at from StringCore with path, 0
+        If first_char is not equal to 47:  Note: '/'
+            Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+            Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+            Let warning be "WORKDIR should use an absolute path at line "
+            Set warning to proc string_concat from StringPrim with warning, line_label2
+            proc list_append from List with optimization_warnings, warning
+        End If
+    End If
+End Process
+
+@Reasoning:
+USER selects the runtime user. Beyond syntactic presence, declaring root
+explicitly (`USER root` / `USER 0`) is the canonical privilege-escalation
+risk; we flag it here so the finding is line-qualified, complementing the
+whole-file final-user analysis in check_user_privileges.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "USER instruction missing user at line <n+1>".
+Otherwise reads args[0]; if it equals "root" or "0", appends a line-
+qualified root-user finding to security_issues (offset 88).
+@End Implementation
+
+Process called "validate_user_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate USER instruction and flag explicit root
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "USER instruction missing user at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let user be proc list_get from List with args, 0
+    Let is_root be proc string_equals from StringCore with user, "root"
+    Let is_zero be proc string_equals from StringCore with user, "0"
+    If is_root is equal to 1 or is_zero is equal to 1:
+        Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+        Let line_label2 be proc integer_to_string from StringPrim with line_number plus 1
+        Let issue be "USER explicitly set to root at line "
+        Set issue to proc string_concat from StringPrim with issue, line_label2
+        proc list_append from List with security_issues, issue
+    End If
+End Process
+
+@Reasoning:
+VOLUME declares one or more mount points. The only structural requirement is
+that at least one path is present; an empty VOLUME is a syntax error. Valid
+paths are recorded into the analyzer's volumes registry for downstream
+reporting.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "VOLUME instruction missing path at line <n+1>".
+Otherwise walks every path and appends it to the volumes list (offset 32).
+@End Implementation
+
+Process called "validate_volume_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate VOLUME instruction and record mount points
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "VOLUME instruction missing path at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let volumes be proc memory_get_int64 from Layout with analyzer, 32
+    Let i be 0
+    While i is less than arg_count:
+        Let path be proc list_get from List with args, i
+        proc list_append from List with volumes, path
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+LABEL attaches metadata key/value pairs. A LABEL with no pairs is a syntax
+error. Each declared key is recorded into the analyzer's labels registry so
+check_metadata_completeness can later confirm that provenance metadata is
+present.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "LABEL instruction missing key-value pair at line
+<n+1>". Otherwise appends every label entry to the labels list (offset 56).
+@End Implementation
+
+Process called "validate_label_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate LABEL instruction and record metadata keys
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "LABEL instruction missing key-value pair at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let labels be proc memory_get_int64 from Layout with analyzer, 56
+    Let i be 0
+    While i is less than arg_count:
+        Let entry be proc list_get from List with args, i
+        proc list_append from List with labels, entry
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+ARG declares a build-time variable. It must name a variable; a nameless ARG
+is a syntax error. Each declared name is recorded into the args registry so
+the metadata audit can recognise build-arg usage.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "ARG instruction missing name at line <n+1>".
+Otherwise appends every argument entry to the args list (offset 64).
+@End Implementation
+
+Process called "validate_arg_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate ARG instruction and record build-arg names
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "ARG instruction missing name at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+        Return
+    End If
+
+    Let args_registry be proc memory_get_int64 from Layout with analyzer, 64
+    Let i be 0
+    While i is less than arg_count:
+        Let entry be proc list_get from List with args, i
+        proc list_append from List with args_registry, entry
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+CMD supplies the default container command. An empty CMD is unusual but not
+strictly illegal (an image may rely on ENTRYPOINT); however a missing
+command makes the instruction meaningless, so we warn rather than error.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, appends "CMD instruction has no command at line <n+1>"
+to validation_warnings. Otherwise the instruction is well-formed and no
+diagnostic is emitted.
+@End Implementation
+
+Process called "validate_cmd_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate CMD instruction presence
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let warning be "CMD instruction has no command at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set warning to proc string_concat from StringPrim with warning, line_label
+        proc add_dockerfile_validation_warning with analyzer, warning
+    End If
+End Process
+
+@Reasoning:
+ENTRYPOINT defines the fixed executable for the container. A missing
+command is a hard error because, unlike CMD, an ENTRYPOINT with no
+executable cannot launch anything.
+@End Reasoning
+
+@Implementation:
+If arg_count is 0, adds "ENTRYPOINT instruction missing command at line
+<n+1>" to validation_errors. Otherwise it is well-formed.
+@End Implementation
+
+Process called "validate_entrypoint_instruction" takes analyzer as Integer, args as Integer, line_number as Integer:
+    Note: Validate ENTRYPOINT instruction presence
+
+    Let arg_count be proc list_length from List with args
+    If arg_count is equal to 0:
+        Let error be "ENTRYPOINT instruction missing command at line "
+        Let line_label be proc integer_to_string from StringPrim with line_number plus 1
+        Set error to proc string_concat from StringPrim with error, line_label
+        proc add_dockerfile_validation_error with analyzer, error
+    End If
+End Process
+
+@Reasoning:
+After per-instruction validation, the structure pass collects each
+instruction's salient value into the analyzer's registries so that whole-
+file phases (base-image policy, metadata audit) can operate on aggregated
+data without re-walking the AST. FROM image references land in base_images;
+that is the registry check_base_image_best_practices and validate_base_images
+consume.
+@End Reasoning
+
+@Implementation:
+Reads instruction_type. For FROM, reads the image reference at node offset 8
+and appends it to base_images (offset 0) when present. Other instruction
+kinds have already routed their data through their validators
+(ENV/LABEL/ARG/VOLUME registries), so they need no additional collection
+here.
+@End Implementation
+
+Process called "collect_instruction_info" takes analyzer as Integer, instruction as Integer:
+    Note: Aggregate per-instruction data into the analyzer registries
+
+    If instruction is equal to 0:
+        Return
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with instruction, 0
+    If node_type is equal to NODE_FROM:
+        Let image be proc memory_get_int64 from Layout with instruction, 8
+        Let present be string_is_nonempty with image
+        If present is equal to 1:
+            Let base_images be proc memory_get_int64 from Layout with analyzer, 0
+            proc list_append from List with base_images, image
+        End If
+    End If
+End Process
+
+@Reasoning:
+Whole-file requirement check: every Dockerfile must contain at least one
+FROM instruction, and FROM must precede any non-ARG instruction. This proc
+verifies the FROM presence requirement over the full instruction list so
+that even a Dockerfile whose first instruction is FROM-less is reported.
+@End Reasoning
+
+@Implementation:
+Reads the instruction list. Walks it counting FROM occurrences. If zero
+FROM instructions exist, adds "Dockerfile must contain at least one FROM
+instruction" to validation_errors. (FROM-ordering is enforced separately
+by validate_from_instruction_placement.)
+@End Implementation
+
+Process called "validate_required_instructions" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Ensure the Dockerfile declares the mandatory FROM instruction
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        proc add_dockerfile_validation_error with analyzer, "Dockerfile must contain at least one FROM instruction"
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let from_count be 0
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let instruction_type be proc get_instruction_type with instruction
+        Let is_from be proc string_equals from StringCore with instruction_type, "FROM"
+        If is_from is equal to 1:
+            Set from_count to from_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    If from_count is equal to 0:
+        proc add_dockerfile_validation_error with analyzer, "Dockerfile must contain at least one FROM instruction"
+    End If
 End Process
 
 Note: ===================================================================
@@ -599,26 +1550,18 @@ Note: BUILD STAGE ANALYSIS
 Note: ===================================================================
 
 @Reasoning:
-Phase 2 builds the stage dependency graph by running four sub-analyses
-in fixed order: identify_build_stages populates analyzer.stages (must
-run first - everything else reads from this list), analyze_stage_dependencies
-walks COPY --from references to construct the dependency edges,
-check_unused_stages flags stages that no later stage references (waste of
-build time), validate_stage_references catches forward references and
-self-references which Docker treats as errors. The ordering is strict:
-references can't be validated until the stage set is known, and unused-
-stage detection needs the dependency graph already built.
+Phase 2 builds the stage dependency graph by running four sub-analyses in
+fixed order: identify_build_stages populates analyzer.stages (must run first),
+analyze_stage_dependencies walks COPY --from references, check_unused_stages
+flags stages no later COPY references, validate_stage_references catches
+references to undeclared stages. The ordering is strict: references can't be
+validated until the stage set is known.
 @End Reasoning
 
 @Implementation:
-Calls four procs in sequence:
-identify_build_stages(analyzer, dockerfile_ast) which populates the
-stages List (offset 8) from FROM instructions with optional AS clauses;
-analyze_stage_dependencies(analyzer, dockerfile_ast) which walks COPY
---from to add edges; check_unused_stages(analyzer) which is registry-
-only (no ast); validate_stage_references(analyzer, dockerfile_ast).
-No return value - results flow into the analyzer's security_issues and
-optimization_warnings lists.
+Calls four procs in sequence: identify_build_stages, analyze_stage_dependencies,
+check_unused_stages (registry + ast), validate_stage_references. No return
+value - results flow into security_issues and optimization_warnings.
 @End Implementation
 
 Process called "analyze_build_stages" takes analyzer as Integer, dockerfile_ast as Integer:
@@ -626,52 +1569,51 @@ Process called "analyze_build_stages" takes analyzer as Integer, dockerfile_ast 
 
     proc identify_build_stages with analyzer, dockerfile_ast
     proc analyze_stage_dependencies with analyzer, dockerfile_ast
-    proc check_unused_stages from analyzer
+    proc check_unused_stages with analyzer, dockerfile_ast
     proc validate_stage_references with analyzer, dockerfile_ast
 End Process
 
 @Reasoning:
 Multi-stage builds are recognised by FROM <image> [AS <name>] occurrences;
-this pass populates analyzer.stages (offset 8) with one entry per FROM so
-later passes can validate stage references and detect unused stages. Unnamed
-FROMs receive a synthetic "stage<N>" label so downstream graph code can
-treat every stage uniformly.
+this pass records the explicit stage names already registered by
+register_build_stage and ensures the stages list reflects every named stage,
+giving later passes a complete name set to validate references against.
 @End Reasoning
 
 @Implementation:
-Walks the instruction list once. For each FROM with arg_count > 2 (image
-plus AS plus name), pushes args[2] onto the stages list; otherwise pushes
-"stage" concatenated with the running stage_count. stage_count is local —
-the list itself is the durable record.
+Walks the instruction list. For each FROM whose argument list yields a stage
+name (arg_count > 2 with args[1] == "AS"), appends args[2] to the stages
+list (offset 8) if not already present. Anonymous stages are not named here -
+only referenceable named stages matter for reference validation.
 @End Implementation
 
 Process called "identify_build_stages" takes analyzer as Integer, dockerfile_ast as Integer:
-    Note: Identify all build stages in the Dockerfile
+    Note: Identify all named build stages in the Dockerfile
 
-    Let instructions be proc get_dockerfile_instructions from dockerfile_ast
-    Let instruction_count be proc size from List with instructions
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
     Let stages be proc memory_get_int64 from Layout with analyzer, 8
-    Let stage_count be 0
     Let i be 0
 
     While i is less than instruction_count:
-        Let instruction be proc get from List with instructions, i
-        Let instruction_type be proc get_instruction_type from instruction
+        Let instruction be proc list_get from List with instructions, i
+        Let instruction_type be proc get_instruction_type with instruction
 
         Let is_from be proc string_equals from StringCore with instruction_type, "FROM"
         If is_from is equal to 1:
-            Let args be proc get_instruction_arguments from instruction
-            Let arg_count be proc size from List with args
+            Let args be proc get_instruction_arguments with instruction
+            Let arg_count be proc list_length from List with args
 
             If arg_count is greater than 2:
-                Let stage_name be proc get from List with args, 2
-                proc add from List with stages, stage_name
-                Set stage_count to stage_count plus 1
-            Otherwise:
-                Note: Unnamed stage
-                Let default_name be proc string_concat from StringCore with "stage", proc int_to_string from StringCore with stage_count
-                proc add from List with stages, default_name
-                Set stage_count to stage_count plus 1
+                Let stage_name be proc list_get from List with args, 2
+                Let already be proc list_contains_string with stages, stage_name
+                If already is equal to 0:
+                    proc list_append from List with stages, stage_name
+                End If
             End If
         End If
 
@@ -680,46 +1622,255 @@ Process called "identify_build_stages" takes analyzer as Integer, dockerfile_ast
 End Process
 
 @Reasoning:
-Cross-stage COPY references (`COPY --from=stage_name src dest`) are the
-only way one Docker stage references another, so this dependency walk
-focuses exclusively on COPY instructions. The current_stage counter
-starts at 0 and bumps on each FROM, giving each instruction a known
-home stage. Stage dependencies flow backwards in source order: a COPY
-in stage N can reference stage M only if M < N. The detector here
-counts FROM occurrences to maintain current_stage, and dispatches each
-COPY to analyze_copy_stage_dependency which actually examines the
---from argument.
+A reusable membership test over a list of string handles. Several stage
+passes need "does this list already contain this name" semantics; centralising
+it avoids duplicate inline loops and keeps the comparison (string_equals)
+consistent.
 @End Reasoning
 
 @Implementation:
-Reads instructions list and its count. Initialises current_stage=0 and
-i=0. Loops: reads instruction at index i and its instruction_type. If
-type equals "FROM", bumps current_stage by 1. Otherwise tests for "COPY";
-if matched, calls analyze_copy_stage_dependency(analyzer, instruction,
-current_stage). Other types are skipped (they can't reference stages).
-The current_stage value is local because we just need the running index,
-not a persistent state.
+Walks the list comparing each element to needle via string_equals; returns 1
+on the first match, 0 if the walk completes without a hit. Null list returns 0.
+@End Implementation
+
+Process called "list_contains_string" takes lst as Integer, needle as Integer returns Integer:
+    Note: Return 1 if lst contains a string equal to needle
+
+    If lst is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with lst
+    Let i be 0
+    While i is less than count:
+        Let element be proc list_get from List with lst, i
+        Let same be proc string_equals from StringCore with element, needle
+        If same is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Cross-stage COPY references (`COPY --from=stage src dest`) are the only way
+one Docker stage references another. This walk records which named stages
+are actually referenced by collecting the --from values into a per-call
+referenced set, then is consumed by check_unused_stages. Here we simply
+validate that any referenced stage name exists in the stage set; a reference
+to an undeclared stage is recorded as a security/integrity issue.
+@End Reasoning
+
+@Implementation:
+Walks instructions. For each COPY node, reads the from_stage field at COPY
+offset 24; if non-empty and not a numeric external-image index, checks it
+against the stages list. A reference to an unknown stage name appends a
+finding to security_issues (offset 88).
 @End Implementation
 
 Process called "analyze_stage_dependencies" takes analyzer as Integer, dockerfile_ast as Integer:
-    Note: Analyze dependencies between build stages
+    Note: Validate COPY --from stage references resolve to declared stages
 
-    Let instructions be proc get_dockerfile_instructions from dockerfile_ast
-    Let instruction_count be proc size from List with instructions
-    Let current_stage be 0
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let stages be proc memory_get_int64 from Layout with analyzer, 8
     Let i be 0
 
     While i is less than instruction_count:
-        Let instruction be proc get from List with instructions, i
-        Let instruction_type be proc get_instruction_type from instruction
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
 
-        Let is_from be proc string_equals from StringCore with instruction_type, "FROM"
-        If is_from is equal to 1:
-            Set current_stage to current_stage plus 1
-        Otherwise:
-            Let is_copy be proc string_equals from StringCore with instruction_type, "COPY"
-            If is_copy is equal to 1:
-                proc analyze_copy_stage_dependency with analyzer, instruction, current_stage
+        If node_type is equal to NODE_COPY:
+            Let from_stage be proc memory_get_int64 from Layout with instruction, 24
+            Let present be string_is_nonempty with from_stage
+            If present is equal to 1:
+                Let is_numeric be all_digits with from_stage
+                If is_numeric is equal to 0:
+                    Let known be proc list_contains_string with stages, from_stage
+                    If known is equal to 0:
+                        Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+                        Let issue be proc string_concat from StringPrim with "COPY --from references unknown stage: ", from_stage
+                        proc list_append from List with security_issues, issue
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A predicate distinguishing a numeric COPY --from index (e.g. `--from=0`,
+a valid reference to the Nth prior stage or an external image) from a named
+stage reference. Numeric forms are always legal and must not trip the
+unknown-stage check.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null/empty handle. Otherwise scans every byte; returns 0 on
+the first non-digit (ASCII 48..57), else 1.
+@End Implementation
+
+Process called "all_digits" takes value as Integer returns Integer:
+    Note: True when value is a non-empty all-digit string
+
+    Let present be string_is_nonempty with value
+    If present is equal to 0:
+        Return 0
+    End If
+
+    Let length be proc string_length from StringCore with value
+    Let i be 0
+    While i is less than length:
+        Let char be proc string_char_at from StringCore with value, i
+        If char is less than 48 or char is greater than 57:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A multi-stage build that declares a named stage which no later instruction
+ever references (via `COPY --from=<name>` or `FROM <name>`) is wasted build
+time and image-graph bloat. This pass cross-references the declared stage set
+against the set of stages actually referenced; any declared-but-unreferenced
+stage produces an optimization warning.
+@End Reasoning
+
+@Implementation:
+Builds the referenced-name set by walking instructions: every COPY's
+from_stage (offset 24) and every FROM whose image equals a declared stage
+name (stage-as-base reuse) contributes a reference. Then walks the declared
+stages list (offset 8); each stage name absent from the referenced set
+appends an "unused stage" advisory to optimization_warnings (offset 96).
+@End Implementation
+
+Process called "check_unused_stages" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Warn on declared multi-stage build stages that are never referenced
+
+    Let stages be proc memory_get_int64 from Layout with analyzer, 8
+    If stages is equal to 0:
+        Return
+    End If
+
+    Let stage_count be proc list_length from List with stages
+    If stage_count is less than 2:
+        Note: Single-stage (or no named stages) builds cannot have unused stages
+        Return
+    End If
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+    Let instruction_count be proc list_length from List with instructions
+
+    Note: Collect the set of referenced stage names
+    Let referenced be proc list_create from List
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        If node_type is equal to NODE_COPY:
+            Let from_stage be proc memory_get_int64 from Layout with instruction, 24
+            Let copy_present be string_is_nonempty with from_stage
+            If copy_present is equal to 1:
+                proc list_append from List with referenced, from_stage
+            End If
+        End If
+
+        If node_type is equal to NODE_FROM:
+            Let from_image be proc memory_get_int64 from Layout with instruction, 8
+            Let image_is_stage be proc list_contains_string with stages, from_image
+            If image_is_stage is equal to 1:
+                proc list_append from List with referenced, from_image
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: The last declared stage is the build target and is implicitly used
+    Let last_index be stage_count minus 1
+    Let target_stage be proc list_get from List with stages, last_index
+    proc list_append from List with referenced, target_stage
+
+    Note: Report each declared stage absent from the referenced set
+    Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+    Let s be 0
+    While s is less than stage_count:
+        Let stage_name be proc list_get from List with stages, s
+        Let used be proc list_contains_string with referenced, stage_name
+        If used is equal to 0:
+            Let warning be proc string_concat from StringPrim with "Unused build stage: ", stage_name
+            proc list_append from List with optimization_warnings, warning
+        End If
+        Set s to s plus 1
+    End While
+End Process
+
+@Reasoning:
+Final stage-graph integrity check: a COPY --from that names a stage which is
+declared LATER in the file (a forward reference) is illegal in Docker because
+a stage can only copy from stages already built. This pass tracks the set of
+stages declared so far and flags any COPY --from to a name not yet declared
+as a hard validation error.
+@End Reasoning
+
+@Implementation:
+Maintains a declared-so-far set. Walks instructions in order: a FROM with a
+stage name adds that name to the set; a COPY whose from_stage is a non-
+numeric name not in the declared-so-far set produces a forward-reference
+validation error.
+@End Implementation
+
+Process called "validate_stage_references" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Reject forward references in COPY --from across build stages
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let declared_so_far be proc list_create from List
+    Let i be 0
+
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        If node_type is equal to NODE_FROM:
+            Let stage_name be proc memory_get_int64 from Layout with instruction, 32
+            Let name_present be string_is_nonempty with stage_name
+            If name_present is equal to 1:
+                proc list_append from List with declared_so_far, stage_name
+            End If
+        End If
+
+        If node_type is equal to NODE_COPY:
+            Let from_stage be proc memory_get_int64 from Layout with instruction, 24
+            Let from_present be string_is_nonempty with from_stage
+            If from_present is equal to 1:
+                Let is_numeric be all_digits with from_stage
+                If is_numeric is equal to 0:
+                    Let declared be proc list_contains_string with declared_so_far, from_stage
+                    If declared is equal to 0:
+                        Let error be proc string_concat from StringPrim with "COPY --from references a stage not yet declared: ", from_stage
+                        proc add_dockerfile_validation_error with analyzer, error
+                    End If
+                End If
             End If
         End If
 
@@ -732,30 +1883,24 @@ Note: SECURITY ANALYSIS
 Note: ===================================================================
 
 @Reasoning:
-Phase 4 runs four orthogonal security sub-checks: user privileges
-(detecting root-running containers, the #1 container security CWE),
-sensitive data exposure (catching secrets baked into image layers via
-ENV or COPY), package security (insecure download/install patterns),
-and general best-practice security policy (e.g., no SETUID binaries,
-no curl-to-bash piping). Each sub-check is independent so they can run
-in any order; we chose this order because user privileges and sensitive
-data are the highest-frequency issues in CVE reports.
+Phase 4 runs four orthogonal security sub-checks: user privileges (detecting
+root-running containers), sensitive data exposure (catching secrets baked
+into image layers via ENV or COPY), package security (insecure download/
+install patterns), and general best-practice security policy. Each is
+independent so they can run in any order.
 @End Reasoning
 
 @Implementation:
-Calls four sub-checks sequentially: check_user_privileges (scans for
-USER instructions), check_sensitive_data_exposure (walks COPY, ENV,
-LABEL for credential-shaped strings), check_package_security (scans
-RUN commands for unsafe package-manager invocations),
-validate_security_best_practices (the policy aggregator). All findings
-flow into analyzer.security_issues (offset 88). No return value.
+Calls four sub-checks sequentially: check_user_privileges,
+check_sensitive_data_exposure, check_package_security,
+validate_security_best_practices. All findings flow into
+analyzer.security_issues (offset 88).
 @End Implementation
 
 @Security_Scope:
 This phase is the primary defense against image security issues found
-post-build. The checks here are pattern-based and best-effort;
-production deployments must additionally run dedicated scanners
-(Trivy, Grype, etc.) against the built image.
+post-build. The checks here are pattern-based and best-effort; production
+deployments must additionally run dedicated scanners against the built image.
 @End Security_Scope
 
 Process called "analyze_dockerfile_security" takes analyzer as Integer, dockerfile_ast as Integer:
@@ -768,54 +1913,51 @@ Process called "analyze_dockerfile_security" takes analyzer as Integer, dockerfi
 End Process
 
 @Reasoning:
-Docker containers default to running as root (UID 0) if no USER
-instruction overrides it - and root inside a container has near-host
-privileges when combined with `--privileged` or volume mounts. This
-check walks the instruction list noting the most recent USER, and at
-the end determines whether the FINAL effective user is root (either
-"root" / "0" string match or no USER instruction at all). Only the
-LAST USER matters for the running container - intermediate USER changes
-during build are not the security concern; what runs in production is.
+Docker containers default to running as root (UID 0) if no USER instruction
+overrides it. This check walks the instruction list noting the most recent
+USER, and at the end determines whether the FINAL effective user is root
+(either "root"/"0" string match or no USER instruction at all). Only the
+LAST USER matters for the running container.
 @End Reasoning
 
 @Implementation:
 Initialises has_user_instruction=0, current_user="root", i=0. Loops
-instruction list: reads instruction_type, tests for "USER". On match
-sets has_user_instruction=1, reads instruction's args; if args has
-content, updates current_user to args[0]. After the loop, tests if
-current_user equals "root" OR has_user_instruction equals 0. Either
-condition adds "Container running as root user - security risk" to
-analyzer.security_issues (offset 88).
+instructions: on USER, sets has_user_instruction=1 and updates current_user
+from args[0] when present. After the loop, if current_user equals "root"/"0"
+OR has_user_instruction is 0, appends a root-user finding to security_issues
+(offset 88).
 @End Implementation
 
 @Security_Scope:
-Detection is string-comparison only - "root", "0", and "ROOT" are
-matched, but a hostile actor could craft `USER 0:0` or use numeric
-forms not caught by the simple match. This is a defense-in-depth
-hint, not a complete privilege analysis.
+Detection is string-comparison only; numeric forms like `0:0` are not
+caught. Defense-in-depth hint, not a complete privilege analysis.
 @End Security_Scope
 
 Process called "check_user_privileges" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Check for privilege escalation and root usage
 
-    Let instructions be proc get_dockerfile_instructions from dockerfile_ast
-    Let instruction_count be proc size from List with instructions
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
     Let has_user_instruction be 0
     Let current_user be "root"
     Let i be 0
 
     While i is less than instruction_count:
-        Let instruction be proc get from List with instructions, i
-        Let instruction_type be proc get_instruction_type from instruction
+        Let instruction be proc list_get from List with instructions, i
+        Let instruction_type be proc get_instruction_type with instruction
 
         Let is_user be proc string_equals from StringCore with instruction_type, "USER"
         If is_user is equal to 1:
             Set has_user_instruction to 1
-            Let args be proc get_instruction_arguments from instruction
-            Let arg_count be proc size from List with args
+            Let args be proc get_instruction_arguments with instruction
+            Let arg_count be proc list_length from List with args
 
             If arg_count is greater than 0:
-                Set current_user to proc get from List with args, 0
+                Set current_user to proc list_get from List with args, 0
             End If
         End If
 
@@ -824,10 +1966,297 @@ Process called "check_user_privileges" takes analyzer as Integer, dockerfile_ast
 
     Note: Check if running as root in final stage
     Let is_root be proc string_equals from StringCore with current_user, "root"
-    If is_root is equal to 1 or has_user_instruction is equal to 0:
-        Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
-        proc add from List with security_issues, "Container running as root user - security risk"
+    Let is_zero be proc string_equals from StringCore with current_user, "0"
+    Let runs_as_root be 0
+    If is_root is equal to 1:
+        Set runs_as_root to 1
     End If
+    If is_zero is equal to 1:
+        Set runs_as_root to 1
+    End If
+    If has_user_instruction is equal to 0:
+        Set runs_as_root to 1
+    End If
+
+    If runs_as_root is equal to 1:
+        Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+        proc list_append from List with security_issues, "Container running as root user - security risk"
+    End If
+End Process
+
+@Reasoning:
+Secrets baked into image layers via ENV variable values or LABEL metadata
+are recoverable from the image even after deletion. This pass scans ENV and
+LABEL instruction arguments for credential-shaped key names (PASSWORD,
+SECRET, TOKEN, API_KEY) so the user is warned before publishing the image.
+@End Reasoning
+
+@Implementation:
+Walks instructions. For each ENV/LABEL node, retrieves the argument list and
+scans each entry for the credential-shaped substrings; any match appends a
+sensitive-data finding to security_issues (offset 88).
+@End Implementation
+
+@Security_Scope:
+Substring detection over key/value text; obfuscated secret names are not
+caught. Build-time secret mounts remain the recommended mitigation.
+@End Security_Scope
+
+Process called "check_sensitive_data_exposure" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Scan ENV/LABEL values for credential-shaped data
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+    Let i be 0
+
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        Let scan be 0
+        If node_type is equal to NODE_ENV:
+            Set scan to 1
+        End If
+        If node_type is equal to NODE_LABEL:
+            Set scan to 1
+        End If
+
+        If scan is equal to 1:
+            Let args be proc get_instruction_arguments with instruction
+            Let arg_count be proc list_length from List with args
+            Let j be 0
+            While j is less than arg_count:
+                Let entry be proc list_get from List with args, j
+                Let has_pw be proc string_contains from StringUtils with entry, "PASSWORD"
+                Let has_secret be proc string_contains from StringUtils with entry, "SECRET"
+                Let has_token be proc string_contains from StringUtils with entry, "TOKEN"
+                Let has_apikey be proc string_contains from StringUtils with entry, "API_KEY"
+                Let found be 0
+                If has_pw is equal to 1:
+                    Set found to 1
+                End If
+                If has_secret is equal to 1:
+                    Set found to 1
+                End If
+                If has_token is equal to 1:
+                    Set found to 1
+                End If
+                If has_apikey is equal to 1:
+                    Set found to 1
+                End If
+                If found is equal to 1:
+                    proc list_append from List with security_issues, "Possible secret baked into image metadata"
+                End If
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Package-manager invocations in RUN commands carry security weight: installing
+without verifying signatures, or disabling certificate checks
+(`--allow-unauthenticated`, `--no-check-certificate`), opens the build to
+supply-chain tampering. This pass scans RUN commands for those flags.
+@End Reasoning
+
+@Implementation:
+Walks instructions. For each RUN node, reads the command at offset 16 and
+scans for "--allow-unauthenticated" and "--no-check-certificate"; either
+appends an insecure-package finding to security_issues (offset 88).
+@End Implementation
+
+@Security_Scope:
+Heuristic substring scan; covers the common spellings of certificate/sig
+bypass flags but not every package manager's equivalent.
+@End Security_Scope
+
+Process called "check_package_security" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Scan RUN commands for insecure package-manager flags
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+    Let i be 0
+
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        If node_type is equal to NODE_RUN:
+            Let command be proc memory_get_int64 from Layout with instruction, 16
+            Let present be string_is_nonempty with command
+            If present is equal to 1:
+                Let allow_unauth be proc string_contains from StringUtils with command, "--allow-unauthenticated"
+                Let no_cert be proc string_contains from StringUtils with command, "--no-check-certificate"
+                Let insecure be 0
+                If allow_unauth is equal to 1:
+                    Set insecure to 1
+                End If
+                If no_cert is equal to 1:
+                    Set insecure to 1
+                End If
+                If insecure is equal to 1:
+                    proc list_append from List with security_issues, "Insecure package install disables verification"
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Security best-practice aggregator: an image that performs no privilege
+de-escalation AND exposes a privileged port (< 1024) is at elevated risk
+because the process must run as root to bind it. This proc consults the
+already-populated exposed_ports and users registries to surface that
+combination as a policy advisory.
+@End Reasoning
+
+@Implementation:
+Reads the users registry (offset 48) and exposed_ports (offset 16). If no
+non-root USER was recorded AND any exposed port parses to < 1024, appends a
+privileged-port-as-root advisory to security_issues (offset 88).
+@End Implementation
+
+Process called "validate_security_best_practices" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Flag privileged-port exposure without privilege de-escalation
+
+    Let exposed_ports be proc memory_get_int64 from Layout with analyzer, 16
+    If exposed_ports is equal to 0:
+        Return
+    End If
+
+    Let port_count be proc list_length from List with exposed_ports
+    Let has_privileged be 0
+    Let i be 0
+    While i is less than port_count:
+        Let port_spec be proc list_get from List with exposed_ports, i
+        Let port_num be port_number_of with port_spec
+        If port_num is greater than 0 and port_num is less than 1024:
+            Set has_privileged to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_privileged is equal to 1:
+        Note: Determine whether a non-root USER was declared
+        Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+        Let non_root_user be 0
+        If instructions is not equal to 0:
+            Let instruction_count be proc list_length from List with instructions
+            Let j be 0
+            While j is less than instruction_count:
+                Let instruction be proc list_get from List with instructions, j
+                Let node_type be proc memory_get_int64 from Layout with instruction, 0
+                If node_type is equal to NODE_USER:
+                    Let user be proc memory_get_int64 from Layout with instruction, 8
+                    Let is_root be proc string_equals from StringCore with user, "root"
+                    Let is_zero be proc string_equals from StringCore with user, "0"
+                    Let present be string_is_nonempty with user
+                    If present is equal to 1 and is_root is equal to 0 and is_zero is equal to 0:
+                        Set non_root_user to 1
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+
+        If non_root_user is equal to 0:
+            Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
+            proc list_append from List with security_issues, "Privileged port (<1024) exposed without dropping root - security risk"
+        End If
+    End If
+End Process
+
+@Reasoning:
+Extracts the leading numeric port from a port specification string
+("80", "80/tcp", "8080-8090"). The privileged-port check only needs the
+first port number, so parsing stops at the first '/' or '-' delimiter.
+@End Reasoning
+
+@Implementation:
+Returns 0 for null/empty. Finds the first '/' or '-' (whichever comes first)
+and takes the substring before it as the port digits; if neither delimiter
+exists, uses the whole string. Converts via string_to_integer; returns 0 if
+the digit portion is empty.
+@End Implementation
+
+Process called "port_number_of" takes port_spec as Integer returns Integer:
+    Note: Parse the leading port number from a port specification
+
+    Let present be string_is_nonempty with port_spec
+    If present is equal to 0:
+        Return 0
+    End If
+
+    Let slash_pos be proc string_find from StringUtils with port_spec, "/", 0
+    Let dash_pos be proc string_find from StringUtils with port_spec, "-", 0
+
+    Let cut be proc string_length from StringCore with port_spec
+    If slash_pos is not equal to -1 and slash_pos is less than cut:
+        Set cut to slash_pos
+    End If
+    If dash_pos is not equal to -1 and dash_pos is less than cut:
+        Set cut to dash_pos
+    End If
+
+    If cut is equal to 0:
+        Return 0
+    End If
+
+    Let port_digits be proc string_substring from StringPrim with port_spec, 0, cut
+    Return proc string_to_integer from StringPrim with port_digits
+End Process
+
+Note: ===================================================================
+Note: BASE IMAGE VALIDATION
+Note: ===================================================================
+
+@Reasoning:
+Phase 3 validates each collected base image: a FROM whose recorded image
+reference is empty is a hard error, and any base image that is a bare stage
+alias (matching a declared stage name) is legitimate and skipped. Real image
+references are also checked for the `:latest`/missing-tag policy in
+check_base_image_best_practices; here we focus on presence/integrity.
+@End Reasoning
+
+@Implementation:
+Reads base_images (offset 0) and its count. Loops each entry: an empty
+reference appends "FROM base image reference is empty" to validation_errors.
+Non-empty references pass; tag policy is enforced in the best-practices phase.
+@End Implementation
+
+Process called "validate_base_images" takes analyzer as Integer:
+    Note: Validate collected base image references are well-formed
+
+    Let base_images be proc memory_get_int64 from Layout with analyzer, 0
+    If base_images is equal to 0:
+        Return
+    End If
+
+    Let image_count be proc list_length from List with base_images
+    Let i be 0
+    While i is less than image_count:
+        Let image_ref be proc list_get from List with base_images, i
+        Let present be string_is_nonempty with image_ref
+        If present is equal to 0:
+            proc add_dockerfile_validation_error with analyzer, "FROM base image reference is empty"
+        End If
+        Set i to i plus 1
+    End While
 End Process
 
 Note: ===================================================================
@@ -835,23 +2264,17 @@ Note: LAYER OPTIMIZATION ANALYSIS
 Note: ===================================================================
 
 @Reasoning:
-Phase 5 examines layer-economy concerns: each layer in a Docker image
-adds storage overhead, slows cold pulls, and bloats the image graph in
-registries. The three sub-checks address: (1) RUN-combining (consecutive
-RUNs should be merged with `&&` to share one layer), (2) cache-friendly
-ordering (instructions that change rarely should appear before those
-that change often, maximising cache hits during incremental builds),
-(3) layer-ordering policy (e.g., COPY application code AFTER package
-installs so app-only changes don't bust the install cache).
+Phase 5 examines layer-economy concerns: each layer in a Docker image adds
+storage overhead. The three sub-checks address: (1) RUN-combining
+(consecutive RUNs should be merged), (2) cache-friendly ordering (rarely-
+changing instructions before frequently-changing ones), (3) layer-ordering
+policy (COPY application code after package installs).
 @End Reasoning
 
 @Implementation:
-Calls three sub-procedures: check_run_command_combining (counts
-consecutive RUN instructions, warns when > 1),
-analyze_cache_efficiency (scans for ordering anti-patterns),
-check_layer_ordering (validates standard Docker layer-ordering
-recommendations). All findings flow into
-analyzer.optimization_warnings (offset 96). No return value.
+Calls three sub-procedures: check_run_command_combining,
+analyze_cache_efficiency, check_layer_ordering. All findings flow into
+analyzer.optimization_warnings (offset 96).
 @End Implementation
 
 Process called "analyze_layer_optimization" takes analyzer as Integer, dockerfile_ast as Integer:
@@ -863,39 +2286,35 @@ Process called "analyze_layer_optimization" takes analyzer as Integer, dockerfil
 End Process
 
 @Reasoning:
-Each RUN instruction creates a distinct image layer with full filesystem
-state. Three consecutive `RUN apt-get install ...`, `RUN apt-get install ...`,
-`RUN apt-get install ...` instructions creates three layers when one
-combined RUN with `&&` would produce one. Beyond size savings, combining
-is also a SECURITY measure: temporary files (e.g., apt cache) created
-in one RUN persist into the layer even if a later RUN deletes them,
-because layers are append-only - only combining the create and delete
-into a single RUN actually removes them from the image. We count runs
-of CONSECUTIVE RUN instructions; non-RUN instructions reset the counter.
+Each RUN instruction creates a distinct image layer. Consecutive RUN
+instructions could be combined with `&&` into one layer, saving size and
+ensuring temporary files created and deleted within one RUN actually leave
+the image. We count runs of CONSECUTIVE RUN instructions; non-RUN
+instructions reset the counter.
 @End Reasoning
 
 @Implementation:
-Reads instructions and its count. Initialises consecutive_runs=0 and
-i=0. Loops: reads instruction_type. If equals "RUN", bumps
-consecutive_runs. Otherwise: if consecutive_runs > 1, builds warning
-"<n> consecutive RUN commands could be combined into one layer" and
-appends to optimization_warnings (offset 96), then resets
-consecutive_runs to 0. After loop: handles the trailing case - if the
-file ends with consecutive_runs > 1, adds "<n> consecutive RUN commands
-at end could be combined".
+Reads instructions and count. Initialises consecutive_runs=0, i=0. Loops:
+on "RUN" bumps consecutive_runs; otherwise if consecutive_runs > 1 appends a
+combine warning to optimization_warnings (offset 96) and resets. After the
+loop handles the trailing run of RUNs.
 @End Implementation
 
 Process called "check_run_command_combining" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Check for consecutive RUN commands that could be combined
 
-    Let instructions be proc get_dockerfile_instructions from dockerfile_ast
-    Let instruction_count be proc size from List with instructions
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
     Let consecutive_runs be 0
     Let i be 0
 
     While i is less than instruction_count:
-        Let instruction be proc get from List with instructions, i
-        Let instruction_type be proc get_instruction_type from instruction
+        Let instruction be proc list_get from List with instructions, i
+        Let instruction_type be proc get_instruction_type with instruction
 
         Let is_run be proc string_equals from StringCore with instruction_type, "RUN"
         If is_run is equal to 1:
@@ -903,9 +2322,9 @@ Process called "check_run_command_combining" takes analyzer as Integer, dockerfi
         Otherwise:
             If consecutive_runs is greater than 1:
                 Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
-                Let warning be proc int_to_string from StringCore with consecutive_runs
-                Set warning to proc string_concat from StringCore with warning, " consecutive RUN commands could be combined into one layer"
-                proc add from List with optimization_warnings, warning
+                Let warning be proc integer_to_string from StringPrim with consecutive_runs
+                Set warning to proc string_concat from StringPrim with warning, " consecutive RUN commands could be combined into one layer"
+                proc list_append from List with optimization_warnings, warning
             End If
             Set consecutive_runs to 0
         End If
@@ -915,10 +2334,115 @@ Process called "check_run_command_combining" takes analyzer as Integer, dockerfi
 
     Note: Check final sequence
     If consecutive_runs is greater than 1:
-        Set optimization_warnings to proc memory_get_int64 from Layout with analyzer, 96
-        Set warning to proc int_to_string from StringCore with consecutive_runs
-        Set warning to proc string_concat from StringCore with warning, " consecutive RUN commands at end could be combined"
-        proc add from List with optimization_warnings, warning
+        Let optimization_warnings2 be proc memory_get_int64 from Layout with analyzer, 96
+        Let warning2 be proc integer_to_string from StringPrim with consecutive_runs
+        Set warning2 to proc string_concat from StringPrim with warning2, " consecutive RUN commands at end could be combined"
+        proc list_append from List with optimization_warnings2, warning2
+    End If
+End Process
+
+@Reasoning:
+Docker's layer cache is invalidated from the first changed instruction
+onward, so placing a broad `COPY . .` (which changes on every source edit)
+before package-install RUNs forces the expensive installs to re-run on every
+build. This pass flags a full-context COPY that precedes any RUN as a cache-
+efficiency anti-pattern.
+@End Reasoning
+
+@Implementation:
+Walks instructions tracking whether a full-context COPY (destination scanned
+for "." source) has been seen. When a RUN appears after such a COPY, appends
+a cache-efficiency advisory to optimization_warnings (offset 96), once.
+@End Implementation
+
+Process called "analyze_cache_efficiency" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Flag broad COPY placed before package-install RUN (cache busting)
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let saw_broad_copy be 0
+    Let reported be 0
+    Let i be 0
+
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        If node_type is equal to NODE_COPY:
+            Let sources be proc memory_get_int64 from Layout with instruction, 8
+            If sources is not equal to 0:
+                Let src_count be proc list_length from List with sources
+                Let s be 0
+                While s is less than src_count:
+                    Let src be proc list_get from List with sources, s
+                    Let is_dot be proc string_equals from StringCore with src, "."
+                    If is_dot is equal to 1:
+                        Set saw_broad_copy to 1
+                    End If
+                    Set s to s plus 1
+                End While
+            End If
+        End If
+
+        If node_type is equal to NODE_RUN:
+            If saw_broad_copy is equal to 1 and reported is equal to 0:
+                Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+                proc list_append from List with optimization_warnings, "Broad 'COPY . .' before RUN busts the build cache - copy dependency manifests first"
+                Set reported to 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+The recommended Dockerfile layer ordering places infrastructure setup
+(package installs) before application code so that app-only edits reuse the
+cached install layers. A Dockerfile that issues its last RUN after the final
+COPY of application code inverts this and is flagged.
+@End Reasoning
+
+@Implementation:
+Walks instructions recording the index of the last RUN and the last COPY.
+If a RUN appears after the last COPY (last_run > last_copy and both exist),
+appends a layer-ordering advisory to optimization_warnings (offset 96).
+@End Implementation
+
+Process called "check_layer_ordering" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Warn when a RUN follows the final COPY (suboptimal cache ordering)
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let last_run be -1
+    Let last_copy be -1
+    Let i be 0
+
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+
+        If node_type is equal to NODE_RUN:
+            Set last_run to i
+        End If
+        If node_type is equal to NODE_COPY:
+            Set last_copy to i
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If last_copy is not equal to -1 and last_run is greater than last_copy:
+        Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+        proc list_append from List with optimization_warnings, "RUN after final COPY of application code reduces cache reuse - install dependencies before copying source"
     End If
 End Process
 
@@ -927,94 +2451,183 @@ Note: DOCKER BEST PRACTICES VALIDATION
 Note: ===================================================================
 
 @Reasoning:
-Phase 6 (final) is the catch-all best-practices aggregator covering
-issues that don't fit into the previous five specific phases: base
-image selection (avoid `latest`, prefer slim/alpine, avoid deprecated
-images), HEALTHCHECK presence (production containers should declare
-liveness probes), signal handling (PID 1 inside containers needs to
-forward SIGTERM correctly for graceful shutdown), and metadata
-completeness (LABEL maintainer, org.opencontainers.image.* labels for
-provenance). Each of these is a soft policy concern - violations don't
-break builds but flag the image as non-production-ready.
+Phase 6 (final) is the catch-all best-practices aggregator covering base
+image selection, HEALTHCHECK presence, signal handling, and metadata
+completeness. Each is a soft policy concern - violations don't break builds
+but flag the image as non-production-ready.
 @End Reasoning
 
 @Implementation:
-Calls four sub-procs: check_base_image_best_practices(analyzer) which
-consults the already-populated base_images registry,
-check_healthcheck_configuration(analyzer, dockerfile_ast) which scans
-for HEALTHCHECK instructions, validate_signal_handling(analyzer,
-dockerfile_ast) which checks ENTRYPOINT/CMD shell vs exec form and
-related concerns, check_metadata_completeness(analyzer) which audits
-labels and args. All findings go to optimization_warnings or
+Calls four sub-procs: check_base_image_best_practices,
+check_healthcheck_configuration, validate_signal_handling,
+check_metadata_completeness. Findings go to optimization_warnings or
 security_issues depending on severity.
 @End Implementation
 
 Process called "validate_docker_best_practices" takes analyzer as Integer, dockerfile_ast as Integer:
     Note: Validate Docker best practices compliance
 
-    proc check_base_image_best_practices from analyzer
+    proc check_base_image_best_practices with analyzer
     proc check_healthcheck_configuration with analyzer, dockerfile_ast
     proc validate_signal_handling with analyzer, dockerfile_ast
-    proc check_metadata_completeness from analyzer
+    proc check_metadata_completeness with analyzer
 End Process
 
 @Reasoning:
-Two image-reference anti-patterns flagged here: (1) the `:latest` tag
-which is a moving target - the image rebuilt tomorrow may be different
-from today's, making builds non-reproducible AND creating a supply-chain
-attack vector if the upstream maintainer is compromised; (2) entirely
-missing tag, which Docker silently resolves to `:latest` with the same
-problems. Both are reported but at different severities: `:latest` is
-a security issue (someone deliberately chose it), missing tag is an
-optimization warning (likely a forgot-to-pin oversight).
+Two image-reference anti-patterns flagged here: (1) the `:latest` tag which
+is a moving target making builds non-reproducible and creating a supply-chain
+vector; (2) entirely missing tag, which Docker silently resolves to
+`:latest`. `:latest` is a security issue; missing tag is an optimization
+warning.
 @End Reasoning
 
 @Implementation:
-Reads base_images list (analyzer offset 0) and its count. Loops i in
-0..count-1: reads image_ref at index i. First substring test:
-string_contains(image_ref, ":latest"); on match appends "Base image
-uses 'latest' tag: <ref>" to security_issues (offset 88). Second
-test: string_contains(image_ref, ":"); if FALSE (no tag at all),
-appends "Base image missing explicit tag: <ref>" to
-optimization_warnings (offset 96). Both checks fire independently;
-a `foo:latest` reference fails only the first; a `foo` reference
-fails only the second.
+Reads base_images list (offset 0) and its count. Loops each: string_contains
+test for ":latest" appends to security_issues (offset 88). A second
+string_contains for ":" that is false (no tag) appends to
+optimization_warnings (offset 96).
 @End Implementation
 
 @Security_Scope:
-The `:latest` tag check is the primary supply-chain defense in this
-analyzer; combined with a registry-side immutable-tag policy and
-SBOM generation, it forms the syntactic-side of provenance enforcement.
+The `:latest` tag check is the primary supply-chain defense in this analyzer.
 @End Security_Scope
 
 Process called "check_base_image_best_practices" takes analyzer as Integer:
     Note: Check base image selection best practices
 
     Let base_images be proc memory_get_int64 from Layout with analyzer, 0
-    Let image_count be proc size from List with base_images
+    If base_images is equal to 0:
+        Return
+    End If
+
+    Let image_count be proc list_length from List with base_images
     Let i be 0
 
     While i is less than image_count:
-        Let image_ref be proc get from List with base_images, i
+        Let image_ref be proc list_get from List with base_images, i
 
         Note: Check for 'latest' tag
-        Let has_latest be proc string_contains from StringCore with image_ref, ":latest"
+        Let has_latest be proc string_contains from StringUtils with image_ref, ":latest"
         If has_latest is equal to 1:
             Let security_issues be proc memory_get_int64 from Layout with analyzer, 88
-            Let issue be proc string_concat from StringCore with "Base image uses 'latest' tag: ", image_ref
-            proc add from List with security_issues, issue
+            Let issue be proc string_concat from StringPrim with "Base image uses 'latest' tag: ", image_ref
+            proc list_append from List with security_issues, issue
         End If
 
         Note: Check for missing tag
-        Let has_colon be proc string_contains from StringCore with image_ref, ":"
+        Let has_colon be proc string_contains from StringUtils with image_ref, ":"
         If has_colon is equal to 0:
             Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
-            Let warning be proc string_concat from StringCore with "Base image missing explicit tag: ", image_ref
-            proc add from List with optimization_warnings, warning
+            Let warning be proc string_concat from StringPrim with "Base image missing explicit tag: ", image_ref
+            proc list_append from List with optimization_warnings, warning
         End If
 
         Set i to i plus 1
     End While
+End Process
+
+@Reasoning:
+Production containers should declare a HEALTHCHECK so orchestrators can
+detect a hung process. The absence of any HEALTHCHECK instruction is a
+best-practice gap surfaced as an optimization warning.
+@End Reasoning
+
+@Implementation:
+Walks instructions counting HEALTHCHECK nodes. If none are present, appends
+"No HEALTHCHECK instruction" to optimization_warnings (offset 96).
+@End Implementation
+
+Process called "check_healthcheck_configuration" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Warn when no HEALTHCHECK is declared
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let found be 0
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+        If node_type is equal to NODE_HEALTHCHECK:
+            Set found to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    If found is equal to 0:
+        Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+        proc list_append from List with optimization_warnings, "No HEALTHCHECK instruction - orchestrators cannot detect an unhealthy container"
+    End If
+End Process
+
+@Reasoning:
+A shell-form ENTRYPOINT/CMD runs the command under `/bin/sh -c`, which
+becomes PID 1 and does NOT forward SIGTERM to the child, breaking graceful
+shutdown. Exec form (JSON array) makes the executable PID 1 directly. The
+parser records the form at the node's form field; shell-form ENTRYPOINT is
+flagged here.
+@End Reasoning
+
+@Implementation:
+Walks instructions. For each ENTRYPOINT node, reads the form field (offset 8;
+SHELL_FORM = 2000). If shell form, appends a signal-handling advisory to
+optimization_warnings (offset 96).
+@End Implementation
+
+Process called "validate_signal_handling" takes analyzer as Integer, dockerfile_ast as Integer:
+    Note: Warn when ENTRYPOINT uses shell form (breaks SIGTERM forwarding)
+
+    Let instructions be proc get_dockerfile_instructions with dockerfile_ast
+    If instructions is equal to 0:
+        Return
+    End If
+
+    Let instruction_count be proc list_length from List with instructions
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction be proc list_get from List with instructions, i
+        Let node_type be proc memory_get_int64 from Layout with instruction, 0
+        If node_type is equal to NODE_ENTRYPOINT:
+            Let form be proc memory_get_int64 from Layout with instruction, 8
+            If form is equal to 2000:  Note: SHELL_FORM
+                Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+                proc list_append from List with optimization_warnings, "Shell-form ENTRYPOINT does not forward signals - use exec form (JSON array) for correct SIGTERM handling"
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Provenance metadata (a LABEL maintainer / org.opencontainers.image.* label
+or a legacy MAINTAINER instruction) lets operators trace an image to its
+source. The absence of any such metadata is a best-practice gap surfaced as
+an optimization warning. This pass consults the already-populated labels
+registry rather than re-walking the AST.
+@End Reasoning
+
+@Implementation:
+Reads the labels registry (offset 56) and its count. If the registry is empty
+(no LABEL ever recorded), appends "No metadata labels" to
+optimization_warnings (offset 96). A populated registry satisfies the check.
+@End Implementation
+
+Process called "check_metadata_completeness" takes analyzer as Integer:
+    Note: Warn when the image declares no provenance metadata
+
+    Let labels be proc memory_get_int64 from Layout with analyzer, 56
+    Let label_count be 0
+    If labels is not equal to 0:
+        Set label_count to proc list_length from List with labels
+    End If
+
+    If label_count is equal to 0:
+        Let optimization_warnings be proc memory_get_int64 from Layout with analyzer, 96
+        proc list_append from List with optimization_warnings, "No metadata labels (e.g. maintainer / org.opencontainers.image.*) - image provenance cannot be traced"
+    End If
 End Process
 
 Note: ===================================================================
@@ -1022,41 +2635,37 @@ Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
 @Reasoning:
-Docker EXPOSE arguments accept three formats: a bare port (`80`), port
-with protocol (`80/tcp` or `80/udp`), or port range (`8080-8090` or
-`8080-8090/tcp`). Other protocols (sctp, etc.) are not standard Docker
-and are rejected. The dash-separated range form requires BOTH endpoints
-to parse as integers in 1..65535 - we do not enforce start < end here
-because Docker accepts both orders and normalises. Returning Integer
-0/1 lets the caller branch cleanly without parsing diagnostic strings.
+Docker EXPOSE arguments accept three formats: a bare port (`80`), port with
+protocol (`80/tcp` or `80/udp`), or port range (`8080-8090` or `8080-8090/tcp`).
+Other protocols are rejected. The dash-separated range form requires BOTH
+endpoints to parse as integers in 1..65535. Returning Integer 0/1 lets the
+caller branch cleanly.
 @End Reasoning
 
 @Implementation:
-Locates `/` via string_find. If found, splits into port_part (before)
-and protocol_part (after); checks protocol_part equals "tcp" or "udp",
-returning 0 on any other value. Then operates on port_part. Locates
-`-`; if found, splits into start_port and end_port substrings and
-validates each as a valid port number via is_valid_port_number,
-returning 0 if either fails. If no dash, validates port_part directly.
-Returns 1 only when every component passes.
+Locates `/` via string_find. If found, splits into port_part (before) and
+protocol_part (after); checks protocol_part equals "tcp" or "udp". Then
+operates on port_part. Locates `-`; if found, splits into start_port and
+end_port and validates each via is_valid_port_number. If no dash, validates
+port_part directly. Returns 1 only when every component passes.
 @End Implementation
 
 @Security_Scope:
-Port spec originates from untrusted Dockerfile source. Strict
-1..65535 validation prevents downstream tooling from receiving
-out-of-range values that could underflow/overflow into kernel-managed
-port tables.
+Port spec originates from untrusted Dockerfile source. Strict 1..65535
+validation prevents out-of-range values reaching runtime tooling.
 @End Security_Scope
 
 Process called "validate_port_specification" takes port_spec as Integer returns Integer:
     Note: Validate Docker port specification format
 
-    Let slash_pos be proc string_find from StringCore with port_spec, "/"
+    Let slash_pos be proc string_find from StringUtils with port_spec, "/", 0
     Let port_part be port_spec
 
     If slash_pos is not equal to -1:
-        Set port_part to proc string_substring from StringCore with port_spec, 0, slash_pos
-        Let protocol_part be proc string_substring from StringCore with port_spec, slash_pos plus 1, proc string_length from StringCore with port_spec minus slash_pos minus 1
+        Set port_part to proc string_substring from StringPrim with port_spec, 0, slash_pos
+        Let spec_len be proc string_length from StringCore with port_spec
+        Let proto_len be spec_len minus slash_pos minus 1
+        Let protocol_part be proc string_substring from StringPrim with port_spec, slash_pos plus 1, proto_len
 
         Note: Validate protocol
         Let is_tcp be proc string_equals from StringCore with protocol_part, "tcp"
@@ -1067,31 +2676,35 @@ Process called "validate_port_specification" takes port_spec as Integer returns 
     End If
 
     Note: Check for port range
-    Let dash_pos be proc string_find from StringCore with port_part, "-"
+    Let dash_pos be proc string_find from StringUtils with port_part, "-", 0
     If dash_pos is not equal to -1:
-        Let start_port be proc string_substring from StringCore with port_part, 0, dash_pos
-        Let end_port be proc string_substring from StringCore with port_part, dash_pos plus 1, proc string_length from StringCore with port_part minus dash_pos minus 1
+        Let start_port be proc string_substring from StringPrim with port_part, 0, dash_pos
+        Let part_len be proc string_length from StringCore with port_part
+        Let end_len be part_len minus dash_pos minus 1
+        Let end_port be proc string_substring from StringPrim with port_part, dash_pos plus 1, end_len
 
-        Let start_valid be proc is_valid_port_number from start_port
-        Let end_valid be proc is_valid_port_number from end_port
+        Let start_valid be proc is_valid_port_number with start_port
+        Let end_valid be proc is_valid_port_number with end_port
 
-        Return start_valid and end_valid
+        If start_valid is equal to 1 and end_valid is equal to 1:
+            Return 1
+        End If
+        Return 0
     End If
 
     Note: Single port number
-    Return proc is_valid_port_number from port_part
+    Return proc is_valid_port_number with port_part
 End Process
 
 @Reasoning:
 Final numeric check for an EXPOSE port: a 1..65535 decimal integer with at
-most 5 characters (length cap is a quick reject for over-long strings even
-if all-digit). Pure validator returning 0/1 — does not raise diagnostics.
+most 5 characters. Pure validator returning 0/1 - does not raise diagnostics.
 @End Reasoning
 
 @Implementation:
 Three gates: length in 1..5, every byte in '0'..'9' (ASCII 48..57), and the
-parsed integer in 1..65535. Uses string_char_at/string_to_int from
-StringCore; no allocations beyond what those calls perform internally.
+parsed integer in 1..65535. Uses string_char_at from StringCore and
+string_to_integer from StringPrim.
 @End Implementation
 
 Process called "is_valid_port_number" takes port_str as Integer returns Integer:
@@ -1113,7 +2726,7 @@ Process called "is_valid_port_number" takes port_str as Integer returns Integer:
     End While
 
     Note: Convert to number and check range
-    Let port_num be proc string_to_int from StringCore with port_str
+    Let port_num be proc string_to_integer from StringPrim with port_str
     If port_num is less than 1 or port_num is greater than 65535:
         Return 0
     End If
@@ -1133,8 +2746,7 @@ recoverable issues; this one trips the sticky has_error flag.
 
 @Implementation:
 Writes the error_message string handle into offset 120 and sets has_error=1
-at offset 128. Caller's StringCore is borrowed - the analyzer's destructor
-frees it.
+at offset 128.
 @End Implementation
 
 Process called "set_dockerfile_semantic_error" takes analyzer as Integer, error_message as Integer:
@@ -1146,39 +2758,37 @@ End Process
 
 @Reasoning:
 Validation errors accumulate without aborting analysis so the user gets the
-full set in one pass (missing FROM, bare ADD without --chown, etc.).
-Append-only ordering preserves source-document order in the report.
+full set in one pass. Append-only ordering preserves source-document order.
 @End Reasoning
 
 @Implementation:
 Reads validation_errors List from offset 104 and appends the error_message
-string handle. The analyzer's destructor walks the list and frees each
-string.
+string handle.
 @End Implementation
 
 Process called "add_dockerfile_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
 
     Let errors be proc memory_get_int64 from Layout with analyzer, 104
-    proc add from List with errors, error_message
+    proc list_append from List with errors, error_message
 End Process
 
 @Reasoning:
-Mirror of the error-add path for warning-level issues (e.g. apt-get without
---no-install-recommends, root USER in production). Kept in a separate List
-so warning-only builds proceed and the reporter applies distinct formatting.
+Mirror of the error-add path for warning-level issues. Kept in a separate
+List so warning-only builds proceed and the reporter applies distinct
+formatting.
 @End Reasoning
 
 @Implementation:
 Reads validation_warnings List from offset 112 and appends the warning
-message string. Same ownership semantics as add_dockerfile_validation_error.
+message string.
 @End Implementation
 
 Process called "add_dockerfile_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
 
     Let warnings be proc memory_get_int64 from Layout with analyzer, 112
-    proc add from List with warnings, warning_message
+    proc list_append from List with warnings, warning_message
 End Process
 
 Note: ===================================================================
@@ -1188,20 +2798,18 @@ Note: ===================================================================
 @Reasoning:
 One-shot facade used by the build driver: allocates analyzer + runs analysis
 + returns the populated analyzer for downstream consumption. Caller owns the
-returned analyzer and must free it via destroy_dockerfile_semantic_analyzer.
+returned analyzer.
 @End Reasoning
 
 @Implementation:
-Calls create_dockerfile_semantic_analyzer; on OOM returns 0 (analyzer is the
-public artifact, so a null result means analysis could not even start).
-Otherwise runs analyze_dockerfile which walks the AST and populates every
-registry/diagnostic stream, then returns the analyzer.
+Calls create_dockerfile_semantic_analyzer; on OOM returns 0. Otherwise runs
+analyze_dockerfile which walks the AST and populates every registry/diagnostic
+stream, then returns the analyzer.
 @End Implementation
 
 @Security_Scope:
-dockerfile_ast originates from user-supplied Dockerfiles which often contain
-URLs, secrets in ARG defaults, and shell commands. Analysis itself is read-
-only over the AST; the diagnostic stream may carry attacker-controlled
+dockerfile_ast originates from user-supplied Dockerfiles. Analysis itself is
+read-only over the AST; the diagnostic stream may carry attacker-controlled
 strings which the reporter must escape before display.
 @End Security_Scope
 
@@ -1219,14 +2827,11 @@ End Process
 
 @Reasoning:
 Public accessor for the validation_errors stream so the diagnostic emitter
-or IDE bridge can render the full error set without poking analyzer
-internals. Null analyzer returns 0 (treated as no-errors) so callers can
-chain accessors safely.
+or IDE bridge can render the full error set. Null analyzer returns 0.
 @End Reasoning
 
 @Implementation:
-Reads offset 104 (validation_errors List). Borrowed pointer - analyzer
-retains ownership.
+Reads offset 104 (validation_errors List). Borrowed pointer.
 @End Implementation
 
 Process called "dockerfile_semantic_get_errors" takes analyzer as Integer returns Integer:
@@ -1240,9 +2845,8 @@ Process called "dockerfile_semantic_get_errors" takes analyzer as Integer return
 End Process
 
 @Reasoning:
-Public accessor for warnings list. Separation from errors is preserved at
-the API surface so IDEs can group/filter independently and reporters can
-emit distinct exit codes.
+Public accessor for warnings list. Separation from errors is preserved at the
+API surface so IDEs can group/filter independently.
 @End Reasoning
 
 @Implementation:
@@ -1260,9 +2864,8 @@ Process called "dockerfile_semantic_get_warnings" takes analyzer as Integer retu
 End Process
 
 @Reasoning:
-Security findings (e.g. USER root, ADD instead of COPY with checksum, ENV
-secrets, --privileged hints) are collected on their own stream so security
-tooling can subscribe to them without parsing free-form warning text.
+Security findings are collected on their own stream so security tooling can
+subscribe to them without parsing free-form warning text.
 @End Reasoning
 
 @Implementation:
@@ -1280,9 +2883,9 @@ Process called "dockerfile_semantic_get_security_issues" takes analyzer as Integ
 End Process
 
 @Reasoning:
-Layer-count and instruction-ordering advice (combine RUNs, place COPY late,
-multi-stage builds, etc.) lives on a dedicated optimization stream so users
-can opt into "size hints" without seeing them in a normal warning report.
+Layer-count and instruction-ordering advice lives on a dedicated optimization
+stream so users can opt into size hints without seeing them in a normal
+warning report.
 @End Reasoning
 
 @Implementation:
@@ -1301,14 +2904,13 @@ End Process
 
 @Reasoning:
 Drivers need a single integer "did analysis pass" signal. Returns the actual
-error count rather than 0/1 so reporters can pretty-print "N errors". A
-null analyzer is treated as 1 error to keep the "analyzer-failed" path
-indistinguishable from "errors found" at the call site.
+error count rather than 0/1 so reporters can pretty-print "N errors". A null
+analyzer is treated as 1 error.
 @End Reasoning
 
 @Implementation:
 Null analyzer returns 1. Otherwise reads validation_errors at offset 104 and
-returns its List.size, which is 0 when analysis succeeded with no errors.
+returns its list_length, which is 0 when analysis succeeded with no errors.
 @End Implementation
 
 Process called "dockerfile_semantic_has_errors" takes analyzer as Integer returns Integer:
@@ -1319,6 +2921,6 @@ Process called "dockerfile_semantic_has_errors" takes analyzer as Integer return
     End If
 
     Let errors be proc memory_get_int64 from Layout with analyzer, 104
-    Let error_count be proc size from List with errors
+    Let error_count be proc list_length from List with errors
     Return error_count
 End Process
