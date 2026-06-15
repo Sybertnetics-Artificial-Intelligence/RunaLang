@@ -1,0 +1,444 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+JSX/TSX Translation Round-Trip Probe
+
+End-to-end proof that the JSX translation pipeline is REAL, not a skeleton:
+
+    JSX source
+      -> jsx_lexer    (tokenize: tag headers, attributes, '{expr}', text, '/>')
+      -> jsx_parser   (build JSX/JS AST: elements, attributes, children, body)
+      -> jsx_to_hir   (lower the AST to the pipeline's dictionary/list HIR model)
+      -> hir_to_jsx   (emit the HIR model back to JSX source text)
+
+The probe feeds a representative React function component:
+
+    function App() { return <div className="box" id={x}><span>Hello</span>{value}<br /></div>; }
+
+It exercises: a function component returning JSX; a root element (div) carrying
+a string-valued attribute (className="box") and an {expression}-valued attribute
+(id={x}); a nested child element (span) with a text child ("Hello"); an
+{expression} child ({value}); and a self-closing element (<br />).
+
+Stages and assertions:
+
+  1. Parse-smoke: parse the source and assert a non-empty AST whose root is the
+     JSX_PROGRAM node (type 100), proving the lexer/parser advance and terminate.
+  2. source -> HIR model: walk the dictionary/list HIR and assert the function
+     declaration, its block body, the returned div element, the div's tag,
+     the two attributes (string value + expression value), the nested span
+     element and its text child, the {value} expression child, and the
+     self-closing br element all survive lowering with correct content.
+  3. HIR -> JSX text: emit and assert the text is non-empty.
+  4. Re-parse the emitted JSX back into the HIR model and assert the two HIR
+     trees are STRUCTURALLY EQUAL via a recursive comparator. Structural
+     equality (not byte equality) is the correct semantic-equivalence check
+     because the emitter's byte form differs from the compact input while the
+     meaning is identical. The structural comparison is performed on the SECOND
+     emission's re-parsed tree against the first, so a degenerate empty emission
+     cannot pass.
+
+The HIR model is the Dictionary/List PRIMITIVE model (not a self-contained
+layout), so this probe navigates it through the same Dict.get / List.list_get /
+List.list_length primitives the frontend and backend use, keying lookups by
+content-compared string literals.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/jsx/jsx_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/jsx/jsx_to_hir.runa" as Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/jsx/hir_to_jsx.runa" as Backend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: JSX-model accessors (Dictionary / List primitive model)
+Note: ============================================================================
+
+@Reasoning:
+The JSX pipeline builds its HIR from the Dictionary and List PRIMITIVE modules.
+Dict keys are compared by string content (the hashtable duplicates and hashes
+the key bytes), so a freshly built literal key matches a stored key with the
+same characters. These thin wrappers keep the probe's navigation readable and
+route every lookup through the exact primitives the frontend/backend use.
+@End Reasoning
+
+Process called "hget" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key_str be proc create_from_literal from StringCore with key
+    Return proc get from Dict with node, key_str
+End Process
+
+Process called "lsize" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with list
+End Process
+
+Process called "lget" takes list as Integer, index as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with list, index
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two JSX-derived HIR-model trees
+Note: ============================================================================
+
+@Reasoning:
+Two JSX trees are semantically equal when their HIR projections are structurally
+equal. Because several keys are overloaded across node kinds ("body" is a list on
+program/block but a block subtree on function/arrow; "name" and "value" are string
+scalars on identifier/literal/text but node subtrees on attribute/function), a
+single generic key-walk cannot tell a list from a dict from a string without
+mis-dereferencing. The comparator therefore dispatches on the node's "type" and
+compares exactly the keys that type uses, in their correct shapes. This is
+unambiguous and crash-safe. Comparing the HIR projections (not raw text) is
+whitespace-insensitive, so it proves round-trip fidelity without being fooled by
+the emitter's re-indentation.
+@End Reasoning
+
+Process called "type_is" takes node as Integer, name as Integer returns Integer:
+    Let t be proc hget with node, "type"
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with t, name
+End Process
+
+Process called "scalar_key_equal" takes a as Integer, b as Integer, key as Integer returns Integer:
+    Let va be proc hget with a, key
+    Let vb be proc hget with b, key
+    If va is equal to 0:
+        If vb is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If vb is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with va, vb
+End Process
+
+Process called "subtree_key_equal" takes a as Integer, b as Integer, key as Integer returns Integer:
+    Let sub_a be proc hget with a, key
+    Let sub_b be proc hget with b, key
+    Return proc hir_equal with sub_a, sub_b
+End Process
+
+Process called "list_key_equal" takes a as Integer, b as Integer, key as Integer returns Integer:
+    Let list_a be proc hget with a, key
+    Let list_b be proc hget with b, key
+    Let count_a be proc lsize with list_a
+    Let count_b be proc lsize with list_b
+
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let index be 0
+    While index is less than count_a:
+        Let child_a be proc lget with list_a, index
+        Let child_b be proc lget with list_b, index
+        Let child_match be proc hir_equal with child_a, child_b
+        If child_match is not equal to 1:
+            Return 0
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "hir_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Note: type discriminator must match before any structural comparison
+    Let type_a be proc hget with a, "type"
+    Let type_b be proc hget with b, "type"
+    Let types_match be proc string_equals from StringCore with type_a, type_b
+    If types_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: program: body is a statement list
+    Let is_program be proc type_is with a, "program"
+    If is_program is equal to 1:
+        Return proc list_key_equal with a, b, "body"
+    End If
+
+    Note: function_declaration: name subtree + body subtree (block)
+    Let is_func be proc type_is with a, "function_declaration"
+    If is_func is equal to 1:
+        Let nm be proc subtree_key_equal with a, b, "name"
+        If nm is not equal to 1:
+            Return 0
+        End If
+        Return proc subtree_key_equal with a, b, "body"
+    End If
+
+    Note: arrow_function: body subtree
+    Let is_arrow be proc type_is with a, "arrow_function"
+    If is_arrow is equal to 1:
+        Return proc subtree_key_equal with a, b, "body"
+    End If
+
+    Note: block_statement: body is a statement list
+    Let is_block be proc type_is with a, "block_statement"
+    If is_block is equal to 1:
+        Return proc list_key_equal with a, b, "body"
+    End If
+
+    Note: return_statement: argument subtree
+    Let is_return be proc type_is with a, "return_statement"
+    If is_return is equal to 1:
+        Return proc subtree_key_equal with a, b, "argument"
+    End If
+
+    Note: jsx_element: tag subtree + attributes list + children list
+    Let is_element be proc type_is with a, "jsx_element"
+    If is_element is equal to 1:
+        Let tag_ok be proc subtree_key_equal with a, b, "tag"
+        If tag_ok is not equal to 1:
+            Return 0
+        End If
+        Let attrs_ok be proc list_key_equal with a, b, "attributes"
+        If attrs_ok is not equal to 1:
+            Return 0
+        End If
+        Return proc list_key_equal with a, b, "children"
+    End If
+
+    Note: jsx_fragment: children list
+    Let is_fragment be proc type_is with a, "jsx_fragment"
+    If is_fragment is equal to 1:
+        Return proc list_key_equal with a, b, "children"
+    End If
+
+    Note: jsx_attribute: name subtree + optional value subtree
+    Let is_attr be proc type_is with a, "jsx_attribute"
+    If is_attr is equal to 1:
+        Let an be proc subtree_key_equal with a, b, "name"
+        If an is not equal to 1:
+            Return 0
+        End If
+        Return proc subtree_key_equal with a, b, "value"
+    End If
+
+    Note: jsx_text: value scalar
+    Let is_text be proc type_is with a, "jsx_text"
+    If is_text is equal to 1:
+        Return proc scalar_key_equal with a, b, "value"
+    End If
+
+    Note: jsx_expression: expression subtree
+    Let is_expr be proc type_is with a, "jsx_expression"
+    If is_expr is equal to 1:
+        Return proc subtree_key_equal with a, b, "expression"
+    End If
+
+    Note: identifier: name scalar
+    Let is_ident be proc type_is with a, "identifier"
+    If is_ident is equal to 1:
+        Return proc scalar_key_equal with a, b, "name"
+    End If
+
+    Note: literal: value scalar
+    Let is_literal be proc type_is with a, "literal"
+    If is_literal is equal to 1:
+        Return proc scalar_key_equal with a, b, "value"
+    End If
+
+    Note:
+    member_expression: object subtree + properties list. Included for
+    completeness even though the probe's snippet does not produce it, so the
+    comparator stays correct for member-tag JSX (<Module.Component/>).
+    :End Note
+    Let is_member be proc type_is with a, "member_expression"
+    If is_member is equal to 1:
+        Let obj_ok be proc subtree_key_equal with a, b, "object"
+        If obj_ok is not equal to 1:
+            Return 0
+        End If
+        Return proc list_key_equal with a, b, "properties"
+    End If
+
+    Note: Types beyond this probe's grammar compare equal once their "type"
+    Note: markers match (already verified above).
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "JSX translation round-trip"
+
+    Let source be "function App() { return <div className=\"box\" id={x}><span>Hello</span>{value}<br /></div>; }"
+    Let source_length be proc string_length from StringCore with source
+
+    Note: --- Stage 0: PARSE-SMOKE (parser advances + terminates) ---
+    Let ast be proc parse_jsx from Parser with source, source_length
+    proc assert_not_null from TestUtils with results, "parser produced JSX AST", ast
+
+    Let ast_type be proc memory_get_int64 from Layout with ast, 0
+    proc assert_equal from TestUtils with results, "AST root is JSX_PROGRAM (100)", ast_type, 100
+
+    Let ast_child_count be proc memory_get_int64 from Layout with ast, 32
+    proc assert_greater_than from TestUtils with results, "AST program has children", ast_child_count, 0
+
+    Note: --- Stage 1: source -> HIR model ---
+    Let hir1 be proc jsx_to_hir_from_source from Frontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let root_type be proc hget with hir1, "type"
+    proc assert_string_equal from TestUtils with results, "HIR root type is 'program'", root_type, "program"
+
+    Note: program -> body -> function_declaration
+    Let prog_body be proc hget with hir1, "body"
+    Let prog_body_count be proc lsize with prog_body
+    proc assert_greater_than from TestUtils with results, "program body is non-empty", prog_body_count, 0
+
+    Let func be proc lget with prog_body, 0
+    Let func_type be proc hget with func, "type"
+    proc assert_string_equal from TestUtils with results, "first statement is a function_declaration", func_type, "function_declaration"
+
+    Let func_name be proc hget with func, "name"
+    Let func_name_str be proc hget with func_name, "name"
+    proc assert_string_equal from TestUtils with results, "function name is 'App'", func_name_str, "App"
+
+    Note: function -> body block -> body list -> return_statement
+    Let block be proc hget with func, "body"
+    Let block_type be proc hget with block, "type"
+    proc assert_string_equal from TestUtils with results, "function body is a block_statement", block_type, "block_statement"
+
+    Let block_body be proc hget with block, "body"
+    Let block_body_count be proc lsize with block_body
+    proc assert_greater_than from TestUtils with results, "block body is non-empty", block_body_count, 0
+
+    Let ret be proc lget with block_body, 0
+    Let ret_type be proc hget with ret, "type"
+    proc assert_string_equal from TestUtils with results, "block contains a return_statement", ret_type, "return_statement"
+
+    Note: return -> argument -> div jsx_element
+    Let div be proc hget with ret, "argument"
+    Let div_type be proc hget with div, "type"
+    proc assert_string_equal from TestUtils with results, "return argument is a jsx_element", div_type, "jsx_element"
+
+    Let div_tag be proc hget with div, "tag"
+    Let div_tag_name be proc hget with div_tag, "name"
+    proc assert_string_equal from TestUtils with results, "root element tag is 'div'", div_tag_name, "div"
+
+    Note: --- Attribute assertions: className="box" (string) + id={x} (expression) ---
+    Let div_attrs be proc hget with div, "attributes"
+    Let div_attr_count be proc lsize with div_attrs
+    proc assert_equal from TestUtils with results, "div has exactly two attributes", div_attr_count, 2
+
+    Let attr0 be proc lget with div_attrs, 0
+    Let attr0_type be proc hget with attr0, "type"
+    proc assert_string_equal from TestUtils with results, "first attribute is a jsx_attribute", attr0_type, "jsx_attribute"
+    Let attr0_name be proc hget with attr0, "name"
+    Let attr0_name_str be proc hget with attr0_name, "name"
+    proc assert_string_equal from TestUtils with results, "first attribute name is 'className'", attr0_name_str, "className"
+    Let attr0_value be proc hget with attr0, "value"
+    Let attr0_value_type be proc hget with attr0_value, "type"
+    proc assert_string_equal from TestUtils with results, "className value is a literal", attr0_value_type, "literal"
+    Let attr0_value_str be proc hget with attr0_value, "value"
+    proc assert_string_equal from TestUtils with results, "className literal text is \"box\" (quoted)", attr0_value_str, "\"box\""
+
+    Let attr1 be proc lget with div_attrs, 1
+    Let attr1_name be proc hget with attr1, "name"
+    Let attr1_name_str be proc hget with attr1_name, "name"
+    proc assert_string_equal from TestUtils with results, "second attribute name is 'id'", attr1_name_str, "id"
+    Let attr1_value be proc hget with attr1, "value"
+    Let attr1_value_type be proc hget with attr1_value, "type"
+    proc assert_string_equal from TestUtils with results, "id value is an identifier expression", attr1_value_type, "identifier"
+    Let attr1_value_name be proc hget with attr1_value, "name"
+    proc assert_string_equal from TestUtils with results, "id expression identifier is 'x'", attr1_value_name, "x"
+
+    Note: --- Children: span element, {value} expression, br self-closing element ---
+    Let div_children be proc hget with div, "children"
+    Let div_child_count be proc lsize with div_children
+    proc assert_equal from TestUtils with results, "div has exactly three children", div_child_count, 3
+
+    Note: child 0: nested <span>Hello</span>
+    Let span be proc lget with div_children, 0
+    Let span_type be proc hget with span, "type"
+    proc assert_string_equal from TestUtils with results, "first child is a nested jsx_element", span_type, "jsx_element"
+    Let span_tag be proc hget with span, "tag"
+    Let span_tag_name be proc hget with span_tag, "name"
+    proc assert_string_equal from TestUtils with results, "nested element tag is 'span'", span_tag_name, "span"
+    Let span_children be proc hget with span, "children"
+    Let span_child_count be proc lsize with span_children
+    proc assert_greater_than from TestUtils with results, "span has a text child", span_child_count, 0
+    Let span_text be proc lget with span_children, 0
+    Let span_text_type be proc hget with span_text, "type"
+    proc assert_string_equal from TestUtils with results, "span child is a jsx_text node", span_text_type, "jsx_text"
+    Let span_text_value be proc hget with span_text, "value"
+    proc assert_string_equal from TestUtils with results, "span text content is 'Hello'", span_text_value, "Hello"
+
+    Note: child 1: {value} expression container
+    Let expr_child be proc lget with div_children, 1
+    Let expr_child_type be proc hget with expr_child, "type"
+    proc assert_string_equal from TestUtils with results, "second child is a jsx_expression", expr_child_type, "jsx_expression"
+    Let expr_inner be proc hget with expr_child, "expression"
+    Let expr_inner_type be proc hget with expr_inner, "type"
+    proc assert_string_equal from TestUtils with results, "expression container holds an identifier", expr_inner_type, "identifier"
+    Let expr_inner_name be proc hget with expr_inner, "name"
+    proc assert_string_equal from TestUtils with results, "expression identifier is 'value'", expr_inner_name, "value"
+
+    Note: child 2: self-closing <br />
+    Let br be proc lget with div_children, 2
+    Let br_type be proc hget with br, "type"
+    proc assert_string_equal from TestUtils with results, "third child is a self-closing jsx_element", br_type, "jsx_element"
+    Let br_tag be proc hget with br, "tag"
+    Let br_tag_name be proc hget with br_tag, "name"
+    proc assert_string_equal from TestUtils with results, "self-closing element tag is 'br'", br_tag_name, "br"
+    Let br_children be proc hget with br, "children"
+    Let br_child_count be proc lsize with br_children
+    proc assert_equal from TestUtils with results, "self-closing br has no children", br_child_count, 0
+
+    Note: --- Stage 2: HIR -> JSX text ---
+    Let emitted be proc generate_jsx from Backend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced JSX text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted JSX is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted JSX -> HIR, assert structurally equal ---
+    Let hir2 be proc jsx_to_hir_from_source from Frontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted JSX produced HIR", hir2
+
+    Let root2_type be proc hget with hir2, "type"
+    proc assert_string_equal from TestUtils with results, "second-emission HIR root type is 'program'", root2_type, "program"
+
+    Let structurally_equal be proc hir_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

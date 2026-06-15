@@ -142,15 +142,22 @@ Process called "create_ast_node" takes type as Integer returns Integer:
 End Process
 
 @Reasoning:
-add_child writes the child pointer into the parent's children array
-at the current count offset, then increments the count. The 8-byte
-stride matches the pointer size; bounds checking against the 200-slot
-allocation is not enforced here because the parser's source-size
-constraints prevent it from exceeding the allocation in practice.
+add_child writes the child pointer into the parent's children array at the
+current count offset, then increments the count. The 8-byte stride matches the
+pointer size. The children array is allocated by create_ast_node at a fixed
+200-slot (1600-byte) capacity, so add_child enforces that bound explicitly: a
+write that would land at or beyond slot 200 is refused (returns 0) rather than
+writing past the allocation into adjacent heap. Returning 0 lets callers detect
+the rare saturation case; the common case writes and returns 1.
 @End Reasoning
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Let children be proc memory_get_int64 from Layout with parent, 24
     Let child_count be proc memory_get_int64 from Layout with parent, 32
+
+    Note: Refuse to write past the fixed 200-slot children allocation.
+    If child_count is greater than or equal to 200:
+        Return 0
+    End If
 
     Let offset be child_count multiplied by 8
     Let child_slot be children plus offset
@@ -177,6 +184,24 @@ Process called "current_token_type" takes parser as Integer returns Integer:
 
     Let token_type be proc memory_get_int64 from Layout with current_token, 0
     Return token_type
+End Process
+
+@Reasoning:
+current_token_value returns the text-pointer of the token currently in
+focus (token struct slot 8 = text pointer into the source buffer), or 0
+when the parser has run past the end. Callers that need a token's lexeme
+(for example arrow-function parameter names) use this to capture the
+borrowed string handle without re-scanning the source.
+@End Reasoning
+Process called "current_token_value" takes parser as Integer returns Integer:
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is equal to 0:
+        Return 0
+    End If
+
+    Let token_text be proc memory_get_int64 from Layout with current_token, 8
+    Return token_text
 End Process
 
 @Reasoning:
@@ -216,13 +241,13 @@ without recording the message, leaving error reporting to the
 caller via context.
 @End Reasoning
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_message as Integer returns Integer:
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to expected_type:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
     Return 1
 End Process
 
@@ -236,10 +261,10 @@ explicit via Break for EOF (0) or end-of-input sentinel (99).
 Process called "parse_jsx" takes source as Integer, length as Integer returns Integer:
     Let parser be proc create_parser with source, length
 
-    Let program be proc create_ast_node from JSX_PROGRAM
+    Let program be proc create_ast_node with JSX_PROGRAM
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to 0:
             Break
@@ -250,9 +275,9 @@ Process called "parse_jsx" takes source as Integer, length as Integer returns In
         End If
 
         If token_type is equal to 60:
-            proc advance_token from parser
+            proc advance_token with parser
             Otherwise:
-                Let statement be proc parse_statement from parser
+                Let statement be proc parse_statement with parser
                 If statement is not equal to 0:
                     proc add_child with program, statement
                 End If
@@ -270,20 +295,20 @@ type 2 (identifier) tokens. Anything else falls through to
 parse_expression which produces an expression-statement node.
 @End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note:
     JSX element
     :End Note
     If token_type is equal to 10:
-        Return proc parse_jsx_element from parser
+        Return proc parse_jsx_element with parser
     End If
 
     Note:
-    JSX fragment
+    JSX fragment (opens with JSX_FRAGMENT_OPEN = 18)
     :End Note
-    If token_type is equal to 17:
-        Return proc parse_jsx_fragment from parser
+    If token_type is equal to 18:
+        Return proc parse_jsx_fragment with parser
     End If
 
     Note:
@@ -299,32 +324,32 @@ Process called "parse_statement" takes parser as Integer returns Integer:
         Let is_const be proc check_text with text, text_length, "const"
 
         If is_var is equal to 1:
-            Return proc parse_variable_declaration from parser
+            Return proc parse_variable_declaration with parser
         End If
 
         If is_let is equal to 1:
-            Return proc parse_variable_declaration from parser
+            Return proc parse_variable_declaration with parser
         End If
 
         If is_const is equal to 1:
-            Return proc parse_variable_declaration from parser
+            Return proc parse_variable_declaration with parser
         End If
 
         Let is_function be proc check_text with text, text_length, "function"
         If is_function is equal to 1:
-            Return proc parse_function_declaration from parser
+            Return proc parse_function_declaration with parser
         End If
 
         Let is_return be proc check_text with text, text_length, "return"
         If is_return is equal to 1:
-            Return proc parse_return_statement from parser
+            Return proc parse_return_statement with parser
         End If
     End If
 
     Note:
     Expression statement
     :End Note
-    Return proc parse_expression from parser
+    Return proc parse_expression with parser
 End Process
 
 @Reasoning:
@@ -370,7 +395,7 @@ parser does not attempt recovery, the universal translator surfaces
 the diagnostic instead.
 @End Reasoning
 Process called "parse_jsx_element" takes parser as Integer returns Integer:
-    Let element be proc create_ast_node from JSX_ELEMENT
+    Let element be proc create_ast_node with JSX_ELEMENT
 
     Note:
     Parse opening tag <TagName
@@ -380,19 +405,26 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
     Note:
     Parse tag name (identifier or member expression)
     :End Note
-    Let tag_name be proc parse_jsx_element_name from parser
+    Let tag_name be proc parse_jsx_element_name with parser
 
     If tag_name is not equal to 0:
         proc add_child with element, tag_name
     End If
 
     Note:
-    Parse attributes
+    Parse attributes. The lexer emits the opening '<' as JSX_TAG_OPEN (10)
+    and, while jsx_depth is positive, emits '>' as JSX_TAG_CLOSE (11) and
+    '/>' as JSX_TAG_SELF_CLOSE (12); a leftover GT (47) only appears once
+    jsx_depth has fallen back to zero, so it is also treated as a terminator
+    for defensive robustness. Attribute names arrive as TOKEN_IDENTIFIER (1)
+    and a spread '{' arrives as JSX_EXPRESSION_START (16). The loop always
+    consumes at least one token on the otherwise-branch so a stray token can
+    never spin it forever.
     :End Note
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
-        If token_type is equal to 47:
+        If token_type is equal to 11:
             Break
         End If
 
@@ -400,7 +432,7 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
             Break
         End If
 
-        If token_type is equal to 11:
+        If token_type is equal to 47:
             Break
         End If
 
@@ -409,29 +441,35 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
         End If
 
         If token_type is equal to 1:
-            Let attribute be proc parse_jsx_attribute from parser
+            Let attribute be proc parse_jsx_attribute with parser
             If attribute is not equal to 0:
                 proc add_child with element, attribute
+            Otherwise:
+                proc advance_token with parser
             End If
         Otherwise:
-            If token_type is equal to 22:
-                Let spread be proc parse_jsx_spread_attribute from parser
+            If token_type is equal to 16:
+                Let spread be proc parse_jsx_spread_attribute with parser
                 If spread is not equal to 0:
                     proc add_child with element, spread
                 Otherwise:
                     Break
                 End If
+            Otherwise:
+                Note: Unknown token inside the tag header — consume it to
+                Note: guarantee forward progress and avoid an infinite loop.
+                proc advance_token with parser
             End If
         End If
     End While
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     Note:
     Self-closing tag />
     :End Note
     If token_type is equal to 12:
-        proc advance_token from parser
+        proc advance_token with parser
         Return element
     End If
 
@@ -441,59 +479,58 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
     proc expect_token with parser, 11, "Expected '>'"
 
     Note:
-    Parse children
+    Parse children. Token codes follow the lexer's emissions while inside a
+    JSX element: JSX_CLOSING_TAG_START (13) ends the body, JSX_TEXT (15) is a
+    text child, JSX_EXPRESSION_START (16) opens an {expression} child, a
+    nested JSX_TAG_OPEN (10) is a child element, and JSX_FRAGMENT_OPEN (18)
+    is a fragment child. Any other token is consumed unconditionally so the
+    loop always makes forward progress and can never hang on malformed input.
     :End Note
     While 1 is equal to 1:
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         If token_type is equal to 0:
             Break
         End If
 
-        Note:
-        Closing tag </
-        :End Note
-        If token_type is equal to 60:
+        Note: Closing tag start </
+        If token_type is equal to 13:
             Break
         End If
 
-        Note:
-        JSX text
-        :End Note
-        If token_type is equal to 14:
-            Let text_node be proc parse_jsx_text from parser
+        If token_type is equal to 15:
+            Let text_node be proc parse_jsx_text with parser
             If text_node is not equal to 0:
                 proc add_child with element, text_node
+            Otherwise:
+                proc advance_token with parser
             End If
         Otherwise:
-            Note:
-            JSX expression {expr}
-            :End Note
-            If token_type is equal to 15:
-                Let expr_node be proc parse_jsx_expression from parser
+            If token_type is equal to 16:
+                Let expr_node be proc parse_jsx_expression with parser
                 If expr_node is not equal to 0:
                     proc add_child with element, expr_node
                 End If
             Otherwise:
-                Note:
-                Nested JSX element
-                :End Note
                 If token_type is equal to 10:
-                    Let child_element be proc parse_jsx_element from parser
+                    Let child_element be proc parse_jsx_element with parser
                     If child_element is not equal to 0:
                         proc add_child with element, child_element
+                    Otherwise:
+                        proc advance_token with parser
                     End If
                 Otherwise:
-                    Note:
-                    JSX fragment
-                    :End Note
-                    If token_type is equal to 17:
-                        Let fragment be proc parse_jsx_fragment from parser
+                    If token_type is equal to 18:
+                        Let fragment be proc parse_jsx_fragment with parser
                         If fragment is not equal to 0:
                             proc add_child with element, fragment
                         Otherwise:
-                            Break
+                            proc advance_token with parser
                         End If
+                    Otherwise:
+                        Note: Unrecognised child token — consume to guarantee
+                        Note: forward progress and prevent an infinite loop.
+                        proc advance_token with parser
                     End If
                 End If
             End If
@@ -501,22 +538,40 @@ Process called "parse_jsx_element" takes parser as Integer returns Integer:
     End While
 
     Note:
-    Skip closing tag and attributes if present
+    Consume the closing tag </TagName>. The body loop stopped on the
+    JSX_CLOSING_TAG_START (13) token; advance past it, then skip the closing
+    tag name (and any stray tokens) up to and including the closing '>'.
+    Depending on residual jsx_depth the closing '>' arrives as either
+    JSX_TAG_CLOSE (11, still nested) or GT (47, back at top level), so both
+    are accepted as the terminator. Every iteration consumes a token, so this
+    loop terminates on all inputs.
     :End Note
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
-    While token_type is not equal to 47:
+    If token_type is equal to 13:
+        proc advance_token with parser
+        Set token_type to proc current_token_type with parser
+    End If
+
+    While 1 is equal to 1:
+        Set token_type to proc current_token_type with parser
+
         If token_type is equal to 0:
             Break
         End If
 
-        proc advance_token from parser
-        Set token_type to proc current_token_type from parser
-    End While
+        If token_type is equal to 11:
+            proc advance_token with parser
+            Break
+        End If
 
-    If token_type is equal to 60:
-        proc advance_token from parser
-    End If
+        If token_type is equal to 47:
+            proc advance_token with parser
+            Break
+        End If
+
+        proc advance_token with parser
+    End While
 
     Return element
 End Process
@@ -529,7 +584,7 @@ reading the identifier and following any . or : separators to build
 the qualified name.
 @End Reasoning
 Process called "parse_jsx_element_name" takes parser as Integer returns Integer:
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 1:
         Return 0
@@ -539,25 +594,25 @@ Process called "parse_jsx_element_name" takes parser as Integer returns Integer:
     Let text be proc memory_get_int64 from Layout with current_token, 8
     Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-    Let identifier be proc create_ast_node from JSX_IDENTIFIER
+    Let identifier be proc create_ast_node with JSX_IDENTIFIER
     proc memory_set_int64 from Layout with identifier, 8, text
     proc memory_set_int64 from Layout with identifier, 16, text_length
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note:
     Check for member expression (Component.SubComponent)
     :End Note
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 26:
-        Let member_expr be proc create_ast_node from JSX_MEMBER_EXPRESSION
+        Let member_expr be proc create_ast_node with JSX_MEMBER_EXPRESSION
         proc add_child with member_expr, identifier
 
         While token_type is equal to 26:
-            proc advance_token from parser
+            proc advance_token with parser
 
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
             If token_type is not equal to 1:
                 Break
             End If
@@ -566,14 +621,14 @@ Process called "parse_jsx_element_name" takes parser as Integer returns Integer:
             Set text to proc memory_get_int64 from Layout with current_token, 8
             Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-            Let property be proc create_ast_node from JSX_IDENTIFIER
+            Let property be proc create_ast_node with JSX_IDENTIFIER
             proc memory_set_int64 from Layout with property, 8, text
             proc memory_set_int64 from Layout with property, 16, text_length
 
             proc add_child with member_expr, property
-            proc advance_token from parser
+            proc advance_token with parser
 
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
         End While
 
         Return member_expr
@@ -590,9 +645,9 @@ accordingly. Attribute values without an = sign default to true,
 matching HTML's boolean attribute convention.
 @End Reasoning
 Process called "parse_jsx_attribute" takes parser as Integer returns Integer:
-    Let attribute be proc create_ast_node from JSX_ATTRIBUTE
+    Let attribute be proc create_ast_node with JSX_ATTRIBUTE
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 1:
         Return 0
@@ -602,22 +657,22 @@ Process called "parse_jsx_attribute" takes parser as Integer returns Integer:
     Let text be proc memory_get_int64 from Layout with current_token, 8
     Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-    Let name_node be proc create_ast_node from JSX_IDENTIFIER
+    Let name_node be proc create_ast_node with JSX_IDENTIFIER
     proc memory_set_int64 from Layout with name_node, 8, text
     proc memory_set_int64 from Layout with name_node, 16, text_length
 
     proc add_child with attribute, name_node
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     Note:
     Attribute with value
     :End Note
     If token_type is equal to 40:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         Note:
         String value
@@ -627,26 +682,28 @@ Process called "parse_jsx_attribute" takes parser as Integer returns Integer:
             Set text to proc memory_get_int64 from Layout with current_token, 8
             Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-            Let value_node be proc create_ast_node from JS_LITERAL
+            Let value_node be proc create_ast_node with JS_LITERAL
             proc memory_set_int64 from Layout with value_node, 8, text
             proc memory_set_int64 from Layout with value_node, 16, text_length
 
             proc add_child with attribute, value_node
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
         Note:
-        Expression value {expr}
+        Expression value {expr}. Inside a JSX tag the lexer emits the opening
+        '{' as JSX_EXPRESSION_START (16) and the matching '}' as
+        JSX_EXPRESSION_END (17).
         :End Note
-        If token_type is equal to 22:
-            proc advance_token from parser
+        If token_type is equal to 16:
+            proc advance_token with parser
 
-            Let expr be proc parse_expression from parser
+            Let expr be proc parse_expression with parser
             If expr is not equal to 0:
                 proc add_child with attribute, expr
             End If
 
-            proc expect_token with parser, 23, "Expected '}'"
+            proc expect_token with parser, 17, "Expected '}'"
         End If
     End If
 
@@ -661,19 +718,22 @@ lowering can emit the destination-language equivalent (Object.assign,
 spread syntax, etc.).
 @End Reasoning
 Process called "parse_jsx_spread_attribute" takes parser as Integer returns Integer:
-    proc expect_token with parser, 22, "Expected '{'"
+    Note: The opening '{' of a spread arrives as JSX_EXPRESSION_START (16) and
+    Note: the spread operator '...' as TOKEN_SPREAD (32); the closing '}' is
+    Note: JSX_EXPRESSION_END (17).
+    proc expect_token with parser, 16, "Expected '{'"
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 32:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let expr be proc parse_expression from parser
+    Let expr be proc parse_expression with parser
 
-    proc expect_token with parser, 23, "Expected '}'"
+    proc expect_token with parser, 17, "Expected '}'"
 
     Return expr
 End Process
@@ -689,11 +749,11 @@ Process called "parse_jsx_text" takes parser as Integer returns Integer:
     Let text be proc memory_get_int64 from Layout with current_token, 8
     Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-    Let text_node be proc create_ast_node from JSX_TEXT
+    Let text_node be proc create_ast_node with JSX_TEXT
     proc memory_set_int64 from Layout with text_node, 8, text
     proc memory_set_int64 from Layout with text_node, 16, text_length
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return text_node
 End Process
@@ -705,13 +765,26 @@ parse_expression for the JS body, then consumes the closing brace.
 This is how dynamic content (e.g. {user.name}) enters the JSX tree.
 @End Reasoning
 Process called "parse_jsx_expression" takes parser as Integer returns Integer:
-    proc expect_token with parser, 15, "Expected '{'"
+    Note: A JSX child expression container opens with JSX_EXPRESSION_START (16)
+    Note: and closes with JSX_EXPRESSION_END (17), per the lexer's brace-depth
+    Note: tracking inside a JSX element. The wrapped JavaScript expression is
+    Note: stored as child[0] of a JSX_EXPRESSION node so the container is
+    Note: preserved distinctly from a bare expression — translate_jsx_expression
+    Note: reads child[0] and emits {type:"jsx_expression", expression:...}, and
+    Note: the backend re-wraps it in braces. Returning the inner expression
+    Note: directly would erase the container and break round-trip fidelity.
+    Let container be proc create_ast_node with JSX_EXPRESSION
 
-    Let expr be proc parse_expression from parser
+    proc expect_token with parser, 16, "Expected '{'"
 
-    proc expect_token with parser, 16, "Expected '}'"
+    Let expr be proc parse_expression with parser
+    If expr is not equal to 0:
+        proc add_child with container, expr
+    End If
 
-    Return expr
+    proc expect_token with parser, 17, "Expected '}'"
+
+    Return container
 End Process
 
 @Reasoning:
@@ -722,56 +795,115 @@ distinct JSX_FRAGMENT tag lets the HIR lowering emit framework-
 specific fragment forms (React.Fragment, Vue's <template>, etc.).
 @End Reasoning
 Process called "parse_jsx_fragment" takes parser as Integer returns Integer:
-    Let fragment be proc create_ast_node from JSX_FRAGMENT
+    Let fragment be proc create_ast_node with JSX_FRAGMENT
 
-    proc expect_token with parser, 17, "Expected '<>'"
+    Note: A fragment opens with JSX_FRAGMENT_OPEN (18, the '<>' token).
+    proc expect_token with parser, 18, "Expected '<>'"
 
     Note:
-    Parse children
+    Parse children. The fragment body ends at the closing '</>' which the
+    lexer surfaces either as JSX_CLOSING_TAG_START (13, the '</' of '</>')
+    or, when '</' is immediately followed by another '<', as
+    JSX_FRAGMENT_CLOSE (19). Children mirror element children: JSX_TEXT (15),
+    JSX_EXPRESSION_START (16), nested JSX_TAG_OPEN (10), and nested
+    JSX_FRAGMENT_OPEN (18). Any other token is consumed unconditionally so
+    the loop always advances.
     :End Note
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to 0:
             Break
         End If
 
-        If token_type is equal to 18:
+        If token_type is equal to 13:
             Break
         End If
 
-        If token_type is equal to 14:
-            Let text_node be proc parse_jsx_text from parser
+        If token_type is equal to 19:
+            Break
+        End If
+
+        If token_type is equal to 15:
+            Let text_node be proc parse_jsx_text with parser
             If text_node is not equal to 0:
                 proc add_child with fragment, text_node
+            Otherwise:
+                proc advance_token with parser
             End If
         Otherwise:
-            If token_type is equal to 15:
-                Let expr_node be proc parse_jsx_expression from parser
+            If token_type is equal to 16:
+                Let expr_node be proc parse_jsx_expression with parser
                 If expr_node is not equal to 0:
                     proc add_child with fragment, expr_node
                 End If
             Otherwise:
                 If token_type is equal to 10:
-                    Let element be proc parse_jsx_element from parser
+                    Let element be proc parse_jsx_element with parser
                     If element is not equal to 0:
                         proc add_child with fragment, element
+                    Otherwise:
+                        proc advance_token with parser
                     End If
                 Otherwise:
-                    If token_type is equal to 17:
-                        Let nested_fragment be proc parse_jsx_fragment from parser
+                    If token_type is equal to 18:
+                        Let nested_fragment be proc parse_jsx_fragment with parser
                         If nested_fragment is not equal to 0:
                             proc add_child with fragment, nested_fragment
                         Otherwise:
-                            Break
+                            proc advance_token with parser
                         End If
+                    Otherwise:
+                        Note: Unrecognised token — consume for forward progress.
+                        proc advance_token with parser
                     End If
                 End If
             End If
         End If
     End While
 
-    proc expect_token with parser, 18, "Expected '</>'"
+    Note:
+    Consume the closing '</>'. Skip the JSX_CLOSING_TAG_START / FRAGMENT_CLOSE
+    token, then advance up to and including the terminating '>' (which appears
+    as JSX_TAG_CLOSE (11), GT (47), or JSX_FRAGMENT_CLOSE (19) depending on
+    residual depth). Every iteration consumes a token, guaranteeing
+    termination.
+    :End Note
+    Let close_type be proc current_token_type with parser
+
+    If close_type is equal to 13:
+        proc advance_token with parser
+    End If
+
+    If close_type is equal to 19:
+        proc advance_token with parser
+        Return fragment
+    End If
+
+    While 1 is equal to 1:
+        Set close_type to proc current_token_type with parser
+
+        If close_type is equal to 0:
+            Break
+        End If
+
+        If close_type is equal to 11:
+            proc advance_token with parser
+            Break
+        End If
+
+        If close_type is equal to 47:
+            proc advance_token with parser
+            Break
+        End If
+
+        If close_type is equal to 19:
+            proc advance_token with parser
+            Break
+        End If
+
+        proc advance_token with parser
+    End While
 
     Return fragment
 End Process
@@ -784,23 +916,23 @@ declarator as a name + optional initialiser pair, separated by commas
 until the statement terminator.
 @End Reasoning
 Process called "parse_variable_declaration" takes parser as Integer returns Integer:
-    Let decl be proc create_ast_node from JS_VARIABLE_DECLARATION
+    Let decl be proc create_ast_node with JS_VARIABLE_DECLARATION
 
     Let current_token be proc memory_get_int64 from Layout with parser, 8
     Let text be proc memory_get_int64 from Layout with current_token, 8
     Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-    Let kind_node be proc create_ast_node from JS_IDENTIFIER
+    Let kind_node be proc create_ast_node with JS_IDENTIFIER
     proc memory_set_int64 from Layout with kind_node, 8, text
     proc memory_set_int64 from Layout with kind_node, 16, text_length
 
     proc add_child with decl, kind_node
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note:
     Variable name
     :End Note
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 1:
         Return decl
@@ -810,23 +942,23 @@ Process called "parse_variable_declaration" takes parser as Integer returns Inte
     Set text to proc memory_get_int64 from Layout with current_token, 8
     Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-    Let name_node be proc create_ast_node from JS_IDENTIFIER
+    Let name_node be proc create_ast_node with JS_IDENTIFIER
     proc memory_set_int64 from Layout with name_node, 8, text
     proc memory_set_int64 from Layout with name_node, 16, text_length
 
     proc add_child with decl, name_node
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note:
     Optional type annotation : Type
     :End Note
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 29:
-        proc advance_token from parser
+        proc advance_token with parser
 
         While 1 is equal to 1:
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
 
             If token_type is equal to 40:
                 Break
@@ -836,28 +968,28 @@ Process called "parse_variable_declaration" takes parser as Integer returns Inte
                 Break
             End If
 
-            proc advance_token from parser
+            proc advance_token with parser
         End While
     End If
 
     Note:
     Initializer = expr
     :End Note
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 40:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let init_expr be proc parse_expression from parser
+        Let init_expr be proc parse_expression with parser
         If init_expr is not equal to 0:
             proc add_child with decl, init_expr
         End If
     End If
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 28:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Return decl
@@ -871,33 +1003,33 @@ functions and function expressions are handled separately by
 parse_arrow_function / parse_primary_expression.
 @End Reasoning
 Process called "parse_function_declaration" takes parser as Integer returns Integer:
-    Let func be proc create_ast_node from JS_FUNCTION_DECLARATION
+    Let func be proc create_ast_node with JS_FUNCTION_DECLARATION
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note:
     Function name
     :End Note
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to 1:
         Let current_token be proc memory_get_int64 from Layout with parser, 8
         Let text be proc memory_get_int64 from Layout with current_token, 8
         Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-        Let name_node be proc create_ast_node from JS_IDENTIFIER
+        Let name_node be proc create_ast_node with JS_IDENTIFIER
         proc memory_set_int64 from Layout with name_node, 8, text
         proc memory_set_int64 from Layout with name_node, 16, text_length
 
         proc add_child with func, name_node
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note:
     Skip parameters and return type
     :End Note
     While 1 is equal to 1:
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         If token_type is equal to 22:
             Break
@@ -907,13 +1039,13 @@ Process called "parse_function_declaration" takes parser as Integer returns Inte
             Break
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
     End While
 
     Note:
     Function body
     :End Note
-    Let body be proc parse_block_statement from parser
+    Let body be proc parse_block_statement with parser
     If body is not equal to 0:
         proc add_child with func, body
     End If
@@ -928,25 +1060,25 @@ unless the next token is a statement terminator (semicolon or
 newline-handled-as-ASI). Bare returns produce a node with no child.
 @End Reasoning
 Process called "parse_return_statement" takes parser as Integer returns Integer:
-    Let ret be proc create_ast_node from JS_RETURN_STATEMENT
+    Let ret be proc create_ast_node with JS_RETURN_STATEMENT
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 28:
         If token_type is not equal to 23:
-            Let expr be proc parse_expression from parser
+            Let expr be proc parse_expression with parser
             If expr is not equal to 0:
                 proc add_child with ret, expr
             End If
         End If
     End If
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 28:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Return ret
@@ -960,12 +1092,12 @@ closing brace. Each parsed statement becomes a child of the block
 node.
 @End Reasoning
 Process called "parse_block_statement" takes parser as Integer returns Integer:
-    Let block be proc create_ast_node from JS_BLOCK_STATEMENT
+    Let block be proc create_ast_node with JS_BLOCK_STATEMENT
 
     proc expect_token with parser, 22, "Expected '{'"
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to 23:
             Break
@@ -975,7 +1107,7 @@ Process called "parse_block_statement" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let statement be proc parse_statement from parser
+        Let statement be proc parse_statement with parser
         If statement is not equal to 0:
             proc add_child with block, statement
         End If
@@ -994,7 +1126,7 @@ v0.0.8.5; that production lives in the higher-level statement
 parser when needed.
 @End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
-    Return proc parse_conditional_expression from parser
+    Return proc parse_conditional_expression with parser
 End Process
 
 @Reasoning:
@@ -1004,20 +1136,20 @@ both the then and else branches, matching ECMAScript semantics for
 chained ternaries.
 @End Reasoning
 Process called "parse_conditional_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_logical_or_expression from parser
+    Let left be proc parse_logical_or_expression with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to 30:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let consequent be proc parse_expression from parser
+        Let consequent be proc parse_expression with parser
 
         proc expect_token with parser, 29, "Expected ':'"
 
-        Let alternate be proc parse_expression from parser
+        Let alternate be proc parse_expression with parser
 
-        Let ternary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let ternary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with ternary, left
         proc add_child with ternary, consequent
         proc add_child with ternary, alternate
@@ -1034,20 +1166,20 @@ climbing loop. ECMAScript's || has short-circuit semantics that
 the destination emitter is responsible for preserving.
 @End Reasoning
 Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_logical_and_expression from parser
+    Let left be proc parse_logical_and_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 53:
             Break
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_logical_and_expression from parser
+        Let right be proc parse_logical_and_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1063,20 +1195,20 @@ pattern as logical-or but binds tighter. Short-circuit semantics
 preserved through to the destination by the HIR lowering.
 @End Reasoning
 Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_equality_expression from parser
+    Let left be proc parse_equality_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 52:
             Break
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_equality_expression from parser
+        Let right be proc parse_equality_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1093,10 +1225,10 @@ specific operator into the binary-op node so the destination
 emitter can choose between strict and loose equality semantics.
 @End Reasoning
 Process called "parse_equality_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_relational_expression from parser
+    Let left be proc parse_relational_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 50:
             If token_type is not equal to 51:
@@ -1104,11 +1236,11 @@ Process called "parse_equality_expression" takes parser as Integer returns Integ
             End If
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_relational_expression from parser
+        Let right be proc parse_relational_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1125,10 +1257,10 @@ ordinary binary operators at this level even though they have
 distinct runtime semantics; the HIR lowering chooses the right form.
 @End Reasoning
 Process called "parse_relational_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_additive_expression from parser
+    Let left be proc parse_additive_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 46:
             If token_type is not equal to 47:
@@ -1140,11 +1272,11 @@ Process called "parse_relational_expression" takes parser as Integer returns Int
             End If
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_additive_expression from parser
+        Let right be proc parse_additive_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1161,10 +1293,10 @@ coercion rules; the parser captures the operator and lets the
 destination emitter handle the polymorphism.
 @End Reasoning
 Process called "parse_additive_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_multiplicative_expression from parser
+    Let left be proc parse_multiplicative_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 41:
             If token_type is not equal to 42:
@@ -1172,11 +1304,11 @@ Process called "parse_additive_expression" takes parser as Integer returns Integ
             End If
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_multiplicative_expression from parser
+        Let right be proc parse_multiplicative_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1193,10 +1325,10 @@ recursing into parse_unary_expression for the right operand, so
 2**3**2 evaluates as 2**(3**2) per ECMAScript.
 @End Reasoning
 Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_unary_expression from parser
+    Let left be proc parse_unary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is not equal to 43:
             If token_type is not equal to 44:
@@ -1206,11 +1338,11 @@ Process called "parse_multiplicative_expression" takes parser as Integer returns
             End If
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let right be proc parse_unary_expression from parser
+        Let right be proc parse_unary_expression with parser
 
-        Let binary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let binary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with binary, left
         proc add_child with binary, right
 
@@ -1227,42 +1359,42 @@ operand sub-tree. typeof/void/delete are keyword-form unary
 operators distinguished from the symbolic ones by the leading token.
 @End Reasoning
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to 54:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let operand be proc parse_unary_expression from parser
+        Let operand be proc parse_unary_expression with parser
 
-        Let unary be proc create_ast_node from JS_BINARY_EXPRESSION
+        Let unary be proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with unary, operand
 
         Return unary
     End If
 
     If token_type is equal to 42:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Set operand to proc parse_unary_expression from parser
+        Set operand to proc parse_unary_expression with parser
 
-        Set unary to proc create_ast_node from JS_BINARY_EXPRESSION
+        Set unary to proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with unary, operand
 
         Return unary
     End If
 
     If token_type is equal to 41:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Set operand to proc parse_unary_expression from parser
+        Set operand to proc parse_unary_expression with parser
 
-        Set unary to proc create_ast_node from JS_BINARY_EXPRESSION
+        Set unary to proc create_ast_node with JS_BINARY_EXPRESSION
         proc add_child with unary, operand
 
         Return unary
     End If
 
-    Return proc parse_postfix_expression from parser
+    Return proc parse_postfix_expression with parser
 End Process
 
 @Reasoning:
@@ -1273,34 +1405,34 @@ around a primary expression, so chains like obj.foo()[0].bar all
 build correctly without left-recursion.
 @End Reasoning
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
-    Let left be proc parse_primary_expression from parser
+    Let left be proc parse_primary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note:
         Member access .property
         :End Note
         If token_type is equal to 26:
-            proc advance_token from parser
+            proc advance_token with parser
 
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
 
             If token_type is equal to 1:
                 Let current_token be proc memory_get_int64 from Layout with parser, 8
                 Let text be proc memory_get_int64 from Layout with current_token, 8
                 Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-                Let property be proc create_ast_node from JS_IDENTIFIER
+                Let property be proc create_ast_node with JS_IDENTIFIER
                 proc memory_set_int64 from Layout with property, 8, text
                 proc memory_set_int64 from Layout with property, 16, text_length
 
-                Let member be proc create_ast_node from JSX_MEMBER_EXPRESSION
+                Let member be proc create_ast_node with JSX_MEMBER_EXPRESSION
                 proc add_child with member, left
                 proc add_child with member, property
 
                 Set left to member
-                proc advance_token from parser
+                proc advance_token with parser
             Otherwise:
                 Break
             End If
@@ -1309,13 +1441,13 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
             Array access [index]
             :End Note
             If token_type is equal to 24:
-                proc advance_token from parser
+                proc advance_token with parser
 
-                Let index_expr be proc parse_expression from parser
+                Let index_expr be proc parse_expression with parser
 
                 proc expect_token with parser, 25, "Expected ']'"
 
-                Set member to proc create_ast_node from JSX_MEMBER_EXPRESSION
+                Set member to proc create_ast_node with JSX_MEMBER_EXPRESSION
                 proc add_child with member, left
                 proc add_child with member, index_expr
 
@@ -1325,28 +1457,28 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
                 Function call (args)
                 :End Note
                 If token_type is equal to 20:
-                    proc advance_token from parser
+                    proc advance_token with parser
 
-                    Let call be proc create_ast_node from JS_CALL_EXPRESSION
+                    Let call be proc create_ast_node with JS_CALL_EXPRESSION
                     proc add_child with call, left
 
-                    Set token_type to proc current_token_type from parser
+                    Set token_type to proc current_token_type with parser
 
                     While token_type is not equal to 21:
                         If token_type is equal to 0:
                             Break
                         End If
 
-                        Let arg be proc parse_expression from parser
+                        Let arg be proc parse_expression with parser
                         If arg is not equal to 0:
                             proc add_child with call, arg
                         End If
 
-                        Set token_type to proc current_token_type from parser
+                        Set token_type to proc current_token_type with parser
 
                         If token_type is equal to 27:
-                            proc advance_token from parser
-                            Set token_type to proc current_token_type from parser
+                            proc advance_token with parser
+                            Set token_type to proc current_token_type with parser
                         End If
                     End While
 
@@ -1372,20 +1504,20 @@ function expressions, arrow functions, template literals, and the
 token type and routes to the right constructor.
 @End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note:
     JSX element
     :End Note
     If token_type is equal to 10:
-        Return proc parse_jsx_element from parser
+        Return proc parse_jsx_element with parser
     End If
 
     Note:
-    JSX fragment
+    JSX fragment (opens with JSX_FRAGMENT_OPEN = 18)
     :End Note
-    If token_type is equal to 17:
-        Return proc parse_jsx_fragment from parser
+    If token_type is equal to 18:
+        Return proc parse_jsx_fragment with parser
     End If
 
     Note:
@@ -1396,11 +1528,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Let text be proc memory_get_int64 from Layout with current_token, 8
         Let text_length be proc memory_get_int64 from Layout with current_token, 16
 
-        Let identifier be proc create_ast_node from JS_IDENTIFIER
+        Let identifier be proc create_ast_node with JS_IDENTIFIER
         proc memory_set_int64 from Layout with identifier, 8, text
         proc memory_set_int64 from Layout with identifier, 16, text_length
 
-        proc advance_token from parser
+        proc advance_token with parser
         Return identifier
     End If
 
@@ -1412,11 +1544,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Set text to proc memory_get_int64 from Layout with current_token, 8
         Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-        Let number be proc create_ast_node from JS_LITERAL
+        Let number be proc create_ast_node with JS_LITERAL
         proc memory_set_int64 from Layout with number, 8, text
         proc memory_set_int64 from Layout with number, 16, text_length
 
-        proc advance_token from parser
+        proc advance_token with parser
         Return number
     End If
 
@@ -1428,11 +1560,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Set text to proc memory_get_int64 from Layout with current_token, 8
         Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-        Let string be proc create_ast_node from JS_LITERAL
+        Let string be proc create_ast_node with JS_LITERAL
         proc memory_set_int64 from Layout with string, 8, text
         proc memory_set_int64 from Layout with string, 16, text_length
 
-        proc advance_token from parser
+        proc advance_token with parser
         Return string
     End If
 
@@ -1444,11 +1576,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Set text to proc memory_get_int64 from Layout with current_token, 8
         Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-        Let template be proc create_ast_node from JS_LITERAL
+        Let template be proc create_ast_node with JS_LITERAL
         proc memory_set_int64 from Layout with template, 8, text
         proc memory_set_int64 from Layout with template, 16, text_length
 
-        proc advance_token from parser
+        proc advance_token with parser
         Return template
     End If
 
@@ -1460,11 +1592,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Set text to proc memory_get_int64 from Layout with current_token, 8
         Set text_length to proc memory_get_int64 from Layout with current_token, 16
 
-        Let keyword be proc create_ast_node from JS_LITERAL
+        Let keyword be proc create_ast_node with JS_LITERAL
         proc memory_set_int64 from Layout with keyword, 8, text
         proc memory_set_int64 from Layout with keyword, 16, text_length
 
-        proc advance_token from parser
+        proc advance_token with parser
         Return keyword
     End If
 
@@ -1472,9 +1604,9 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Parenthesized expression
     :End Note
     If token_type is equal to 20:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let expr be proc parse_expression from parser
+        Let expr be proc parse_expression with parser
 
         proc expect_token with parser, 21, "Expected ')'"
 
@@ -1485,27 +1617,27 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Array literal
     :End Note
     If token_type is equal to 24:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let array be proc create_ast_node from JS_ARRAY_EXPRESSION
+        Let array be proc create_ast_node with JS_ARRAY_EXPRESSION
 
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         While token_type is not equal to 25:
             If token_type is equal to 0:
                 Break
             End If
 
-            Let element be proc parse_expression from parser
+            Let element be proc parse_expression with parser
             If element is not equal to 0:
                 proc add_child with array, element
             End If
 
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
 
             If token_type is equal to 27:
-                proc advance_token from parser
-                Set token_type to proc current_token_type from parser
+                proc advance_token with parser
+                Set token_type to proc current_token_type with parser
             End If
         End While
 
@@ -1518,11 +1650,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Object literal
     :End Note
     If token_type is equal to 22:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let object be proc create_ast_node from JS_OBJECT_EXPRESSION
+        Let object be proc create_ast_node with JS_OBJECT_EXPRESSION
 
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         While token_type is not equal to 23:
             If token_type is equal to 0:
@@ -1532,11 +1664,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
             Note:
             Property key
             :End Note
-            Let key be proc parse_primary_expression from parser
+            Let key be proc parse_primary_expression with parser
 
             proc expect_token with parser, 29, "Expected ':'"
 
-            Let value be proc parse_expression from parser
+            Let value be proc parse_expression with parser
 
             If key is not equal to 0:
                 proc add_child with object, key
@@ -1546,11 +1678,11 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
                 proc add_child with object, value
             End If
 
-            Set token_type to proc current_token_type from parser
+            Set token_type to proc current_token_type with parser
 
             If token_type is equal to 27:
-                proc advance_token from parser
-                Set token_type to proc current_token_type from parser
+                proc advance_token with parser
+                Set token_type to proc current_token_type with parser
             End If
         End While
 
@@ -1563,7 +1695,7 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Arrow function
     :End Note
     If token_type is equal to 31:
-        Return proc parse_arrow_function from parser
+        Return proc parse_arrow_function with parser
     End If
 
     Return 0
@@ -1578,43 +1710,58 @@ or a block-statement (explicit returns required); the parser
 captures which form via a flag on the resulting node.
 @End Reasoning
 Process called "parse_arrow_function" takes parser as Integer returns Integer:
-    Let func be proc create_ast_node from JS_ARROW_FUNCTION
+    Let func be proc create_ast_node with JS_ARROW_FUNCTION
 
-    Note: Parse arrow function parameters
-    Note: Parameters can be: () or (x) or (x, y) or x (single param without parens)
-    Let params_list be proc create_empty_list from List
-    Let token_type be proc current_token_type from parser
+    Note:
+    Parameters can be: () or (x) or (x, y) or x (single param without parens).
+    Params are stored in a memory-array consistent with the rest of the AST:
+    slot 0 of the array holds the parameter count, slots 8.. hold the
+    parameter name string handles. Capacity is 200 params (1608 bytes:
+    one count slot plus 200 name slots).
+    :End Note
+    Let params_array be proc allocate from Layout with 1608
+    proc memory_set_int64 from Layout with params_array, 0, 0
+    Let param_count be 0
+    Let token_type be proc current_token_type with parser
 
     Note: Check for single parameter without parentheses (TOKEN_IDENTIFIER = 1)
     If token_type is equal to 1:
-        Let param_name be proc current_token_value from parser
-        proc append from List with params_list, param_name
-        proc advance_token from parser
+        Let param_name be proc current_token_value with parser
+        Let param_offset be param_count multiplied by 8
+        Set param_offset to param_offset plus 8
+        proc memory_set_int64 from Layout with params_array, param_offset, param_name
+        Set param_count to param_count plus 1
+        proc memory_set_int64 from Layout with params_array, 0, param_count
+        proc advance_token with parser
     Otherwise:
         Note: Expect opening parenthesis for parameter list
         proc expect_token with parser, 9, "Expected '(' or identifier"
 
         Note: Parse comma-separated parameter list
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
         While token_type is not equal to 10:  Note: Not closing paren
             If token_type is equal to 1:  Note: TOKEN_IDENTIFIER
-                Set param_name to proc current_token_value from parser
-                proc append from List with params_list, param_name
-                proc advance_token from parser
+                Set param_name to proc current_token_value with parser
+                Let loop_param_offset be param_count multiplied by 8
+                Set loop_param_offset to loop_param_offset plus 8
+                proc memory_set_int64 from Layout with params_array, loop_param_offset, param_name
+                Set param_count to param_count plus 1
+                proc memory_set_int64 from Layout with params_array, 0, param_count
+                proc advance_token with parser
 
                 Note: Check for comma (continue) or closing paren (end)
-                Set token_type to proc current_token_type from parser
+                Set token_type to proc current_token_type with parser
                 If token_type is equal to 18:  Note: TOKEN_COMMA
-                    proc advance_token from parser
-                    Set token_type to proc current_token_type from parser
+                    proc advance_token with parser
+                    Set token_type to proc current_token_type with parser
                 Otherwise:
                     If token_type is equal to 0:  Note: TOKEN_EOF
                         Break
                     End If
                 End If
             Otherwise:
-                proc advance_token from parser
-                Set token_type to proc current_token_type from parser
+                proc advance_token with parser
+                Set token_type to proc current_token_type with parser
             End If
         End While
 
@@ -1622,25 +1769,25 @@ Process called "parse_arrow_function" takes parser as Integer returns Integer:
         proc expect_token with parser, 10, "Expected ')'"
     End If
 
-    Note: Store parameters in function node
-    proc memory_set_int64 from Layout with func, 16, params_list
+    Note: Store parameters array pointer in function node (slot 16)
+    proc memory_set_int64 from Layout with func, 16, params_array
 
     Note: Expect arrow =>
     proc expect_token with parser, 31, "Expected '=>'"
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     Note:
     Block body { ... }
     :End Note
     If token_type is equal to 22:
-        Let body be proc parse_block_statement from parser
+        Let body be proc parse_block_statement with parser
         proc add_child with func, body
     Otherwise:
         Note:
         Expression body
         :End Note
-        Let expr be proc parse_expression from parser
+        Let expr be proc parse_expression with parser
         If expr is not equal to 0:
             proc add_child with func, expr
         End If
