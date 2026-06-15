@@ -1,0 +1,420 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+VHDL (HDL) Translation Round-Trip Probe
+
+End-to-end proof that the VHDL translation pipeline is REAL, not a skeleton:
+
+    VHDL source
+      -> vhdl_lexer    (tokenize: entity/architecture/signal/process,
+                        port/in/out, std_logic/std_logic_vector, downto,
+                        if/then/end if, <=, rising_edge, identifiers, numbers)
+      -> vhdl_parser   (build design-file AST of entity/architecture nodes,
+                        port-decl/signal-decl/concurrent-assign/process AST)
+      -> vhdl_to_hir   (lower the design file to a HIR_PROGRAM whose "modules"
+                        list carries one HIR_MODULE per design unit; an entity
+                        module's body holds is_port HIR_VARIABLE_DECL nodes, an
+                        architecture module's body holds the signal var-decl, a
+                        concurrent HIR_ASSIGNMENT, and a process HIR_FUNCTION)
+      -> hir_to_vhdl   (emit the HIR program back to VHDL source text)
+
+The probe feeds a representative single-entity design containing:
+  - an entity header with a port clause
+        (clk : in std_logic; q : out std_logic_vector(7 downto 0))
+  - an architecture with:
+      * a signal declaration                 (signal q_reg : std_logic_vector(7 downto 0);)
+      * a concurrent signal assignment        (q <= q_reg;)
+      * a clocked process with an edge test and a sequential assignment
+            (process(clk) begin if rising_edge(clk) then q_reg <= q_reg; end if; end process;)
+
+It then:
+
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     root is a HIR_PROGRAM carrying a non-empty "modules" list. It locates the
+     entity module (the module whose body holds an is_port variable
+     declaration) and the architecture module (the module whose body holds an
+     executable assignment/process), and asserts the entity's first port name
+     and direction, the architecture's signal declaration name, the concurrent
+     assignment's target+value identifiers, and the process function's
+     sensitivity list and if-statement body all survived the first lowering.
+  2. Emits the HIR back to VHDL text and asserts the text is non-empty.
+  3. Re-lexes / re-parses / re-lowers the emitted VHDL text into a SECOND HIR
+     program and asserts STRUCTURAL survival DIRECTLY on that second HIR: the
+     program still carries modules, an entity module still exposes a port with
+     the same name and direction, an architecture module still carries a signal
+     declaration, a concurrent assignment with the same target+value, and a
+     process function with a sensitivity list and an if body. This second-
+     emission assertion is whitespace- and indentation-insensitive and so
+     proves round-trip fidelity, not mere non-emptiness.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_lexer.runa" as VhdlLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_parser.runa" as VhdlParser
+Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_to_hir.runa" as VhdlFrontend
+Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_hir.runa" as HirNodes
+Import "compiler/middle/gungnir/hir/translation/backends/vhdl/hir_to_vhdl.runa" as VhdlBackend
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: VHDL source -> HIR program node
+Note: ============================================================================
+
+@Reasoning:
+The VHDL pipeline exposes its stages individually: create_lexer builds the
+byte-positioned lexer; next_token pulls one token at a time until TOKEN_EOF, so
+the probe accumulates the full token list (EOF included) the parser expects;
+create_parser/parse build the design-file AST; and VhdlFrontend.translate lowers
+the whole file to a HIR_PROGRAM. Returning that program pointer (or 0 on any
+stage failure) lets the caller assert on one value.
+@End Reasoning
+Process called "vhdl_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from VhdlLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the token list by pulling tokens until EOF (inclusive).
+    Let tokens be proc list_create from List
+    Let token_count be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let token be proc next_token from VhdlLexer with lexer
+        If token is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            proc list_append from List with tokens, token
+            Set token_count to token_count plus 1
+            Let kind be proc memory_get_int64 from Layout with token, 0
+            If kind is equal to VhdlLexer.TOKEN_EOF:
+                Set scanning to 0
+            End If
+        End If
+    End While
+
+    Let parser be proc create_parser from VhdlParser with tokens, token_count
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from VhdlParser with tokens, token_count
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir_program be proc translate from VhdlFrontend with ast
+    Return hir_program
+End Process
+
+Note: ============================================================================
+Note: HIR program / module accessors (read the dict-tagged HIR shared model)
+Note: ============================================================================
+
+@Reasoning:
+Every HIR node stores its kind constant under the "type" attribute. Returns it so
+assertions and locators can dispatch on program / module / variable / assignment
+/ function node kinds.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_attribute from HirNodes with node, "type"
+End Process
+
+@Reasoning:
+The HIR program root carries its lowered design units under "modules".
+@End Reasoning
+Process called "program_modules" takes program as Integer returns Integer:
+    Return proc get_attribute from HirNodes with program, "modules"
+End Process
+
+@Reasoning:
+A module's body is the list of its lowered items (port/signal var-decls,
+assignments, process functions).
+@End Reasoning
+Process called "module_body" takes module as Integer returns Integer:
+    Return proc get_attribute from HirNodes with module, "body"
+End Process
+
+@Reasoning:
+Locates the entity module: the first module whose body holds an is_port
+variable declaration. The entity interface lowers to a module whose ports are
+HIR_VARIABLE_DECL nodes marked is_port, so this distinguishes it from the
+architecture module (whose body holds executable items).
+@End Reasoning
+Process called "find_entity_module" takes program as Integer returns Integer:
+    Let modules be proc program_modules with program
+    If modules is equal to 0:
+        Return 0
+    End If
+    Let module_count be proc size from List with modules
+    Let m be 0
+    While m is less than module_count:
+        Let module be proc get from List with modules, m
+        Let body be proc module_body with module
+        If body is not equal to 0:
+            Let item_count be proc size from List with body
+            Let i be 0
+            While i is less than item_count:
+                Let item be proc get from List with body, i
+                Let is_port be proc get_attribute from HirNodes with item, "is_port"
+                If is_port is equal to 1:
+                    Return module
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set m to m plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the first is_port variable declaration in a module's body, or 0 if
+none. Used to assert a port's name and direction survived.
+@End Reasoning
+Process called "first_port" takes module as Integer returns Integer:
+    Let body be proc module_body with module
+    If body is equal to 0:
+        Return 0
+    End If
+    Let item_count be proc size from List with body
+    Let i be 0
+    While i is less than item_count:
+        Let item be proc get from List with body, i
+        Let is_port be proc get_attribute from HirNodes with item, "is_port"
+        If is_port is equal to 1:
+            Return item
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the architecture module: the first module whose body holds an
+executable item (a HIR_ASSIGNMENT or a process HIR_FUNCTION). The architecture's
+concurrent statements and process lower into the architecture module's body.
+@End Reasoning
+Process called "find_architecture_module" takes program as Integer returns Integer:
+    Let modules be proc program_modules with program
+    If modules is equal to 0:
+        Return 0
+    End If
+    Let module_count be proc size from List with modules
+    Let m be 0
+    While m is less than module_count:
+        Let module be proc get from List with modules, m
+        Let body be proc module_body with module
+        If body is not equal to 0:
+            Let item_count be proc size from List with body
+            Let i be 0
+            While i is less than item_count:
+                Let item be proc get from List with body, i
+                Let kind be proc get_attribute from HirNodes with item, "type"
+                If kind is equal to HirNodes.HIR_ASSIGNMENT:
+                    Return module
+                End If
+                If kind is equal to HirNodes.HIR_FUNCTION:
+                    Return module
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set m to m plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the first body item of the requested kind within a module, or 0 if
+none. Used to locate the signal declaration, the concurrent assignment, and the
+process function without depending on their exact body positions.
+@End Reasoning
+Process called "first_item_of_kind" takes module as Integer, kind as Integer returns Integer:
+    Let body be proc module_body with module
+    If body is equal to 0:
+        Return 0
+    End If
+    Let item_count be proc size from List with body
+    Let i be 0
+    While i is less than item_count:
+        Let item be proc get from List with body, i
+        Let item_kind be proc get_attribute from HirNodes with item, "type"
+        If item_kind is equal to kind:
+            Return item
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the first signal variable declaration (HIR_VARIABLE_DECL marked
+is_signal) in a module body, or 0 if none. Signals lower to is_signal-tagged
+variable declarations, distinct from is_port port declarations.
+@End Reasoning
+Process called "first_signal" takes module as Integer returns Integer:
+    Let body be proc module_body with module
+    If body is equal to 0:
+        Return 0
+    End If
+    Let item_count be proc size from List with body
+    Let i be 0
+    While i is less than item_count:
+        Let item be proc get from List with body, i
+        Let is_signal be proc get_attribute from HirNodes with item, "is_signal"
+        If is_signal is equal to 1:
+            Return item
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+An assignment node stores its target and value HIR nodes under "target" and
+"value"; the target is an identifier whose "name" is the assigned signal.
+@End Reasoning
+Process called "assignment_target_name" takes assign as Integer returns Integer:
+    If assign is equal to 0:
+        Return 0
+    End If
+    Let target be proc get_attribute from HirNodes with assign, "target"
+    If target is equal to 0:
+        Return 0
+    End If
+    Return proc get_attribute from HirNodes with target, "name"
+End Process
+
+Process called "assignment_value_node" takes assign as Integer returns Integer:
+    If assign is equal to 0:
+        Return 0
+    End If
+    Return proc get_attribute from HirNodes with assign, "value"
+End Process
+
+Note: ============================================================================
+Note: Structural assertions over one HIR program
+Note: ============================================================================
+
+@Reasoning:
+Factors the full battery of structural checks so it can run identically against
+the stage-1 HIR and the round-trip (second-emission) HIR. label distinguishes
+the two runs in the assertion names. Returns nothing; records into results.
+@End Reasoning
+Process called "assert_structure" takes results as Integer, label as Integer, program as Integer returns Integer:
+    Let root_kind be proc node_kind with program
+    proc assert_equal from TestUtils with results, label, root_kind, HirNodes.HIR_PROGRAM
+
+    Let modules be proc program_modules with program
+    proc assert_not_null from TestUtils with results, label, modules
+    Let module_count be proc size from List with modules
+    proc assert_greater_than from TestUtils with results, label, module_count, 0
+
+    Note: Entity module: a port survives with name and direction.
+    Let entity_module be proc find_entity_module with program
+    proc assert_not_null from TestUtils with results, label, entity_module
+    Let port be proc first_port with entity_module
+    proc assert_not_null from TestUtils with results, label, port
+    Let port_name be proc get_attribute from HirNodes with port, "name"
+    proc assert_string_equal from TestUtils with results, label, port_name, "clk"
+    Let port_mode be proc get_attribute from HirNodes with port, "mode"
+    proc assert_string_equal from TestUtils with results, label, port_mode, "in"
+
+    Note: Architecture module: signal decl + concurrent assignment + process.
+    Let arch_module be proc find_architecture_module with program
+    proc assert_not_null from TestUtils with results, label, arch_module
+
+    Let signal be proc first_signal with arch_module
+    proc assert_not_null from TestUtils with results, label, signal
+    Let signal_name be proc get_attribute from HirNodes with signal, "name"
+    proc assert_string_equal from TestUtils with results, label, signal_name, "q_reg"
+
+    Let assign be proc first_item_of_kind with arch_module, HirNodes.HIR_ASSIGNMENT
+    proc assert_not_null from TestUtils with results, label, assign
+    Let assign_target be proc assignment_target_name with assign
+    proc assert_string_equal from TestUtils with results, label, assign_target, "q"
+    Let assign_value be proc assignment_value_node with assign
+    proc assert_not_null from TestUtils with results, label, assign_value
+    Let assign_value_name be proc get_attribute from HirNodes with assign_value, "name"
+    proc assert_string_equal from TestUtils with results, label, assign_value_name, "q_reg"
+
+    Let process_func be proc first_item_of_kind with arch_module, HirNodes.HIR_FUNCTION
+    proc assert_not_null from TestUtils with results, label, process_func
+    Let is_process be proc get_attribute from HirNodes with process_func, "is_process"
+    proc assert_equal from TestUtils with results, label, is_process, 1
+    Let sensitivity be proc get_attribute from HirNodes with process_func, "sensitivity_list"
+    proc assert_not_null from TestUtils with results, label, sensitivity
+
+    Let process_body be proc get_attribute from HirNodes with process_func, "body"
+    proc assert_not_null from TestUtils with results, label, process_body
+    Let body_count be proc size from List with process_body
+    proc assert_greater_than from TestUtils with results, label, body_count, 0
+
+    Note: The process body's clocked branch lowers to a HIR_IF.
+    Let if_node be 0
+    Let bi be 0
+    While bi is less than body_count:
+        Let stmt be proc get from List with process_body, bi
+        Let skind be proc get_attribute from HirNodes with stmt, "type"
+        If skind is equal to HirNodes.HIR_IF:
+            Set if_node to stmt
+        End If
+        Set bi to bi plus 1
+    End While
+    proc assert_not_null from TestUtils with results, label, if_node
+    Let if_condition be proc get_attribute from HirNodes with if_node, "condition"
+    proc assert_not_null from TestUtils with results, label, if_condition
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Test entry point
+Note: ============================================================================
+
+@Reasoning:
+Owns the whole round trip: lower the source, assert structure on the stage-1
+HIR, emit VHDL text, re-lower the emitted text, then assert the identical
+structure battery on the second HIR. Returns the failed-assertion count as the
+process exit code (0 == all passed).
+@End Reasoning
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "VHDL translation round-trip"
+
+    Let source be proc create_from_literal from StringCore with "entity counter is port (clk : in std_logic; q : out std_logic_vector(7 downto 0)); end entity counter; architecture rtl of counter is signal q_reg : std_logic_vector(7 downto 0); begin q <= q_reg; process(clk) begin if rising_edge(clk) then q_reg <= q_reg; end if; end process; end architecture rtl;"
+
+    Note: --- Stage 1: source -> HIR program ---
+    Let hir1 be proc vhdl_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR program", hir1
+    proc assert_structure with results, "stage-1 HIR structure survives", hir1
+
+    Note: --- Stage 2: HIR -> VHDL text ---
+    Let emitted be proc hir_to_vhdl from VhdlBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced VHDL text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted VHDL is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-lower the emitted VHDL text -> HIR (the SECOND
+    Note: emission), then assert the identical structural battery on it. This is
+    Note: the load-bearing round-trip assertion. ---
+    Let hir2 be proc vhdl_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted VHDL produced HIR", hir2
+    proc assert_structure with results, "round-trip HIR structure survives", hir2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

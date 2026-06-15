@@ -3,10 +3,11 @@ Note: Converts VHDL hardware description language constructs to Runa HIR for uni
 Note: Production-perfect implementation with zero technical debt
 
 Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_parser.runa" as VhdlParser
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HirNodes
+Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_hir.runa" as HirNodes
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 
 Note: ==================== Translator State ====================
 
@@ -24,6 +25,7 @@ Type called "VhdlToHirContext":
     architecture_name as Integer
     in_process as Integer
     sensitivity_signals as Integer
+    errors as Integer
 End Type
 
 @Reasoning:
@@ -34,13 +36,50 @@ VhdlToHirContext is a value type instantiated per translation.
 Process called "create_context" returns Integer:
     Let ctx be a value of type VhdlToHirContext with
         current_module as 0,
-        signal_map as proc create_dictionary from ListCore,
-        type_map as proc create_dictionary from ListCore,
+        signal_map as proc create from Dictionary,
+        type_map as proc create from Dictionary,
         entity_name as 0,
         architecture_name as 0,
         in_process as 0,
-        sensitivity_signals as proc create_list from ListCore
+        sensitivity_signals as proc list_create from ListCore,
+        errors as 0
+    Set ctx.errors to proc list_create from ListCore
     Return ctx
+End Process
+
+@Reasoning:
+Records a translation diagnostic on the context. Errors accumulate in a
+list so a single VHDL->HIR pass can report every unsupported construct it
+encountered rather than aborting on the first. The presence of any entry
+signals the caller that the produced HIR contains error placeholders.
+@End Reasoning
+@Implementation:
+Append the message string onto the context's errors list. A null context
+is a no-op so error reporting never itself crashes translation.
+@End Implementation
+Process called "add_translation_error" that takes ctx as Integer, message as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    proc list_append from ListCore with ctx.errors, message
+    Return 1
+End Process
+
+@Reasoning:
+Builds an error placeholder HIR node carrying the diagnostic message. The
+emitter renders it as a comment/identifier so a partially-translatable
+source still produces a structurally complete HIR tree instead of a null
+hole, which keeps downstream walking total.
+@End Reasoning
+@Implementation:
+Create a HIR_NOP node and attach the message under "error"; the NOP kind
+is the natural "no operation / placeholder" node the backend already
+recognises.
+@End Implementation
+Process called "create_hir_error_node" that takes message as Integer returns Integer:
+    Let node be proc create_node from HirNodes with HirNodes.HIR_NOP
+    proc set_attribute from HirNodes with node, "error", message
+    Return node
 End Process
 
 Note: ==================== HIR Node Creation Helpers ====================
@@ -55,7 +94,7 @@ Process called "create_hir_module" that takes name as Integer returns Integer:
 
     Let module be proc create_node from HirNodes with HirNodes.HIR_MODULE
     proc set_attribute from HirNodes with module, "name", name
-    proc set_attribute from HirNodes with module, "body", proc create_list from ListCore
+    proc set_attribute from HirNodes with module, "body", proc list_create from ListCore
 
     Return module
 End Process
@@ -87,7 +126,7 @@ Process called "create_hir_variable" that takes name as Integer, var_type as Int
 
     Let var be proc create_node from HirNodes with HirNodes.HIR_VARIABLE_DECL
     proc set_attribute from HirNodes with var, "name", name
-    proc set_attribute from HirNodes with var, "type", var_type
+    proc set_attribute from HirNodes with var, "data_type", var_type
     If initial_value is not equal to 0:
         proc set_attribute from HirNodes with var, "initializer", initial_value
     End If
@@ -306,21 +345,21 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Identifier
     If node_type is equal to VhdlParser.NODE_IDENTIFIER:
         Let name be proc get_attribute from HirNodes with vhdl_expr, "name"
-        Return proc create_hir_identifier from name
+        Return proc create_hir_identifier with name
     End If
 
     Note: Binary operations
     If node_type is equal to VhdlParser.NODE_BINARY_OP:
         Let operator be proc get_attribute from HirNodes with vhdl_expr, "operator"
         Let children be proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let left be proc list_get with children, 0
-        Let right be proc list_get with children, 1
+        Let left be proc list_get from ListCore with children, 0
+        Let right be proc list_get from ListCore with children, 1
 
         Let left_hir be proc translate_expression with ctx, left
         Let right_hir be proc translate_expression with ctx, right
 
         Note: Map VHDL operators to HIR operators
-        Let hir_op be proc map_vhdl_operator_to_hir from operator
+        Let hir_op be proc map_vhdl_operator_to_hir with operator
 
         Return proc create_hir_binary_op with hir_op, left_hir, right_hir
     End If
@@ -329,11 +368,11 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     If node_type is equal to VhdlParser.NODE_UNARY_OP:
         Set operator to proc get_attribute from HirNodes with vhdl_expr, "operator"
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let operand be proc list_get with children, 0
+        Let operand be proc list_get from ListCore with children, 0
 
         Let operand_hir be proc translate_expression with ctx, operand
 
-        Set hir_op to proc map_vhdl_operator_to_hir from operator
+        Set hir_op to proc map_vhdl_operator_to_hir with operator
 
         Return proc create_hir_unary_op with hir_op, operand_hir
     End If
@@ -343,14 +382,14 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
         Let func_name be proc get_attribute from HirNodes with vhdl_expr, "name"
         Let args be proc get_attribute from HirNodes with vhdl_expr, "arguments"
 
-        Let hir_args be proc create_list from ListCore
+        Let hir_args be proc list_create from ListCore
 
-        Let arg_count be proc list_length from args
+        Let arg_count be proc list_length from ListCore with args
         Let i be 0
         While i is less than arg_count:
-            Let arg be proc list_get with args, i
+            Let arg be proc list_get from ListCore with args, i
             Let hir_arg be proc translate_expression with ctx, arg
-            proc list_append with hir_args, hir_arg
+            proc list_append from ListCore with hir_args, hir_arg
             Set i to i plus 1
         End While
 
@@ -360,8 +399,8 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Array indexing
     If node_type is equal to VhdlParser.NODE_INDEXED_NAME:
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let array be proc list_get with children, 0
-        Let index be proc list_get with children, 1
+        Let array be proc list_get from ListCore with children, 0
+        Let index be proc list_get from ListCore with children, 1
 
         Let array_hir be proc translate_expression with ctx, array
         Let index_hir be proc translate_expression with ctx, index
@@ -373,11 +412,11 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Record field selection
     If node_type is equal to VhdlParser.NODE_SELECTED_NAME:
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let record be proc list_get with children, 0
+        Let record be proc list_get from ListCore with children, 0
         Let field be proc get_attribute from HirNodes with vhdl_expr, "field"
 
         Let record_hir be proc translate_expression with ctx, record
-        Let field_hir be proc create_hir_identifier from field
+        Let field_hir be proc create_hir_identifier with field
 
         Note: Create field access as binary operation
         Return proc create_hir_binary_op with ".", record_hir, field_hir
@@ -386,19 +425,19 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Slice
     If node_type is equal to VhdlParser.NODE_SLICE:
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Set array to proc list_get with children, 0
-        Let start_index be proc list_get with children, 1
-        Let end_index be proc list_get with children, 2
+        Set array to proc list_get from ListCore with children, 0
+        Let start_index be proc list_get from ListCore with children, 1
+        Let end_index be proc list_get from ListCore with children, 2
 
         Set array_hir to proc translate_expression with ctx, array
         Let start_hir be proc translate_expression with ctx, start_index
         Let end_hir be proc translate_expression with ctx, end_index
 
         Note: Create slice as function call to slice operator
-        Let slice_args be proc create_list from ListCore
-        proc list_append with slice_args, array_hir
-        proc list_append with slice_args, start_hir
-        proc list_append with slice_args, end_hir
+        Let slice_args be proc list_create from ListCore
+        proc list_append from ListCore with slice_args, array_hir
+        proc list_append from ListCore with slice_args, start_hir
+        proc list_append from ListCore with slice_args, end_hir
 
         Return proc create_hir_call with "slice", slice_args
     End If
@@ -406,17 +445,17 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Attribute access
     If node_type is equal to VhdlParser.NODE_ATTRIBUTE_NAME:
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let target be proc list_get with children, 0
+        Let target be proc list_get from ListCore with children, 0
         Let attr_name be proc get_attribute from HirNodes with vhdl_expr, "attribute"
 
         Let target_hir be proc translate_expression with ctx, target
 
         Note: Map common VHDL attributes to HIR equivalents
-        Let mapped_attr be proc map_vhdl_attribute from attr_name
+        Let mapped_attr be proc map_vhdl_attribute with attr_name
 
         Note: Create as function call (e.g., length(array) for 'length attribute)
-        Let attr_args be proc create_list from ListCore
-        proc list_append with attr_args, target_hir
+        Let attr_args be proc list_create from ListCore
+        proc list_append from ListCore with attr_args, target_hir
 
         Return proc create_hir_call with mapped_attr, attr_args
     End If
@@ -424,7 +463,7 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     Note: Parenthesized expression
     If node_type is equal to VhdlParser.NODE_PARENTHESIZED:
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
-        Let inner be proc list_get with children, 0
+        Let inner be proc list_get from ListCore with children, 0
         Return proc translate_expression with ctx, inner
     End If
 
@@ -433,13 +472,13 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
         Note: Translate aggregate to array/record literal
         Set children to proc get_attribute from HirNodes with vhdl_expr, "children"
 
-        Let elements be proc create_list from ListCore
-        Let child_count be proc list_length from children
+        Let elements be proc list_create from ListCore
+        Let child_count be proc list_length from ListCore with children
         Set i to 0
         While i is less than child_count:
-            Let child be proc list_get with children, i
+            Let child be proc list_get from ListCore with children, i
             Let element_hir be proc translate_expression with ctx, child
-            proc list_append with elements, element_hir
+            proc list_append from ListCore with elements, element_hir
             Set i to i plus 1
         End While
 
@@ -451,12 +490,13 @@ Process called "translate_expression" that takes ctx as Integer, vhdl_expr as In
     End If
 
     Note: Unknown expression type - create error
-    Let node_type_str be proc integer_to_string from StringCore with node_type
-    Let error_msg be proc string_concat from StringCore with "Unsupported VHDL expression type: ", node_type_str
+    Let node_type_str be proc integer_to_string from StringPrim with node_type
+    Let err_prefix be proc create_from_literal from StringCore with "Unsupported VHDL expression type: "
+    Let error_msg be proc string_concat from StringPrim with err_prefix, node_type_str
     proc add_translation_error with ctx, error_msg
 
     Note: Return error node
-    Return proc create_hir_error_node from error_msg
+    Return proc create_hir_error_node with error_msg
 End Process
 
 @Reasoning:
@@ -652,9 +692,9 @@ Process called "translate_type" that takes ctx as Integer, vhdl_type as Integer 
         Let type_name be proc get_attribute from HirNodes with vhdl_type, "name"
 
         Note: Map common VHDL types to HIR types
-        Let mapped_type be proc map_vhdl_type_to_hir from type_name
+        Let mapped_type be proc map_vhdl_type_to_hir with type_name
 
-        Return proc create_hir_type from mapped_type
+        Return proc create_hir_type with mapped_type
     End If
 
     Note: Array type
@@ -672,20 +712,20 @@ Process called "translate_type" that takes ctx as Integer, vhdl_type as Integer 
     If node_type is equal to VhdlParser.NODE_TYPE_RECORD:
         Let fields be proc get_attribute from HirNodes with vhdl_type, "fields"
 
-        Let hir_fields be proc create_list from ListCore
-        Let field_count be proc list_length from fields
+        Let hir_fields be proc list_create from ListCore
+        Let field_count be proc list_length from ListCore with fields
         Let i be 0
         While i is less than field_count:
-            Let field be proc list_get with fields, i
+            Let field be proc list_get from ListCore with fields, i
             Let field_name be proc get_attribute from HirNodes with field, "name"
-            Let field_type be proc get_attribute from HirNodes with field, "type"
+            Let field_type be proc get_attribute from HirNodes with field, "subtype"
             Let field_type_hir be proc translate_type with ctx, field_type
 
             Let hir_field be proc create_node from HirNodes with HirNodes.HIR_STRUCT_FIELD
             proc set_attribute from HirNodes with hir_field, "name", field_name
-            proc set_attribute from HirNodes with hir_field, "type", field_type_hir
+            proc set_attribute from HirNodes with hir_field, "data_type", field_type_hir
 
-            proc list_append with hir_fields, hir_field
+            proc list_append from ListCore with hir_fields, hir_field
             Set i to i plus 1
         End While
 
@@ -819,8 +859,8 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
     Note: Signal assignment
     If node_type is equal to VhdlParser.NODE_SIGNAL_ASSIGN:
         Let children be proc get_attribute from HirNodes with vhdl_stmt, "children"
-        Let target be proc list_get with children, 0
-        Let value be proc list_get with children, 1
+        Let target be proc list_get from ListCore with children, 0
+        Let value be proc list_get from ListCore with children, 1
 
         Let target_hir be proc translate_expression with ctx, target
         Let value_hir be proc translate_expression with ctx, value
@@ -831,8 +871,8 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
     Note: Variable assignment
     If node_type is equal to VhdlParser.NODE_VARIABLE_ASSIGN:
         Set children to proc get_attribute from HirNodes with vhdl_stmt, "children"
-        Set target to proc list_get with children, 0
-        Set value to proc list_get with children, 1
+        Set target to proc list_get from ListCore with children, 0
+        Set value to proc list_get from ListCore with children, 1
 
         Set target_hir to proc translate_expression with ctx, target
         Set value_hir to proc translate_expression with ctx, value
@@ -927,22 +967,22 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
             Set value_hir to proc translate_expression with ctx, value
         End If
 
-        Return proc create_hir_return from value_hir
+        Return proc create_hir_return with value_hir
     End If
 
     Note: Wait statement (special hardware construct)
     If node_type is equal to VhdlParser.NODE_WAIT_STMT:
         Note: Translate wait as function call to wait primitive
-        Let wait_args be proc create_list from ListCore
+        Let wait_args be proc list_create from ListCore
 
         Let sensitivity be proc get_attribute from HirNodes with vhdl_stmt, "sensitivity_list"
         If sensitivity is not equal to 0:
-            Let sens_count be proc list_length from sensitivity
+            Let sens_count be proc list_length from ListCore with sensitivity
             Let i be 0
             While i is less than sens_count:
-                Let signal be proc list_get with sensitivity, i
+                Let signal be proc list_get from ListCore with sensitivity, i
                 Let signal_hir be proc translate_expression with ctx, signal
-                proc list_append with wait_args, signal_hir
+                proc list_append from ListCore with wait_args, signal_hir
                 Set i to i plus 1
             End While
         End If
@@ -958,12 +998,12 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
         Set condition_hir to proc translate_expression with ctx, condition
 
         Note: Translate as assert function call
-        Let assert_args be proc create_list from ListCore
-        proc list_append with assert_args, condition_hir
+        Let assert_args be proc list_create from ListCore
+        proc list_append from ListCore with assert_args, condition_hir
 
         If message is not equal to 0:
             Let message_hir be proc translate_expression with ctx, message
-            proc list_append with assert_args, message_hir
+            proc list_append from ListCore with assert_args, message_hir
         End If
 
         Return proc create_hir_call with "assert", assert_args
@@ -974,8 +1014,8 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
         Set message to proc get_attribute from HirNodes with vhdl_stmt, "message"
         Set message_hir to proc translate_expression with ctx, message
 
-        Let report_args be proc create_list from ListCore
-        proc list_append with report_args, message_hir
+        Let report_args be proc list_create from ListCore
+        proc list_append from ListCore with report_args, message_hir
 
         Return proc create_hir_call with "report", report_args
     End If
@@ -983,7 +1023,7 @@ Process called "translate_sequential_statement" that takes ctx as Integer, vhdl_
     Note: Procedure call
     If node_type is equal to VhdlParser.NODE_PROCEDURE_CALL:
         Set children to proc get_attribute from HirNodes with vhdl_stmt, "children"
-        Let call_expr be proc list_get with children, 0
+        Let call_expr be proc list_get from ListCore with children, 0
 
         Return proc translate_expression with ctx, call_expr
     End If
@@ -1019,14 +1059,14 @@ counterparts. Used to lower body lists for if-branches, loop bodies, etc.
 Process called "translate_statement_list" that takes ctx as Integer, vhdl_stmts as Integer returns Integer:
     Note: Translate list of VHDL statements to HIR block
 
-    Let hir_stmts be proc create_list from ListCore
+    Let hir_stmts be proc list_create from ListCore
 
-    Let stmt_count be proc list_length from vhdl_stmts
+    Let stmt_count be proc list_length from ListCore with vhdl_stmts
     Let i be 0
     While i is less than stmt_count:
-        Let stmt be proc list_get with vhdl_stmts, i
+        Let stmt be proc list_get from ListCore with vhdl_stmts, i
         Let hir_stmt be proc translate_sequential_statement with ctx, stmt
-        proc list_append with hir_stmts, hir_stmt
+        proc list_append from ListCore with hir_stmts, hir_stmt
         Set i to i plus 1
     End While
 
@@ -1042,14 +1082,14 @@ alternatives so first-match semantics are preserved.
 Process called "translate_case_alternatives" that takes ctx as Integer, selector as Integer, alternatives as Integer returns Integer:
     Note: Translate VHDL case alternatives to if-elsif chain
 
-    Let alt_count be proc list_length from alternatives
+    Let alt_count be proc list_length from ListCore with alternatives
     If alt_count is equal to 0:
         Let nop be proc create_node from HirNodes with HirNodes.HIR_NOP
         Return nop
     End If
 
     Note: Process first alternative
-    Let first_alt be proc list_get with alternatives, 0
+    Let first_alt be proc list_get from ListCore with alternatives, 0
     Let choices be proc get_attribute from HirNodes with first_alt, "choices"
     Let statements be proc get_attribute from HirNodes with first_alt, "statements"
 
@@ -1058,16 +1098,16 @@ Process called "translate_case_alternatives" that takes ctx as Integer, selector
     Let then_block be proc translate_statement_list with ctx, statements
 
     Note: Process remaining alternatives recursively
-    Let remaining_alts be proc create_list from ListCore
+    Let remaining_alts be proc list_create from ListCore
     Let i be 1
     While i is less than alt_count:
-        Let alt be proc list_get with alternatives, i
-        proc list_append with remaining_alts, alt
+        Let alt be proc list_get from ListCore with alternatives, i
+        proc list_append from ListCore with remaining_alts, alt
         Set i to i plus 1
     End While
 
     Let else_block be 0
-    If proc list_length with remaining_alts is greater than 0:
+    If proc list_length from ListCore with remaining_alts is greater than 0:
         Set else_block to proc translate_case_alternatives with ctx, selector, remaining_alts
     End If
 
@@ -1082,13 +1122,13 @@ A single choice produces "selector = choice"; multiple choices are OR-ed.
 Process called "build_case_condition" that takes ctx as Integer, selector as Integer, choices as Integer returns Integer:
     Note: Build condition expression for case alternative
 
-    Let choice_count be proc list_length from choices
+    Let choice_count be proc list_length from ListCore with choices
     If choice_count is equal to 0:
         Return proc create_hir_literal with "false", "boolean"
     End If
 
     Note: First choice
-    Let first_choice be proc list_get with choices, 0
+    Let first_choice be proc list_get from ListCore with choices, 0
 
     Note: Check for "others" clause
     If proc is_string with first_choice is equal to 1:
@@ -1104,7 +1144,7 @@ Process called "build_case_condition" that takes ctx as Integer, selector as Int
     Let result_condition be first_condition
     Let i be 1
     While i is less than choice_count:
-        Let choice be proc list_get with choices, i
+        Let choice be proc list_get from ListCore with choices, i
         Let choice_hir be proc translate_expression with ctx, choice
         Let choice_condition be proc create_hir_binary_op with "==", selector, choice_hir
         Set result_condition to proc create_hir_binary_op with "||", result_condition, choice_condition
@@ -1161,7 +1201,7 @@ Process called "translate_signal_declaration" that takes ctx as Integer, vhdl_de
     Note: Translate VHDL signal declaration to HIR variable
 
     Let names be proc get_attribute from HirNodes with vhdl_decl, "names"
-    Let signal_type be proc get_attribute from HirNodes with vhdl_decl, "type"
+    Let signal_type be proc get_attribute from HirNodes with vhdl_decl, "subtype"
     Let initial_value be proc get_attribute from HirNodes with vhdl_decl, "initial_value"
 
     Let type_hir be proc translate_type with ctx, signal_type
@@ -1172,14 +1212,14 @@ Process called "translate_signal_declaration" that takes ctx as Integer, vhdl_de
     End If
 
     Note: Create variable declaration for first name
-    Let first_name be proc list_get with names, 0
+    Let first_name be proc list_get from ListCore with names, 0
     Let var_decl be proc create_hir_variable with first_name, type_hir, init_hir
 
     Note: Mark as signal (hardware semantic)
     proc set_attribute from HirNodes with var_decl, "is_signal", 1
 
     Note: Record in signal map
-    proc dict_set with ctx.signal_map, first_name, var_decl
+    proc set from Dictionary with ctx.signal_map, first_name, var_decl
 
     Return var_decl
 End Process
@@ -1193,7 +1233,7 @@ Process called "translate_variable_declaration" that takes ctx as Integer, vhdl_
     Note: Translate VHDL variable declaration to HIR variable
 
     Let names be proc get_attribute from HirNodes with vhdl_decl, "names"
-    Let var_type be proc get_attribute from HirNodes with vhdl_decl, "type"
+    Let var_type be proc get_attribute from HirNodes with vhdl_decl, "subtype"
     Let initial_value be proc get_attribute from HirNodes with vhdl_decl, "initial_value"
 
     Let type_hir be proc translate_type with ctx, var_type
@@ -1204,7 +1244,7 @@ Process called "translate_variable_declaration" that takes ctx as Integer, vhdl_
     End If
 
     Note: Create variable declaration for first name
-    Let first_name be proc list_get with names, 0
+    Let first_name be proc list_get from ListCore with names, 0
     Return proc create_hir_variable with first_name, type_hir, init_hir
 End Process
 
@@ -1217,17 +1257,17 @@ Process called "translate_constant_declaration" that takes ctx as Integer, vhdl_
     Note: Translate VHDL constant declaration to HIR constant
 
     Let names be proc get_attribute from HirNodes with vhdl_decl, "names"
-    Let const_type be proc get_attribute from HirNodes with vhdl_decl, "type"
+    Let const_type be proc get_attribute from HirNodes with vhdl_decl, "subtype"
     Let value be proc get_attribute from HirNodes with vhdl_decl, "value"
 
     Let type_hir be proc translate_type with ctx, const_type
     Let value_hir be proc translate_expression with ctx, value
 
     Note: Create constant declaration
-    Let first_name be proc list_get with names, 0
+    Let first_name be proc list_get from ListCore with names, 0
     Let const_decl be proc create_node from HirNodes with HirNodes.HIR_CONSTANT_DECL
     proc set_attribute from HirNodes with const_decl, "name", first_name
-    proc set_attribute from HirNodes with const_decl, "type", type_hir
+    proc set_attribute from HirNodes with const_decl, "data_type", type_hir
     proc set_attribute from HirNodes with const_decl, "value", value_hir
 
     Return const_decl
@@ -1243,16 +1283,16 @@ Process called "translate_type_declaration" that takes ctx as Integer, vhdl_decl
 
     Let type_name be proc get_attribute from HirNodes with vhdl_decl, "name"
     Let children be proc get_attribute from HirNodes with vhdl_decl, "children"
-    Let type_def be proc list_get with children, 0
+    Let type_def be proc list_get from ListCore with children, 0
 
     Let type_hir be proc translate_type with ctx, type_def
 
     Let type_decl be proc create_node from HirNodes with HirNodes.HIR_TYPE_DECL
     proc set_attribute from HirNodes with type_decl, "name", type_name
-    proc set_attribute from HirNodes with type_decl, "type", type_hir
+    proc set_attribute from HirNodes with type_decl, "data_type", type_hir
 
     Note: Record in type map
-    proc dict_set with ctx.type_map, type_name, type_hir
+    proc set from Dictionary with ctx.type_map, type_name, type_hir
 
     Return type_decl
 End Process
@@ -1270,9 +1310,20 @@ Process called "translate_process_statement" that takes ctx as Integer, vhdl_pro
 
     Set ctx.in_process to 1
 
-    Note: Get sensitivity list
-    Let sensitivity be proc get_attribute from HirNodes with vhdl_proc, "sensitivity_list"
-    If sensitivity is not equal to 0:
+    Note: Get sensitivity list and lower each signal reference to HIR so the
+    Note: backend emits identifiers (not raw parser AST nodes) in process(...).
+    Let raw_sensitivity be proc get_attribute from HirNodes with vhdl_proc, "sensitivity_list"
+    Let sensitivity be 0
+    If raw_sensitivity is not equal to 0:
+        Set sensitivity to proc list_create from ListCore
+        Let sens_count be proc list_length from ListCore with raw_sensitivity
+        Let s be 0
+        While s is less than sens_count:
+            Let sens_expr be proc list_get from ListCore with raw_sensitivity, s
+            Let sens_hir be proc translate_expression with ctx, sens_expr
+            proc list_append from ListCore with sensitivity, sens_hir
+            Set s to s plus 1
+        End While
         Set ctx.sensitivity_signals to sensitivity
     End If
 
@@ -1281,33 +1332,34 @@ Process called "translate_process_statement" that takes ctx as Integer, vhdl_pro
     Let statements be proc get_attribute from HirNodes with vhdl_proc, "statements"
 
     Note: Create function body with declarations, statements
-    Let body be proc create_list from ListCore
+    Let body be proc list_create from ListCore
 
     Note: Add declarations
     If declarations is not equal to 0:
-        Let decl_count be proc list_length from declarations
+        Let decl_count be proc list_length from ListCore with declarations
         Let i be 0
         While i is less than decl_count:
-            Let decl be proc list_get with declarations, i
+            Let decl be proc list_get from ListCore with declarations, i
             Let decl_hir be proc translate_declaration with ctx, decl
-            proc list_append with body, decl_hir
+            proc list_append from ListCore with body, decl_hir
             Set i to i plus 1
         End While
     End If
 
     Note: Add statements
-    Let stmt_count be proc list_length from statements
+    Let stmt_count be proc list_length from ListCore with statements
     Set i to 0
     While i is less than stmt_count:
-        Let stmt be proc list_get with statements, i
+        Let stmt be proc list_get from ListCore with statements, i
         Let stmt_hir be proc translate_sequential_statement with ctx, stmt
-        proc list_append with body, stmt_hir
+        proc list_append from ListCore with body, stmt_hir
         Set i to i plus 1
     End While
 
     Note: Create process function
-    Let process_name be proc string_concat from StringCore with ctx.architecture_name, "_process"
-    Let params be proc create_list from ListCore
+    Let process_suffix be proc create_from_literal from StringCore with "_process"
+    Let process_name be proc string_concat from StringPrim with ctx.architecture_name, process_suffix
+    Let params be proc list_create from ListCore
     Let return_type be proc create_hir_type with "Void"
 
     Let process_func be proc create_hir_function with process_name, params, return_type, body
@@ -1319,7 +1371,7 @@ Process called "translate_process_statement" that takes ctx as Integer, vhdl_pro
     End If
 
     Set ctx.in_process to 0
-    Set ctx.sensitivity_signals to proc create_list from ListCore
+    Set ctx.sensitivity_signals to proc list_create from ListCore
 
     Return process_func
 End Process
@@ -1334,8 +1386,8 @@ Process called "translate_concurrent_signal_assignment" that takes ctx as Intege
     Note: Translate concurrent signal assignment to continuous assignment
 
     Let children be proc get_attribute from HirNodes with vhdl_assign, "children"
-    Let target be proc list_get with children, 0
-    Let value be proc list_get with children, 1
+    Let target be proc list_get from ListCore with children, 0
+    Let value be proc list_get from ListCore with children, 1
 
     Let target_hir be proc translate_expression with ctx, target
     Let value_hir be proc translate_expression with ctx, value
@@ -1367,11 +1419,11 @@ Process called "translate_component_instantiation" that takes ctx as Integer, vh
 
     Note: Translate port mappings
     If port_map is not equal to 0:
-        Let mappings be proc create_list from ListCore
-        Let map_count be proc list_length from port_map
+        Let mappings be proc list_create from ListCore
+        Let map_count be proc list_length from ListCore with port_map
         Let i be 0
         While i is less than map_count:
-            Let assoc be proc list_get with port_map, i
+            Let assoc be proc list_get from ListCore with port_map, i
             Let formal be proc get_attribute from HirNodes with assoc, "formal"
             Let actual be proc get_attribute from HirNodes with assoc, "actual"
 
@@ -1384,7 +1436,7 @@ Process called "translate_component_instantiation" that takes ctx as Integer, vh
             End If
             proc set_attribute from HirNodes with mapping, "actual", actual_hir
 
-            proc list_append with mappings, mapping
+            proc list_append from ListCore with mappings, mapping
             Set i to i plus 1
         End While
 
@@ -1488,14 +1540,14 @@ statement domain.
 Process called "translate_concurrent_statements" that takes ctx as Integer, vhdl_stmts as Integer returns Integer:
     Note: Translate list of concurrent statements
 
-    Let hir_stmts be proc create_list from ListCore
+    Let hir_stmts be proc list_create from ListCore
 
-    Let stmt_count be proc list_length from vhdl_stmts
+    Let stmt_count be proc list_length from ListCore with vhdl_stmts
     Let i be 0
     While i is less than stmt_count:
-        Let stmt be proc list_get with vhdl_stmts, i
+        Let stmt be proc list_get from ListCore with vhdl_stmts, i
         Let hir_stmt be proc translate_concurrent_statement with ctx, stmt
-        proc list_append with hir_stmts, hir_stmt
+        proc list_append from ListCore with hir_stmts, hir_stmt
         Set i to i plus 1
     End While
 
@@ -1533,28 +1585,28 @@ Process called "translate_declaration" that takes ctx as Integer, vhdl_decl as I
         Let comp_name be proc get_attribute from HirNodes with vhdl_decl, "name"
         Let ports be proc get_attribute from HirNodes with vhdl_decl, "ports"
 
-        Let comp_module be proc create_hir_module from comp_name
+        Let comp_module be proc create_hir_module with comp_name
 
         Note: Translate ports to module parameters
         If ports is not equal to 0:
-            Let port_count be proc list_length from ports
+            Let port_count be proc list_length from ListCore with ports
             Let i be 0
             While i is less than port_count:
-                Let port_decl be proc list_get with ports, i
+                Let port_decl be proc list_get from ListCore with ports, i
                 Let port_names be proc get_attribute from HirNodes with port_decl, "names"
                 Let port_mode be proc get_attribute from HirNodes with port_decl, "mode"
-                Let port_type be proc get_attribute from HirNodes with port_decl, "type"
+                Let port_type be proc get_attribute from HirNodes with port_decl, "subtype"
 
                 Let type_hir be proc translate_type with ctx, port_type
-                Let name_count be proc list_length from port_names
+                Let name_count be proc list_length from ListCore with port_names
                 Let j be 0
                 While j is less than name_count:
-                    Let port_name be proc list_get with port_names, j
+                    Let port_name be proc list_get from ListCore with port_names, j
                     Let port_var be proc create_hir_variable with port_name, type_hir, 0
                     proc set_attribute from HirNodes with port_var, "mode", port_mode
 
                     Let module_body be proc get_attribute from HirNodes with comp_module, "body"
-                    proc list_append with module_body, port_var
+                    proc list_append from ListCore with module_body, port_var
                     Set j to j plus 1
                 End While
 
@@ -1584,28 +1636,28 @@ Process called "translate_entity" that takes ctx as Integer, vhdl_entity as Inte
     Let entity_name be proc get_attribute from HirNodes with vhdl_entity, "name"
     Set ctx.entity_name to entity_name
 
-    Let module be proc create_hir_module from entity_name
+    Let module be proc create_hir_module with entity_name
 
     Note: Translate generic parameters
     Let generics be proc get_attribute from HirNodes with vhdl_entity, "generics"
     If generics is not equal to 0:
-        Let generic_count be proc list_length from generics
+        Let generic_count be proc list_length from ListCore with generics
         Let i be 0
         While i is less than generic_count:
-            Let generic_decl be proc list_get with generics, i
+            Let generic_decl be proc list_get from ListCore with generics, i
             Let generic_names be proc get_attribute from HirNodes with generic_decl, "names"
-            Let generic_type be proc get_attribute from HirNodes with generic_decl, "type"
+            Let generic_type be proc get_attribute from HirNodes with generic_decl, "subtype"
 
             Let type_hir be proc translate_type with ctx, generic_type
-            Let name_count be proc list_length from generic_names
+            Let name_count be proc list_length from ListCore with generic_names
             Let j be 0
             While j is less than name_count:
-                Let gen_name be proc list_get with generic_names, j
+                Let gen_name be proc list_get from ListCore with generic_names, j
                 Let gen_var be proc create_hir_variable with gen_name, type_hir, 0
                 proc set_attribute from HirNodes with gen_var, "is_generic", 1
 
                 Let module_body be proc get_attribute from HirNodes with module, "body"
-                proc list_append with module_body, gen_var
+                proc list_append from ListCore with module_body, gen_var
                 Set j to j plus 1
             End While
 
@@ -1616,25 +1668,25 @@ Process called "translate_entity" that takes ctx as Integer, vhdl_entity as Inte
     Note: Translate ports
     Let ports be proc get_attribute from HirNodes with vhdl_entity, "ports"
     If ports is not equal to 0:
-        Let port_count be proc list_length from ports
+        Let port_count be proc list_length from ListCore with ports
         Set i to 0
         While i is less than port_count:
-            Let port_decl be proc list_get with ports, i
+            Let port_decl be proc list_get from ListCore with ports, i
             Let port_names be proc get_attribute from HirNodes with port_decl, "names"
             Let port_mode be proc get_attribute from HirNodes with port_decl, "mode"
-            Let port_type be proc get_attribute from HirNodes with port_decl, "type"
+            Let port_type be proc get_attribute from HirNodes with port_decl, "subtype"
 
             Set type_hir to proc translate_type with ctx, port_type
-            Set name_count to proc list_length from port_names
+            Set name_count to proc list_length from ListCore with port_names
             Set j to 0
             While j is less than name_count:
-                Let port_name be proc list_get with port_names, j
+                Let port_name be proc list_get from ListCore with port_names, j
                 Let port_var be proc create_hir_variable with port_name, type_hir, 0
                 proc set_attribute from HirNodes with port_var, "mode", port_mode
                 proc set_attribute from HirNodes with port_var, "is_port", 1
 
                 Set module_body to proc get_attribute from HirNodes with module, "body"
-                proc list_append with module_body, port_var
+                proc list_append from ListCore with module_body, port_var
                 Set j to j plus 1
             End While
 
@@ -1660,33 +1712,34 @@ Process called "translate_architecture" that takes ctx as Integer, vhdl_arch as 
     Set ctx.entity_name to entity_name
 
     Note: Create module for architecture implementation
-    Let impl_name be proc string_concat from StringCore with entity_name, "_"
-    Set impl_name to proc string_concat from StringCore with impl_name, arch_name
+    Let underscore_str be proc create_from_literal from StringCore with "_"
+    Let impl_name be proc string_concat from StringPrim with entity_name, underscore_str
+    Set impl_name to proc string_concat from StringPrim with impl_name, arch_name
 
-    Let module be proc create_hir_module from impl_name
+    Let module be proc create_hir_module with impl_name
     Let module_body be proc get_attribute from HirNodes with module, "body"
 
     Note: Translate declarations
     Let declarations be proc get_attribute from HirNodes with vhdl_arch, "declarations"
     If declarations is not equal to 0:
-        Let decl_count be proc list_length from declarations
+        Let decl_count be proc list_length from ListCore with declarations
         Let i be 0
         While i is less than decl_count:
-            Let decl be proc list_get with declarations, i
+            Let decl be proc list_get from ListCore with declarations, i
             Let decl_hir be proc translate_declaration with ctx, decl
-            proc list_append with module_body, decl_hir
+            proc list_append from ListCore with module_body, decl_hir
             Set i to i plus 1
         End While
     End If
 
     Note: Translate concurrent statements
     Let statements be proc get_attribute from HirNodes with vhdl_arch, "statements"
-    Let stmt_count be proc list_length from statements
+    Let stmt_count be proc list_length from ListCore with statements
     Set i to 0
     While i is less than stmt_count:
-        Let stmt be proc list_get with statements, i
+        Let stmt be proc list_get from ListCore with statements, i
         Let stmt_hir be proc translate_concurrent_statement with ctx, stmt
-        proc list_append with module_body, stmt_hir
+        proc list_append from ListCore with module_body, stmt_hir
         Set i to i plus 1
     End While
 
@@ -1703,18 +1756,18 @@ Process called "translate_package" that takes ctx as Integer, vhdl_pkg as Intege
 
     Let pkg_name be proc get_attribute from HirNodes with vhdl_pkg, "name"
 
-    Let module be proc create_hir_module from pkg_name
+    Let module be proc create_hir_module with pkg_name
     Let module_body be proc get_attribute from HirNodes with module, "body"
 
     Note: Translate package declarations
     Let declarations be proc get_attribute from HirNodes with vhdl_pkg, "declarations"
     If declarations is not equal to 0:
-        Let decl_count be proc list_length from declarations
+        Let decl_count be proc list_length from ListCore with declarations
         Let i be 0
         While i is less than decl_count:
-            Let decl be proc list_get with declarations, i
+            Let decl be proc list_get from ListCore with declarations, i
             Let decl_hir be proc translate_declaration with ctx, decl
-            proc list_append with module_body, decl_hir
+            proc list_append from ListCore with module_body, decl_hir
             Set i to i plus 1
         End While
     End If
@@ -1771,18 +1824,18 @@ Process called "translate" that takes vhdl_ast as Integer returns Integer:
 
     Note: Create root HIR program node
     Let program be proc create_node from HirNodes with HirNodes.HIR_PROGRAM
-    Let modules be proc create_list from ListCore
+    Let modules be proc list_create from ListCore
 
     Note: Get design units
     Let design_units be proc get_attribute from HirNodes with vhdl_ast, "design_units"
 
     Note: Translate each design unit
-    Let unit_count be proc list_length from design_units
+    Let unit_count be proc list_length from ListCore with design_units
     Let i be 0
     While i is less than unit_count:
-        Let unit be proc list_get with design_units, i
+        Let unit be proc list_get from ListCore with design_units, i
         Let hir_unit be proc translate_design_unit with ctx, unit
-        proc list_append with modules, hir_unit
+        proc list_append from ListCore with modules, hir_unit
         Set i to i plus 1
     End While
 

@@ -5,8 +5,10 @@ Note: Production-perfect implementation with zero technical debt
 
 Import "compiler/middle/gungnir/hir/translation/frontends/vhdl/vhdl_lexer.runa" as VhdlLexer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 
 Note: ==================== AST Node Type Constants ====================
 
@@ -122,6 +124,7 @@ Type called "VhdlParser":
     current_token as Integer   Note: Current token pointer
     had_error as Integer       Note: Error flag (1 if error occurred)
     panic_mode as Integer      Note: Panic mode for error recovery
+    errors as Integer          Note: List of formatted diagnostic strings
 End Type
 
 Note: ==================== Parser Utilities ====================
@@ -144,7 +147,10 @@ Process called "create_parser" that takes tokens as Integer, token_count as Inte
         current_position as 0,
         current_token as 0,
         had_error as 0,
-        panic_mode as 0
+        panic_mode as 0,
+        errors as 0
+
+    Set parser.errors to proc list_create from ListCore
 
     Note: Get first token if available
     If token_count is greater than 0:
@@ -152,6 +158,65 @@ Process called "create_parser" that takes tokens as Integer, token_count as Inte
     End If
 
     Return parser
+End Process
+
+@Reasoning:
+Token accessors decode the four fixed fields of a lexer token. The lexer
+allocates each token as a 32-byte record: type@0, value@8, line@16,
+column@24 (see vhdl_lexer.create_token). These helpers give the parser a
+single point of truth for that layout, so a layout change requires editing
+only here. get_token_at resolves a token pointer out of the parser's token
+list by index.
+@End Reasoning
+@Implementation:
+get_token_at does a bounds-safe list_get; the field readers load the
+corresponding int64 field via memory_get_int64. A null token pointer is
+treated as EOF/zero so callers past end-of-input get well-defined results.
+@End Implementation
+Process called "get_token_at" that takes tokens as Integer, index as Integer returns Integer:
+    Note: Resolve a token pointer from the token list by index
+    If tokens is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to proc list_length from ListCore with tokens:
+        Return 0
+    End If
+    Return proc list_get from ListCore with tokens, index
+End Process
+
+Process called "get_token_type" that takes token as Integer returns Integer:
+    Note: Read the token-type field (offset 0)
+    If token is equal to 0:
+        Return VhdlLexer.TOKEN_EOF
+    End If
+    Return proc memory_get_int64 from Layout with token, 0
+End Process
+
+Process called "get_token_value" that takes token as Integer returns Integer:
+    Note: Read the lexeme-value field (offset 8)
+    If token is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with token, 8
+End Process
+
+Process called "get_token_line" that takes token as Integer returns Integer:
+    Note: Read the source-line field (offset 16)
+    If token is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with token, 16
+End Process
+
+Process called "get_token_column" that takes token as Integer returns Integer:
+    Note: Read the source-column field (offset 24)
+    If token is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with token, 24
 End Process
 
 @Reasoning:
@@ -191,7 +256,7 @@ Process called "peek_token_type" that takes parser as Integer, offset as Integer
     End If
 
     Let token be proc get_token_at with parser.tokens, peek_pos
-    Return proc get_token_type from token
+    Return proc get_token_type with token
 End Process
 
 @Reasoning:
@@ -206,7 +271,7 @@ Process called "token_value" that takes parser as Integer returns Integer:
     Note: Get the string value of current token
 
     If parser.current_position is greater than or equal to parser.token_count:
-        Return proc create_string from StringCore with ""
+        Return proc create_from_literal from StringCore with ""
     End If
 
     Return proc get_token_value with parser.current_token
@@ -246,7 +311,7 @@ Process called "match_token" that takes parser as Integer, expected_type as Inte
     Note: Check if current token matches expected type and advance if so
 
     If proc current_token_type with parser is equal to expected_type:
-        proc advance from parser
+        proc advance with parser
         Return 1
     End If
 
@@ -266,7 +331,7 @@ Process called "expect_token" that takes parser as Integer, expected_type as Int
     Note: Require specific token type or report error
 
     If proc current_token_type with parser is equal to expected_type:
-        proc advance from parser
+        proc advance with parser
         Return 1
     End If
 
@@ -287,36 +352,28 @@ Process called "parser_error" that takes parser as Integer, message as Integer r
     Note: Report parser error with diagnostic information
 
     Set parser.had_error to 1
+    Set parser.panic_mode to 1
 
     Note: Get current token location for error reporting
     Let token be parser.current_token
     If token is not equal to 0:
-        Let line be proc get_token_line from token
-        Let column be proc get_token_column from token
+        Let line be proc get_token_line with token
+        Let column be proc get_token_column with token
 
-        Note: Format error message with location
-        Let line_str be proc integer_to_string from StringCore with line
-        Let col_str be proc integer_to_string from StringCore with column
+        Note: Format error message with location for the errors list
+        Let line_str be proc integer_to_string from StringPrim with line
+        Let col_str be proc integer_to_string from StringPrim with column
 
-        Let full_error be proc string_concat from StringCore with "Parse error at line ", line_str
-        Set full_error to proc string_concat from StringCore with full_error, ", column "
-        Set full_error to proc string_concat from StringCore with full_error, col_str
-        Set full_error to proc string_concat from StringCore with full_error, ": "
-        Set full_error to proc string_concat from StringCore with full_error, message
+        Let prefix be proc create_from_literal from StringCore with "Parse error at line "
+        Let full_error be proc string_concat from StringPrim with prefix, line_str
+        Let col_label be proc create_from_literal from StringCore with ", column "
+        Set full_error to proc string_concat from StringPrim with full_error, col_label
+        Set full_error to proc string_concat from StringPrim with full_error, col_str
+        Let sep be proc create_from_literal from StringCore with ": "
+        Set full_error to proc string_concat from StringPrim with full_error, sep
+        Set full_error to proc string_concat from StringPrim with full_error, message
 
-        Note: Output error diagnostic
-        Note: Display full_error
-
-        Note: Store error in parser error list (offset 64 in parser structure)
-        Let error_list be proc memory_get_int64 from Layout with parser, 64
-        If error_list is equal to 0:
-            Set error_list to proc create from List
-            proc memory_set_int64 from Layout with parser, 64, error_list
-        End If
-        proc append from List with error_list, full_error
-    Otherwise:
-        Note: No current token, just mark error
-        proc memory_set_int64 from Layout with parser, 32, 1
+        proc list_append from ListCore with parser.errors, full_error
     End If
 
     Return 0
@@ -338,11 +395,11 @@ Process called "synchronize" that takes parser as Integer returns Integer:
 
     Note: Skip tokens until we find a statement boundary
     While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_EOF:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Stop at semicolon (statement boundary)
         If token_type is equal to VhdlLexer.TOKEN_SEMICOLON:
-            proc advance from parser
+            proc advance with parser
             Return 1
         End If
 
@@ -360,7 +417,7 @@ Process called "synchronize" that takes parser as Integer returns Integer:
             Return 1
         End If
 
-        proc advance from parser
+        proc advance with parser
     End While
 
     Return 1
@@ -378,9 +435,12 @@ Allocate ASTNode; write node_type@0; zero remaining fields.
 Process called "create_node" that takes node_type as Integer returns Integer:
     Note: Create generic AST node with type
 
-    Let node be proc create_dictionary from ListCore
-    proc dict_set with node, "type", node_type
-    proc dict_set with node, "children", proc create_list from ListCore
+    Let node be proc create from Dictionary
+    Let type_key be proc create_from_literal from StringCore with "type"
+    proc set from Dictionary with node, type_key, node_type
+    Let children_key be proc create_from_literal from StringCore with "children"
+    Let children_list be proc list_create from ListCore
+    proc set from Dictionary with node, children_key, children_list
 
     Return node
 End Process
@@ -396,8 +456,9 @@ increment child_count.
 Process called "add_child" that takes node as Integer, child as Integer returns Integer:
     Note: Add child node to parent
 
-    Let children be proc dict_get with node, "children"
-    proc list_append with children, child
+    Let children_key be proc create_from_literal from StringCore with "children"
+    Let children be proc get from Dictionary with node, children_key
+    proc list_append from ListCore with children, child
 
     Return node
 End Process
@@ -412,7 +473,7 @@ Access the node's metadata dictionary; hashtable_set key -> value.
 Process called "set_node_value" that takes node as Integer, key as Integer, value as Integer returns Integer:
     Note: Set attribute value on node
 
-    proc dict_set with node, key, value
+    proc set from Dictionary with node, key, value
     Return node
 End Process
 
@@ -432,66 +493,66 @@ expression; etc.
 Process called "parse_primary_expression" that takes parser as Integer returns Integer:
     Note: Parse primary expressions: literals, identifiers, parenthesized expressions
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Integer literal
     If token_type is equal to VhdlLexer.TOKEN_INTEGER:
-        Let node be proc create_node from NODE_LITERAL_INT
-        proc set_node_value with node, "value", proc token_value from parser
-        proc advance from parser
+        Let node be proc create_node with NODE_LITERAL_INT
+        proc set_node_value with node, "value", proc token_value with parser
+        proc advance with parser
         Return node
     End If
 
     Note: Real literal
     If token_type is equal to VhdlLexer.TOKEN_REAL:
-        Set node to proc create_node from NODE_LITERAL_REAL
-        proc set_node_value with node, "value", proc token_value from parser
-        proc advance from parser
+        Set node to proc create_node with NODE_LITERAL_REAL
+        proc set_node_value with node, "value", proc token_value with parser
+        proc advance with parser
         Return node
     End If
 
     Note: String literal
     If token_type is equal to VhdlLexer.TOKEN_STRING:
-        Set node to proc create_node from NODE_LITERAL_STRING
-        proc set_node_value with node, "value", proc token_value from parser
-        proc advance from parser
+        Set node to proc create_node with NODE_LITERAL_STRING
+        proc set_node_value with node, "value", proc token_value with parser
+        proc advance with parser
         Return node
     End If
 
     Note: Character literal
     If token_type is equal to VhdlLexer.TOKEN_CHAR:
-        Set node to proc create_node from NODE_LITERAL_CHAR
-        proc set_node_value with node, "value", proc token_value from parser
-        proc advance from parser
+        Set node to proc create_node with NODE_LITERAL_CHAR
+        proc set_node_value with node, "value", proc token_value with parser
+        proc advance with parser
         Return node
     End If
 
     Note: Bit string literal
     If token_type is equal to VhdlLexer.TOKEN_BIT_STRING:
-        Set node to proc create_node from NODE_LITERAL_BIT_STRING
-        proc set_node_value with node, "value", proc token_value from parser
-        proc advance from parser
+        Set node to proc create_node with NODE_LITERAL_BIT_STRING
+        proc set_node_value with node, "value", proc token_value with parser
+        proc advance with parser
         Return node
     End If
 
     Note: Identifier or function call
     If token_type is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        Let name be proc token_value from parser
-        proc advance from parser
+        Let name be proc token_value with parser
+        proc advance with parser
 
         Note: Check for function call
         If proc current_token_type with parser is equal to VhdlLexer.TOKEN_LPAREN:
-            proc advance from parser
-            Set node to proc create_node from NODE_FUNCTION_CALL
+            proc advance with parser
+            Set node to proc create_node with NODE_FUNCTION_CALL
             proc set_node_value with node, "name", name
 
             Note: Parse argument list
-            Let args be proc create_list from ListCore
+            Let args be proc list_create from ListCore
 
             If proc current_token_type with parser is not equal to VhdlLexer.TOKEN_RPAREN:
                 While 1 is equal to 1:
-                    Let arg be proc parse_expression from parser
-                    proc list_append with args, arg
+                    Let arg be proc parse_expression with parser
+                    proc list_append from ListCore with args, arg
 
                     If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                         Break
@@ -505,36 +566,36 @@ Process called "parse_primary_expression" that takes parser as Integer returns I
         End If
 
         Note: Simple identifier
-        Set node to proc create_node from NODE_IDENTIFIER
+        Set node to proc create_node with NODE_IDENTIFIER
         proc set_node_value with node, "name", name
         Return node
     End If
 
     Note: Parenthesized expression
     If token_type is equal to VhdlLexer.TOKEN_LPAREN:
-        proc advance from parser
-        Let expr be proc parse_expression from parser
+        proc advance with parser
+        Let expr be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after expression"
 
-        Set node to proc create_node from NODE_PARENTHESIZED
+        Set node to proc create_node with NODE_PARENTHESIZED
         proc add_child with node, expr
         Return node
     End If
 
     Note: Aggregate (others => value)
     If token_type is equal to VhdlLexer.TOKEN_OTHERS:
-        proc advance from parser
+        proc advance with parser
         proc expect_token with parser, VhdlLexer.TOKEN_ARROW, "Expected '=>' after 'others'"
-        Let value be proc parse_expression from parser
+        Let value be proc parse_expression with parser
 
-        Set node to proc create_node from NODE_AGGREGATE
+        Set node to proc create_node with NODE_AGGREGATE
         proc set_node_value with node, "is_others", 1
         proc add_child with node, value
         Return node
     End If
 
     proc parser_error with parser, "Expected expression"
-    Return proc create_node from NODE_IDENTIFIER
+    Return proc create_node with NODE_IDENTIFIER
 End Process
 
 @Reasoning:
@@ -550,24 +611,24 @@ otherwise break and return accumulated expression.
 Process called "parse_postfix_expression" that takes parser as Integer returns Integer:
     Note: Parse postfix operations: array indexing, record selection, slicing, attributes
 
-    Let expr be proc parse_primary_expression from parser
+    Let expr be proc parse_primary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Array indexing or slice
         If token_type is equal to VhdlLexer.TOKEN_LPAREN:
-            proc advance from parser
-            Let index be proc parse_expression from parser
+            proc advance with parser
+            Let index be proc parse_expression with parser
 
             Note: Check for slice (downto/to)
             If proc current_token_type with parser is equal to VhdlLexer.TOKEN_DOWNTO:
-                proc advance from parser
+                proc advance with parser
                 Let upper be index
-                Let lower be proc parse_expression from parser
+                Let lower be proc parse_expression with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after slice"
 
-                Let node be proc create_node from NODE_SLICE
+                Let node be proc create_node with NODE_SLICE
                 proc add_child with node, expr
                 proc add_child with node, upper
                 proc add_child with node, lower
@@ -577,12 +638,12 @@ Process called "parse_postfix_expression" that takes parser as Integer returns I
             End If
 
             If proc current_token_type with parser is equal to VhdlLexer.TOKEN_TO:
-                proc advance from parser
+                proc advance with parser
                 Set lower to index
-                Set upper to proc parse_expression from parser
+                Set upper to proc parse_expression with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after slice"
 
-                Set node to proc create_node from NODE_SLICE
+                Set node to proc create_node with NODE_SLICE
                 proc add_child with node, expr
                 proc add_child with node, lower
                 proc add_child with node, upper
@@ -594,7 +655,7 @@ Process called "parse_postfix_expression" that takes parser as Integer returns I
             Note: Simple indexing
             proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after index"
 
-            Set node to proc create_node from NODE_INDEXED_NAME
+            Set node to proc create_node with NODE_INDEXED_NAME
             proc add_child with node, expr
             proc add_child with node, index
             Set expr to node
@@ -603,11 +664,11 @@ Process called "parse_postfix_expression" that takes parser as Integer returns I
 
         Note: Record field selection
         If token_type is equal to VhdlLexer.TOKEN_DOT:
-            proc advance from parser
-            Let field be proc token_value from parser
+            proc advance with parser
+            Let field be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected field name after '.'"
 
-            Set node to proc create_node from NODE_SELECTED_NAME
+            Set node to proc create_node with NODE_SELECTED_NAME
             proc add_child with node, expr
             proc set_node_value with node, "field", field
             Set expr to node
@@ -616,18 +677,18 @@ Process called "parse_postfix_expression" that takes parser as Integer returns I
 
         Note: Attribute
         If token_type is equal to VhdlLexer.TOKEN_APOSTROPHE:
-            proc advance from parser
-            Let attr_name be proc token_value from parser
+            proc advance with parser
+            Let attr_name be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected attribute name after apostrophe"
 
-            Set node to proc create_node from NODE_ATTRIBUTE_NAME
+            Set node to proc create_node with NODE_ATTRIBUTE_NAME
             proc add_child with node, expr
             proc set_node_value with node, "attribute", attr_name
 
             Note: Check for attribute parameter
             If proc current_token_type with parser is equal to VhdlLexer.TOKEN_LPAREN:
-                proc advance from parser
-                Let param be proc parse_expression from parser
+                proc advance with parser
+                Let param be proc parse_expression with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after attribute parameter"
                 proc add_child with node, param
             End If
@@ -654,13 +715,13 @@ delegate to parse_postfix_expression.
 Process called "parse_unary_expression" that takes parser as Integer returns Integer:
     Note: Parse unary operations: not, abs, +, -
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Unary NOT
     If token_type is equal to VhdlLexer.TOKEN_NOT:
-        proc advance from parser
-        Let operand be proc parse_unary_expression from parser
-        Let node be proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Let operand be proc parse_unary_expression with parser
+        Let node be proc create_node with NODE_UNARY_OP
         proc set_node_value with node, "operator", "not"
         proc add_child with node, operand
         Return node
@@ -668,9 +729,9 @@ Process called "parse_unary_expression" that takes parser as Integer returns Int
 
     Note: Unary ABS
     If token_type is equal to VhdlLexer.TOKEN_ABS:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set node to proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set node to proc create_node with NODE_UNARY_OP
         proc set_node_value with node, "operator", "abs"
         proc add_child with node, operand
         Return node
@@ -678,9 +739,9 @@ Process called "parse_unary_expression" that takes parser as Integer returns Int
 
     Note: Unary plus
     If token_type is equal to VhdlLexer.TOKEN_PLUS:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set node to proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set node to proc create_node with NODE_UNARY_OP
         proc set_node_value with node, "operator", "+"
         proc add_child with node, operand
         Return node
@@ -688,15 +749,15 @@ Process called "parse_unary_expression" that takes parser as Integer returns Int
 
     Note: Unary minus
     If token_type is equal to VhdlLexer.TOKEN_MINUS:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set node to proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set node to proc create_node with NODE_UNARY_OP
         proc set_node_value with node, "operator", "-"
         proc add_child with node, operand
         Return node
     End If
 
-    Return proc parse_postfix_expression from parser
+    Return proc parse_postfix_expression with parser
 End Process
 
 @Reasoning:
@@ -710,30 +771,30 @@ consume op, parse right operand, build binary node, set as new left.
 Process called "parse_multiplicative_expression" that takes parser as Integer returns Integer:
     Note: Parse multiplication, division, modulo, remainder
 
-    Let left be proc parse_unary_expression from parser
+    Let left be proc parse_unary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let operator be 0
 
         If token_type is equal to VhdlLexer.TOKEN_STAR:
             Set operator to "*"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_SLASH:
             Set operator to "/"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_MOD:
             Set operator to "mod"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_REM:
             Set operator to "rem"
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             Break
         End If
 
-        Let right be proc parse_unary_expression from parser
-        Let node be proc create_node from NODE_BINARY_OP
+        Let right be proc parse_unary_expression with parser
+        Let node be proc create_node with NODE_BINARY_OP
         proc set_node_value with node, "operator", operator
         proc add_child with node, left
         proc add_child with node, right
@@ -753,27 +814,27 @@ Same shape as parse_multiplicative_expression with additive operators.
 Process called "parse_additive_expression" that takes parser as Integer returns Integer:
     Note: Parse addition, subtraction, concatenation
 
-    Let left be proc parse_multiplicative_expression from parser
+    Let left be proc parse_multiplicative_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let operator be 0
 
         If token_type is equal to VhdlLexer.TOKEN_PLUS:
             Set operator to "+"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_MINUS:
             Set operator to "-"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_AMPERSAND:
             Set operator to "&"
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             Break
         End If
 
-        Let right be proc parse_multiplicative_expression from parser
-        Let node be proc create_node from NODE_BINARY_OP
+        Let right be proc parse_multiplicative_expression with parser
+        Let node be proc create_node with NODE_BINARY_OP
         proc set_node_value with node, "operator", operator
         proc add_child with node, left
         proc add_child with node, right
@@ -794,36 +855,36 @@ Same shape as the other infix levels, with the shift-op keyword set.
 Process called "parse_shift_expression" that takes parser as Integer returns Integer:
     Note: Parse shift operations: sll, srl, sla, sra, rol, ror
 
-    Let left be proc parse_additive_expression from parser
+    Let left be proc parse_additive_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let operator be 0
 
         If token_type is equal to VhdlLexer.TOKEN_SLL:
             Set operator to "sll"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_SRL:
             Set operator to "srl"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_SLA:
             Set operator to "sla"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_SRA:
             Set operator to "sra"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_ROL:
             Set operator to "rol"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_ROR:
             Set operator to "ror"
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             Break
         End If
 
-        Let right be proc parse_additive_expression from parser
-        Let node be proc create_node from NODE_BINARY_OP
+        Let right be proc parse_additive_expression with parser
+        Let node be proc create_node with NODE_BINARY_OP
         proc set_node_value with node, "operator", operator
         proc add_child with node, left
         proc add_child with node, right
@@ -845,35 +906,35 @@ consume + parse right + build binary node; otherwise return left.
 Process called "parse_relational_expression" that takes parser as Integer returns Integer:
     Note: Parse comparisons: =, /=, <, <=, >, >=
 
-    Let left be proc parse_shift_expression from parser
+    Let left be proc parse_shift_expression with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
     Let operator be 0
 
     If token_type is equal to VhdlLexer.TOKEN_EQUAL:
         Set operator to "="
-        proc advance from parser
+        proc advance with parser
     Otherwise If token_type is equal to VhdlLexer.TOKEN_NOT_EQUAL:
         Set operator to "/="
-        proc advance from parser
+        proc advance with parser
     Otherwise If token_type is equal to VhdlLexer.TOKEN_LESS:
         Set operator to "<"
-        proc advance from parser
+        proc advance with parser
     Otherwise If token_type is equal to VhdlLexer.TOKEN_LESS_EQUAL:
         Set operator to "<="
-        proc advance from parser
+        proc advance with parser
     Otherwise If token_type is equal to VhdlLexer.TOKEN_GREATER:
         Set operator to ">"
-        proc advance from parser
+        proc advance with parser
     Otherwise If token_type is equal to VhdlLexer.TOKEN_GREATER_EQUAL:
         Set operator to ">="
-        proc advance from parser
+        proc advance with parser
     Otherwise:
         Return left
     End If
 
-    Let right be proc parse_shift_expression from parser
-    Let node be proc create_node from NODE_BINARY_OP
+    Let right be proc parse_shift_expression with parser
+    Let node be proc create_node with NODE_BINARY_OP
     proc set_node_value with node, "operator", operator
     proc add_child with node, left
     proc add_child with node, right
@@ -893,36 +954,36 @@ logical op: consume + parse right + build binary node.
 Process called "parse_logical_expression" that takes parser as Integer returns Integer:
     Note: Parse logical operations: and, or, nand, nor, xor, xnor
 
-    Let left be proc parse_relational_expression from parser
+    Let left be proc parse_relational_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let operator be 0
 
         If token_type is equal to VhdlLexer.TOKEN_AND:
             Set operator to "and"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_OR:
             Set operator to "or"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_NAND:
             Set operator to "nand"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_NOR:
             Set operator to "nor"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_XOR:
             Set operator to "xor"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_XNOR:
             Set operator to "xnor"
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             Break
         End If
 
-        Let right be proc parse_relational_expression from parser
-        Let node be proc create_node from NODE_BINARY_OP
+        Let right be proc parse_relational_expression with parser
+        Let node be proc create_node with NODE_BINARY_OP
         proc set_node_value with node, "operator", operator
         proc add_child with node, left
         proc add_child with node, right
@@ -942,7 +1003,7 @@ Tail-call parse_logical_expression.
 Process called "parse_expression" that takes parser as Integer returns Integer:
     Note: Parse full expression with all precedence levels
 
-    Return proc parse_logical_expression from parser
+    Return proc parse_logical_expression with parser
 End Process
 
 Note: ==================== Type Parsing ====================
@@ -958,19 +1019,20 @@ build SELECTED_NAME or simple identifier.
 Process called "parse_type_mark" that takes parser as Integer returns Integer:
     Note: Parse simple type reference (identifier or selected name)
 
-    Let name be proc token_value from parser
+    Let name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected type name"
 
-    Let node be proc create_node from NODE_TYPE_REFERENCE
+    Let node be proc create_node with NODE_TYPE_REFERENCE
     proc set_node_value with node, "name", name
 
     Note: Check for selected name (library.package.type)
     While proc match_token with parser, VhdlLexer.TOKEN_DOT:
-        Let next_part be proc token_value from parser
+        Let next_part be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected identifier after '.'"
 
-        Let combined_name be proc string_concat from StringCore with name, "."
-        Set combined_name to proc string_concat from StringCore with combined_name, next_part
+        Let dot_str be proc create_from_literal from StringCore with "."
+        Let combined_name be proc string_concat from StringPrim with name, dot_str
+        Set combined_name to proc string_concat from StringPrim with combined_name, next_part
         Set name to combined_name
         proc set_node_value with node, "name", name
     End While
@@ -990,22 +1052,22 @@ present, parse the constraint and wrap in subtype-indication node.
 Process called "parse_subtype_indication" that takes parser as Integer returns Integer:
     Note: Parse subtype indication with optional constraint
 
-    Let type_mark be proc parse_type_mark from parser
+    Let type_mark be proc parse_type_mark with parser
 
     Note: Check for constraint
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_LPAREN:
-        proc advance from parser
+        proc advance with parser
 
         Note: Parse range constraint
-        Let constraint_start be proc parse_expression from parser
+        Let constraint_start be proc parse_expression with parser
 
         If proc match_token with parser, VhdlLexer.TOKEN_TO:
-            Let constraint_end be proc parse_expression from parser
+            Let constraint_end be proc parse_expression with parser
             proc set_node_value with type_mark, "constraint_start", constraint_start
             proc set_node_value with type_mark, "constraint_end", constraint_end
             proc set_node_value with type_mark, "constraint_direction", "to"
         Otherwise If proc match_token with parser, VhdlLexer.TOKEN_DOWNTO:
-            Set constraint_end to proc parse_expression from parser
+            Set constraint_end to proc parse_expression with parser
             proc set_node_value with type_mark, "constraint_start", constraint_start
             proc set_node_value with type_mark, "constraint_end", constraint_end
             proc set_node_value with type_mark, "constraint_direction", "downto"
@@ -1030,19 +1092,19 @@ appropriate type-definition node.
 Process called "parse_type_definition" that takes parser as Integer returns Integer:
     Note: Parse complete type definition
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Enumeration type
     If token_type is equal to VhdlLexer.TOKEN_LPAREN:
-        proc advance from parser
+        proc advance with parser
 
-        Let node be proc create_node from NODE_TYPE_ENUMERATION
-        Let literals be proc create_list from ListCore
+        Let node be proc create_node with NODE_TYPE_ENUMERATION
+        Let literals be proc list_create from ListCore
 
         While 1 is equal to 1:
-            Let literal be proc token_value from parser
+            Let literal be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected enumeration literal"
-            proc list_append with literals, literal
+            proc list_append from ListCore with literals, literal
 
             If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                 Break
@@ -1056,16 +1118,16 @@ Process called "parse_type_definition" that takes parser as Integer returns Inte
 
     Note: Array type
     If token_type is equal to VhdlLexer.TOKEN_ARRAY:
-        proc advance from parser
+        proc advance with parser
         proc expect_token with parser, VhdlLexer.TOKEN_LPAREN, "Expected '(' after 'array'"
 
-        Set node to proc create_node from NODE_TYPE_ARRAY
-        Let indices be proc create_list from ListCore
+        Set node to proc create_node with NODE_TYPE_ARRAY
+        Let indices be proc list_create from ListCore
 
         Note: Parse index types
         While 1 is equal to 1:
-            Let index_type be proc parse_subtype_indication from parser
-            proc list_append with indices, index_type
+            Let index_type be proc parse_subtype_indication with parser
+            proc list_append from ListCore with indices, index_type
 
             If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                 Break
@@ -1075,7 +1137,7 @@ Process called "parse_type_definition" that takes parser as Integer returns Inte
         proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after array indices"
         proc expect_token with parser, VhdlLexer.TOKEN_OF, "Expected 'of' after array indices"
 
-        Let element_type be proc parse_subtype_indication from parser
+        Let element_type be proc parse_subtype_indication with parser
 
         proc set_node_value with node, "indices", indices
         proc set_node_value with node, "element_type", element_type
@@ -1084,24 +1146,24 @@ Process called "parse_type_definition" that takes parser as Integer returns Inte
 
     Note: Record type
     If token_type is equal to VhdlLexer.TOKEN_RECORD:
-        proc advance from parser
+        proc advance with parser
 
-        Set node to proc create_node from NODE_TYPE_RECORD
-        Let fields be proc create_list from ListCore
+        Set node to proc create_node with NODE_TYPE_RECORD
+        Let fields be proc list_create from ListCore
 
         While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_END:
             Note: Parse field declaration
-            Let field_name be proc token_value from parser
+            Let field_name be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected field name"
             proc expect_token with parser, VhdlLexer.TOKEN_COLON, "Expected ':' after field name"
 
-            Let field_type be proc parse_subtype_indication from parser
+            Let field_type be proc parse_subtype_indication with parser
             proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after field type"
 
-            Let field be proc create_node from NODE_PORT_DECL
+            Let field be proc create_node with NODE_PORT_DECL
             proc set_node_value with field, "name", field_name
-            proc set_node_value with field, "type", field_type
-            proc list_append with fields, field
+            proc set_node_value with field, "subtype", field_type
+            proc list_append from ListCore with fields, field
         End While
 
         proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after record fields"
@@ -1113,36 +1175,36 @@ Process called "parse_type_definition" that takes parser as Integer returns Inte
 
     Note: Access type
     If token_type is equal to VhdlLexer.TOKEN_ACCESS:
-        proc advance from parser
-        Set node to proc create_node from NODE_TYPE_ACCESS
-        Let target_type be proc parse_subtype_indication from parser
+        proc advance with parser
+        Set node to proc create_node with NODE_TYPE_ACCESS
+        Let target_type be proc parse_subtype_indication with parser
         proc set_node_value with node, "target_type", target_type
         Return node
     End If
 
     Note: File type
     If token_type is equal to VhdlLexer.TOKEN_FILE:
-        proc advance from parser
+        proc advance with parser
         proc expect_token with parser, VhdlLexer.TOKEN_OF, "Expected 'of' after 'file'"
-        Set node to proc create_node from NODE_TYPE_FILE
-        Set element_type to proc parse_type_mark from parser
+        Set node to proc create_node with NODE_TYPE_FILE
+        Set element_type to proc parse_type_mark with parser
         proc set_node_value with node, "element_type", element_type
         Return node
     End If
 
     Note: Range type (integer/real)
     If token_type is equal to VhdlLexer.TOKEN_RANGE:
-        proc advance from parser
-        Set node to proc create_node from NODE_TYPE_INTEGER
-        Let range_start be proc parse_expression from parser
+        proc advance with parser
+        Set node to proc create_node with NODE_TYPE_INTEGER
+        Let range_start be proc parse_expression with parser
 
         If proc match_token with parser, VhdlLexer.TOKEN_TO:
-            Let range_end be proc parse_expression from parser
+            Let range_end be proc parse_expression with parser
             proc set_node_value with node, "range_start", range_start
             proc set_node_value with node, "range_end", range_end
             proc set_node_value with node, "range_direction", "to"
         Otherwise If proc match_token with parser, VhdlLexer.TOKEN_DOWNTO:
-            Set range_end to proc parse_expression from parser
+            Set range_end to proc parse_expression with parser
             proc set_node_value with node, "range_start", range_start
             proc set_node_value with node, "range_end", range_end
             proc set_node_value with node, "range_direction", "downto"
@@ -1152,7 +1214,7 @@ Process called "parse_type_definition" that takes parser as Integer returns Inte
     End If
 
     proc parser_error with parser, "Expected type definition"
-    Return proc create_node from NODE_TYPE_REFERENCE
+    Return proc create_node with NODE_TYPE_REFERENCE
 End Process
 
 Note: ==================== Declaration Parsing ====================
@@ -1171,14 +1233,14 @@ Process called "parse_signal_declaration" that takes parser as Integer returns I
 
     proc expect_token with parser, VhdlLexer.TOKEN_SIGNAL, "Expected 'signal'"
 
-    Let node be proc create_node from NODE_SIGNAL_DECL
-    Let names be proc create_list from ListCore
+    Let node be proc create_node with NODE_SIGNAL_DECL
+    Let names be proc list_create from ListCore
 
     Note: Parse signal names
     While 1 is equal to 1:
-        Let name be proc token_value from parser
+        Let name be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected signal name"
-        proc list_append with names, name
+        proc list_append from ListCore with names, name
 
         If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
             Break
@@ -1187,18 +1249,18 @@ Process called "parse_signal_declaration" that takes parser as Integer returns I
 
     proc expect_token with parser, VhdlLexer.TOKEN_COLON, "Expected ':' after signal names"
 
-    Let signal_type be proc parse_subtype_indication from parser
+    Let signal_type be proc parse_subtype_indication with parser
 
     Note: Optional initial value
     Let initial_value be 0
     If proc match_token with parser, VhdlLexer.TOKEN_COLON_EQUAL:
-        Set initial_value to proc parse_expression from parser
+        Set initial_value to proc parse_expression with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after signal declaration"
 
     proc set_node_value with node, "names", names
-    proc set_node_value with node, "type", signal_type
+    proc set_node_value with node, "subtype", signal_type
     If initial_value is not equal to 0:
         proc set_node_value with node, "initial_value", initial_value
     End If
@@ -1220,14 +1282,14 @@ Process called "parse_variable_declaration" that takes parser as Integer returns
 
     proc expect_token with parser, VhdlLexer.TOKEN_VARIABLE, "Expected 'variable'"
 
-    Let node be proc create_node from NODE_VARIABLE_DECL
-    Let names be proc create_list from ListCore
+    Let node be proc create_node with NODE_VARIABLE_DECL
+    Let names be proc list_create from ListCore
 
     Note: Parse variable names
     While 1 is equal to 1:
-        Let name be proc token_value from parser
+        Let name be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected variable name"
-        proc list_append with names, name
+        proc list_append from ListCore with names, name
 
         If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
             Break
@@ -1236,18 +1298,18 @@ Process called "parse_variable_declaration" that takes parser as Integer returns
 
     proc expect_token with parser, VhdlLexer.TOKEN_COLON, "Expected ':' after variable names"
 
-    Let var_type be proc parse_subtype_indication from parser
+    Let var_type be proc parse_subtype_indication with parser
 
     Note: Optional initial value
     Let initial_value be 0
     If proc match_token with parser, VhdlLexer.TOKEN_COLON_EQUAL:
-        Set initial_value to proc parse_expression from parser
+        Set initial_value to proc parse_expression with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after variable declaration"
 
     proc set_node_value with node, "names", names
-    proc set_node_value with node, "type", var_type
+    proc set_node_value with node, "subtype", var_type
     If initial_value is not equal to 0:
         proc set_node_value with node, "initial_value", initial_value
     End If
@@ -1270,14 +1332,14 @@ Process called "parse_constant_declaration" that takes parser as Integer returns
 
     proc expect_token with parser, VhdlLexer.TOKEN_CONSTANT, "Expected 'constant'"
 
-    Let node be proc create_node from NODE_CONSTANT_DECL
-    Let names be proc create_list from ListCore
+    Let node be proc create_node with NODE_CONSTANT_DECL
+    Let names be proc list_create from ListCore
 
     Note: Parse constant names
     While 1 is equal to 1:
-        Let name be proc token_value from parser
+        Let name be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected constant name"
-        proc list_append with names, name
+        proc list_append from ListCore with names, name
 
         If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
             Break
@@ -1286,15 +1348,15 @@ Process called "parse_constant_declaration" that takes parser as Integer returns
 
     proc expect_token with parser, VhdlLexer.TOKEN_COLON, "Expected ':' after constant names"
 
-    Let const_type be proc parse_subtype_indication from parser
+    Let const_type be proc parse_subtype_indication with parser
 
     Note: Constant must have initial value
     proc expect_token with parser, VhdlLexer.TOKEN_COLON_EQUAL, "Expected ':=' for constant value"
-    Let initial_value be proc parse_expression from parser
+    Let initial_value be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after constant declaration"
 
     proc set_node_value with node, "names", names
-    proc set_node_value with node, "type", const_type
+    proc set_node_value with node, "subtype", const_type
     proc set_node_value with node, "value", initial_value
 
     Return node
@@ -1312,14 +1374,14 @@ Process called "parse_type_declaration" that takes parser as Integer returns Int
 
     proc expect_token with parser, VhdlLexer.TOKEN_TYPE, "Expected 'type'"
 
-    Let type_name be proc token_value from parser
+    Let type_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected type name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after type name"
 
-    Let type_def be proc parse_type_definition from parser
+    Let type_def be proc parse_type_definition with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after type declaration"
 
-    Let node be proc create_node from NODE_TYPE_DECL
+    Let node be proc create_node with NODE_TYPE_DECL
     proc set_node_value with node, "name", type_name
     proc add_child with node, type_def
 
@@ -1339,14 +1401,14 @@ Process called "parse_subtype_declaration" that takes parser as Integer returns 
 
     proc expect_token with parser, VhdlLexer.TOKEN_SUBTYPE, "Expected 'subtype'"
 
-    Let subtype_name be proc token_value from parser
+    Let subtype_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected subtype name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after subtype name"
 
-    Let base_type be proc parse_subtype_indication from parser
+    Let base_type be proc parse_subtype_indication with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after subtype declaration"
 
-    Let node be proc create_node from NODE_SUBTYPE_DECL
+    Let node be proc create_node with NODE_SUBTYPE_DECL
     proc set_node_value with node, "name", subtype_name
     proc add_child with node, base_type
 
@@ -1367,21 +1429,21 @@ Process called "parse_component_declaration" that takes parser as Integer return
 
     proc expect_token with parser, VhdlLexer.TOKEN_COMPONENT, "Expected 'component'"
 
-    Let component_name be proc token_value from parser
+    Let component_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected component name"
 
-    Let node be proc create_node from NODE_COMPONENT_DECL
+    Let node be proc create_node with NODE_COMPONENT_DECL
     proc set_node_value with node, "name", component_name
 
     Note: Optional generic clause
     If proc match_token with parser, VhdlLexer.TOKEN_GENERIC:
-        Let generics be proc parse_interface_list from parser
+        Let generics be proc parse_interface_list with parser
         proc set_node_value with node, "generics", generics
     End If
 
     Note: Optional port clause
     If proc match_token with parser, VhdlLexer.TOKEN_PORT:
-        Let ports be proc parse_interface_list from parser
+        Let ports be proc parse_interface_list with parser
         proc set_node_value with node, "ports", ports
     End If
 
@@ -1390,7 +1452,7 @@ Process called "parse_component_declaration" that takes parser as Integer return
 
     Note: Optional component name repetition
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after component declaration"
@@ -1414,16 +1476,16 @@ Process called "parse_interface_list" that takes parser as Integer returns Integ
 
     proc expect_token with parser, VhdlLexer.TOKEN_LPAREN, "Expected '(' after generic/port"
 
-    Let interface_list be proc create_list from ListCore
+    Let interface_list be proc list_create from ListCore
 
     While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_RPAREN:
         Note: Parse interface declaration
-        Let names be proc create_list from ListCore
+        Let names be proc list_create from ListCore
 
         While 1 is equal to 1:
-            Let name be proc token_value from parser
+            Let name be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected interface name"
-            proc list_append with names, name
+            proc list_append from ListCore with names, name
 
             If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                 Break
@@ -1434,43 +1496,43 @@ Process called "parse_interface_list" that takes parser as Integer returns Integ
 
         Note: Parse mode (in, out, inout, buffer, linkage)
         Let mode be "in"
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to VhdlLexer.TOKEN_IN:
             Set mode to "in"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_OUT:
             Set mode to "out"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_INOUT:
             Set mode to "inout"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_BUFFER:
             Set mode to "buffer"
-            proc advance from parser
+            proc advance with parser
         Otherwise If token_type is equal to VhdlLexer.TOKEN_LINKAGE:
             Set mode to "linkage"
-            proc advance from parser
+            proc advance with parser
         End If
 
-        Let interface_type be proc parse_subtype_indication from parser
+        Let interface_type be proc parse_subtype_indication with parser
 
         Note: Optional default value
         Let default_value be 0
         If proc match_token with parser, VhdlLexer.TOKEN_COLON_EQUAL:
-            Set default_value to proc parse_expression from parser
+            Set default_value to proc parse_expression with parser
         End If
 
         Note: Create interface node
-        Let interface_node be proc create_node from NODE_PORT_DECL
+        Let interface_node be proc create_node with NODE_PORT_DECL
         proc set_node_value with interface_node, "names", names
         proc set_node_value with interface_node, "mode", mode
-        proc set_node_value with interface_node, "type", interface_type
+        proc set_node_value with interface_node, "subtype", interface_type
         If default_value is not equal to 0:
             proc set_node_value with interface_node, "default_value", default_value
         End If
 
-        proc list_append with interface_list, interface_node
+        proc list_append from ListCore with interface_list, interface_node
 
         Note: Check for more interfaces
         If proc match_token with parser, VhdlLexer.TOKEN_SEMICOLON is equal to 0:
@@ -1500,10 +1562,10 @@ Process called "parse_signal_assignment" that takes parser as Integer, target as
 
     proc expect_token with parser, VhdlLexer.TOKEN_ASSIGN, "Expected '<=' for signal assignment"
 
-    Let value be proc parse_expression from parser
+    Let value be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after signal assignment"
 
-    Let node be proc create_node from NODE_SIGNAL_ASSIGN
+    Let node be proc create_node with NODE_SIGNAL_ASSIGN
     proc add_child with node, target
     proc add_child with node, value
 
@@ -1523,10 +1585,10 @@ Process called "parse_variable_assignment" that takes parser as Integer, target 
 
     proc expect_token with parser, VhdlLexer.TOKEN_COLON_EQUAL, "Expected ':=' for variable assignment"
 
-    Let value be proc parse_expression from parser
+    Let value be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after variable assignment"
 
-    Let node be proc create_node from NODE_VARIABLE_ASSIGN
+    Let node be proc create_node with NODE_VARIABLE_ASSIGN
     proc add_child with node, target
     proc add_child with node, value
 
@@ -1548,39 +1610,39 @@ Process called "parse_if_statement" that takes parser as Integer returns Integer
 
     proc expect_token with parser, VhdlLexer.TOKEN_IF, "Expected 'if'"
 
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_THEN, "Expected 'then' after if condition"
 
-    Let node be proc create_node from NODE_IF_STMT
+    Let node be proc create_node with NODE_IF_STMT
     proc set_node_value with node, "condition", condition
 
     Note: Parse then block
-    Let then_stmts be proc parse_sequential_statements from parser
+    Let then_stmts be proc parse_sequential_statements with parser
     proc set_node_value with node, "then_block", then_stmts
 
     Note: Parse elsif branches
-    Let elsif_branches be proc create_list from ListCore
+    Let elsif_branches be proc list_create from ListCore
 
     While proc match_token with parser, VhdlLexer.TOKEN_ELSIF:
-        Let elsif_condition be proc parse_expression from parser
+        Let elsif_condition be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_THEN, "Expected 'then' after elsif condition"
 
-        Let elsif_stmts be proc parse_sequential_statements from parser
+        Let elsif_stmts be proc parse_sequential_statements with parser
 
-        Let elsif_node be proc create_node from NODE_IF_STMT
+        Let elsif_node be proc create_node with NODE_IF_STMT
         proc set_node_value with elsif_node, "condition", elsif_condition
         proc set_node_value with elsif_node, "then_block", elsif_stmts
 
-        proc list_append with elsif_branches, elsif_node
+        proc list_append from ListCore with elsif_branches, elsif_node
     End While
 
-    If proc list_length with elsif_branches is greater than 0:
+    If proc list_length from ListCore with elsif_branches is greater than 0:
         proc set_node_value with node, "elsif_branches", elsif_branches
     End If
 
     Note: Parse else branch
     If proc match_token with parser, VhdlLexer.TOKEN_ELSE:
-        Let else_stmts be proc parse_sequential_statements from parser
+        Let else_stmts be proc parse_sequential_statements with parser
         proc set_node_value with node, "else_block", else_stmts
     End If
 
@@ -1605,27 +1667,27 @@ Process called "parse_case_statement" that takes parser as Integer returns Integ
 
     proc expect_token with parser, VhdlLexer.TOKEN_CASE, "Expected 'case'"
 
-    Let selector be proc parse_expression from parser
+    Let selector be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after case expression"
 
-    Let node be proc create_node from NODE_CASE_STMT
+    Let node be proc create_node with NODE_CASE_STMT
     proc set_node_value with node, "selector", selector
 
-    Let alternatives be proc create_list from ListCore
+    Let alternatives be proc list_create from ListCore
 
     Note: Parse when branches
     While proc match_token with parser, VhdlLexer.TOKEN_WHEN:
         Note: Parse choice list
-        Let choices be proc create_list from ListCore
+        Let choices be proc list_create from ListCore
 
         While 1 is equal to 1:
             If proc current_token_type with parser is equal to VhdlLexer.TOKEN_OTHERS:
-                proc advance from parser
-                proc list_append with choices, "others"
+                proc advance with parser
+                proc list_append from ListCore with choices, "others"
                 Break
             Otherwise:
-                Let choice be proc parse_expression from parser
-                proc list_append with choices, choice
+                Let choice be proc parse_expression with parser
+                proc list_append from ListCore with choices, choice
             End If
 
             If proc match_token with parser, VhdlLexer.TOKEN_PIPE is equal to 0:
@@ -1635,13 +1697,13 @@ Process called "parse_case_statement" that takes parser as Integer returns Integ
 
         proc expect_token with parser, VhdlLexer.TOKEN_ARROW, "Expected '=>' after case choices"
 
-        Let when_stmts be proc parse_sequential_statements from parser
+        Let when_stmts be proc parse_sequential_statements with parser
 
-        Let alternative be proc create_node from NODE_CASE_STMT
+        Let alternative be proc create_node with NODE_CASE_STMT
         proc set_node_value with alternative, "choices", choices
         proc set_node_value with alternative, "statements", when_stmts
 
-        proc list_append with alternatives, alternative
+        proc list_append from ListCore with alternatives, alternative
     End While
 
     proc set_node_value with node, "alternatives", alternatives
@@ -1668,13 +1730,13 @@ Process called "parse_loop_statement" that takes parser as Integer returns Integ
 
     Note: Check for for loop
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_FOR:
-        proc advance from parser
+        proc advance with parser
 
-        Let loop_var be proc token_value from parser
+        Let loop_var be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected loop variable"
         proc expect_token with parser, VhdlLexer.TOKEN_IN, "Expected 'in' after loop variable"
 
-        Let range_start be proc parse_expression from parser
+        Let range_start be proc parse_expression with parser
 
         Let direction be "to"
         If proc match_token with parser, VhdlLexer.TOKEN_TO:
@@ -1685,16 +1747,16 @@ Process called "parse_loop_statement" that takes parser as Integer returns Integ
             proc parser_error with parser, "Expected 'to' or 'downto' in for loop range"
         End If
 
-        Let range_end be proc parse_expression from parser
+        Let range_end be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop' after for range"
 
-        Let loop_stmts be proc parse_sequential_statements from parser
+        Let loop_stmts be proc parse_sequential_statements with parser
 
         proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after loop"
         proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop' after 'end'"
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after loop"
 
-        Let node be proc create_node from NODE_FOR_STMT
+        Let node be proc create_node with NODE_FOR_STMT
         proc set_node_value with node, "loop_var", loop_var
         proc set_node_value with node, "range_start", range_start
         proc set_node_value with node, "range_end", range_end
@@ -1706,18 +1768,18 @@ Process called "parse_loop_statement" that takes parser as Integer returns Integ
 
     Note: Check for while loop
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_WHILE:
-        proc advance from parser
+        proc advance with parser
 
-        Let condition be proc parse_expression from parser
+        Let condition be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop' after while condition"
 
-        Set loop_stmts to proc parse_sequential_statements from parser
+        Set loop_stmts to proc parse_sequential_statements with parser
 
         proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after loop"
         proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop' after 'end'"
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after loop"
 
-        Set node to proc create_node from NODE_WHILE_STMT
+        Set node to proc create_node with NODE_WHILE_STMT
         proc set_node_value with node, "condition", condition
         proc set_node_value with node, "statements", loop_stmts
 
@@ -1727,13 +1789,13 @@ Process called "parse_loop_statement" that takes parser as Integer returns Integ
     Note: Simple loop
     proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop'"
 
-    Set loop_stmts to proc parse_sequential_statements from parser
+    Set loop_stmts to proc parse_sequential_statements with parser
 
     proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after loop"
     proc expect_token with parser, VhdlLexer.TOKEN_LOOP, "Expected 'loop' after 'end'"
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after loop"
 
-    Set node to proc create_node from NODE_LOOP_STMT
+    Set node to proc create_node with NODE_LOOP_STMT
     proc set_node_value with node, "statements", loop_stmts
 
     Return node
@@ -1752,53 +1814,53 @@ assignment.
 Process called "parse_sequential_statement" that takes parser as Integer returns Integer:
     Note: Parse single sequential statement
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Signal or variable declaration
     If token_type is equal to VhdlLexer.TOKEN_SIGNAL:
-        Return proc parse_signal_declaration from parser
+        Return proc parse_signal_declaration with parser
     End If
 
     If token_type is equal to VhdlLexer.TOKEN_VARIABLE:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to VhdlLexer.TOKEN_CONSTANT:
-        Return proc parse_constant_declaration from parser
+        Return proc parse_constant_declaration with parser
     End If
 
     Note: If statement
     If token_type is equal to VhdlLexer.TOKEN_IF:
-        Return proc parse_if_statement from parser
+        Return proc parse_if_statement with parser
     End If
 
     Note: Case statement
     If token_type is equal to VhdlLexer.TOKEN_CASE:
-        Return proc parse_case_statement from parser
+        Return proc parse_case_statement with parser
     End If
 
     Note: Loop statements
     If token_type is equal to VhdlLexer.TOKEN_LOOP:
-        Return proc parse_loop_statement from parser
+        Return proc parse_loop_statement with parser
     End If
 
     If token_type is equal to VhdlLexer.TOKEN_FOR:
-        Return proc parse_loop_statement from parser
+        Return proc parse_loop_statement with parser
     End If
 
     If token_type is equal to VhdlLexer.TOKEN_WHILE:
-        Return proc parse_loop_statement from parser
+        Return proc parse_loop_statement with parser
     End If
 
     Note: Next statement
     If token_type is equal to VhdlLexer.TOKEN_NEXT:
-        proc advance from parser
+        proc advance with parser
 
-        Let node be proc create_node from NODE_NEXT_STMT
+        Let node be proc create_node with NODE_NEXT_STMT
 
         Note: Optional condition
         If proc match_token with parser, VhdlLexer.TOKEN_WHEN:
-            Let condition be proc parse_expression from parser
+            Let condition be proc parse_expression with parser
             proc set_node_value with node, "condition", condition
         End If
 
@@ -1808,13 +1870,13 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Exit statement
     If token_type is equal to VhdlLexer.TOKEN_EXIT:
-        proc advance from parser
+        proc advance with parser
 
-        Set node to proc create_node from NODE_EXIT_STMT
+        Set node to proc create_node with NODE_EXIT_STMT
 
         Note: Optional condition
         If proc match_token with parser, VhdlLexer.TOKEN_WHEN:
-            Set condition to proc parse_expression from parser
+            Set condition to proc parse_expression with parser
             proc set_node_value with node, "condition", condition
         End If
 
@@ -1824,13 +1886,13 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Return statement
     If token_type is equal to VhdlLexer.TOKEN_RETURN:
-        proc advance from parser
+        proc advance with parser
 
-        Set node to proc create_node from NODE_RETURN_STMT
+        Set node to proc create_node with NODE_RETURN_STMT
 
         Note: Optional return value
         If proc current_token_type with parser is not equal to VhdlLexer.TOKEN_SEMICOLON:
-            Let return_value be proc parse_expression from parser
+            Let return_value be proc parse_expression with parser
             proc set_node_value with node, "value", return_value
         End If
 
@@ -1840,17 +1902,17 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Wait statement
     If token_type is equal to VhdlLexer.TOKEN_WAIT:
-        proc advance from parser
+        proc advance with parser
 
-        Set node to proc create_node from NODE_WAIT_STMT
+        Set node to proc create_node with NODE_WAIT_STMT
 
         Note: Wait conditions
         If proc match_token with parser, VhdlLexer.TOKEN_ON:
-            Let signal_list be proc create_list from ListCore
+            Let signal_list be proc list_create from ListCore
 
             While 1 is equal to 1:
-                Let signal be proc parse_expression from parser
-                proc list_append with signal_list, signal
+                Let signal be proc parse_expression with parser
+                proc list_append from ListCore with signal_list, signal
 
                 If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                     Break
@@ -1861,12 +1923,12 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
         End If
 
         If proc match_token with parser, VhdlLexer.TOKEN_UNTIL:
-            Set condition to proc parse_expression from parser
+            Set condition to proc parse_expression with parser
             proc set_node_value with node, "condition", condition
         End If
 
         If proc match_token with parser, VhdlLexer.TOKEN_FOR:
-            Let timeout be proc parse_expression from parser
+            Let timeout be proc parse_expression with parser
             proc set_node_value with node, "timeout", timeout
         End If
 
@@ -1876,20 +1938,20 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Assert statement
     If token_type is equal to VhdlLexer.TOKEN_ASSERT:
-        proc advance from parser
+        proc advance with parser
 
-        Set condition to proc parse_expression from parser
+        Set condition to proc parse_expression with parser
 
-        Set node to proc create_node from NODE_ASSERTION_STMT
+        Set node to proc create_node with NODE_ASSERTION_STMT
         proc set_node_value with node, "condition", condition
 
         If proc match_token with parser, VhdlLexer.TOKEN_REPORT:
-            Let message be proc parse_expression from parser
+            Let message be proc parse_expression with parser
             proc set_node_value with node, "message", message
         End If
 
         If proc match_token with parser, VhdlLexer.TOKEN_SEVERITY:
-            Let severity be proc token_value from parser
+            Let severity be proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected severity level"
             proc set_node_value with node, "severity", severity
         End If
@@ -1900,15 +1962,15 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Report statement
     If token_type is equal to VhdlLexer.TOKEN_REPORT:
-        proc advance from parser
+        proc advance with parser
 
-        Set message to proc parse_expression from parser
+        Set message to proc parse_expression with parser
 
-        Set node to proc create_node from NODE_REPORT_STMT
+        Set node to proc create_node with NODE_REPORT_STMT
         proc set_node_value with node, "message", message
 
         If proc match_token with parser, VhdlLexer.TOKEN_SEVERITY:
-            Set severity to proc token_value from parser
+            Set severity to proc token_value with parser
             proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected severity level"
             proc set_node_value with node, "severity", severity
         End If
@@ -1919,14 +1981,14 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
 
     Note: Null statement
     If token_type is equal to VhdlLexer.TOKEN_NULL:
-        proc advance from parser
+        proc advance with parser
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after null statement"
-        Return proc create_node from NODE_NULL_STMT
+        Return proc create_node with NODE_NULL_STMT
     End If
 
     Note: Assignment or procedure call (starts with identifier)
     If token_type is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        Let target be proc parse_postfix_expression from parser
+        Let target be proc parse_postfix_expression with parser
 
         Note: Check for signal assignment
         If proc current_token_type with parser is equal to VhdlLexer.TOKEN_ASSIGN:
@@ -1941,13 +2003,13 @@ Process called "parse_sequential_statement" that takes parser as Integer returns
         Note: Must be procedure call
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after procedure call"
 
-        Set node to proc create_node from NODE_PROCEDURE_CALL
+        Set node to proc create_node with NODE_PROCEDURE_CALL
         proc add_child with node, target
         Return node
     End If
 
     proc parser_error with parser, "Expected sequential statement"
-    Return proc create_node from NODE_NULL_STMT
+    Return proc create_node with NODE_NULL_STMT
 End Process
 
 @Reasoning:
@@ -1961,10 +2023,10 @@ append each statement to STATEMENT_LIST.
 Process called "parse_sequential_statements" that takes parser as Integer returns Integer:
     Note: Parse block of sequential statements until end keyword
 
-    Let statements be proc create_list from ListCore
+    Let statements be proc list_create from ListCore
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Stop at end keywords
         If token_type is equal to VhdlLexer.TOKEN_END:
@@ -1983,8 +2045,8 @@ Process called "parse_sequential_statements" that takes parser as Integer return
             Break
         End If
 
-        Let stmt be proc parse_sequential_statement from parser
-        proc list_append with statements, stmt
+        Let stmt be proc parse_sequential_statement with parser
+        proc list_append from ListCore with statements, stmt
     End While
 
     Return statements
@@ -2008,15 +2070,15 @@ Process called "parse_process_statement" that takes parser as Integer returns In
 
     proc expect_token with parser, VhdlLexer.TOKEN_PROCESS, "Expected 'process'"
 
-    Let node be proc create_node from NODE_PROCESS
+    Let node be proc create_node with NODE_PROCESS
 
     Note: Optional sensitivity list
     If proc match_token with parser, VhdlLexer.TOKEN_LPAREN:
-        Let sensitivity be proc create_list from ListCore
+        Let sensitivity be proc list_create from ListCore
 
         While 1 is equal to 1:
-            Let signal be proc parse_expression from parser
-            proc list_append with sensitivity, signal
+            Let signal be proc parse_expression with parser
+            proc list_append from ListCore with sensitivity, signal
 
             If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                 Break
@@ -2031,8 +2093,8 @@ Process called "parse_process_statement" that takes parser as Integer returns In
     proc match_token with parser, VhdlLexer.TOKEN_IS
 
     Note: Parse declarative region
-    Let declarations be proc parse_declarations from parser
-    If proc list_length with declarations is greater than 0:
+    Let declarations be proc parse_declarations with parser
+    If proc list_length from ListCore with declarations is greater than 0:
         proc set_node_value with node, "declarations", declarations
     End If
 
@@ -2040,7 +2102,7 @@ Process called "parse_process_statement" that takes parser as Integer returns In
     proc expect_token with parser, VhdlLexer.TOKEN_BEGIN, "Expected 'begin' in process"
 
     Note: Parse sequential statements
-    Let statements be proc parse_sequential_statements from parser
+    Let statements be proc parse_sequential_statements with parser
     proc set_node_value with node, "statements", statements
 
     proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after process"
@@ -2064,10 +2126,10 @@ Process called "parse_concurrent_signal_assignment" that takes parser as Integer
 
     proc expect_token with parser, VhdlLexer.TOKEN_ASSIGN, "Expected '<=' for signal assignment"
 
-    Let value be proc parse_expression from parser
+    Let value be proc parse_expression with parser
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after signal assignment"
 
-    Let node be proc create_node from NODE_CONCURRENT_ASSIGN
+    Let node be proc create_node with NODE_CONCURRENT_ASSIGN
     proc add_child with node, target
     proc add_child with node, value
 
@@ -2085,10 +2147,10 @@ Already have label; consume component name; optional generic map clause
 Process called "parse_component_instantiation" that takes parser as Integer, label as Integer returns Integer:
     Note: Parse component instantiation
 
-    Let component_name be proc token_value from parser
+    Let component_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected component name"
 
-    Let node be proc create_node from NODE_COMPONENT_INST
+    Let node be proc create_node with NODE_COMPONENT_INST
     proc set_node_value with node, "label", label
     proc set_node_value with node, "component_name", component_name
 
@@ -2096,7 +2158,7 @@ Process called "parse_component_instantiation" that takes parser as Integer, lab
     If proc match_token with parser, VhdlLexer.TOKEN_GENERIC:
         proc expect_token with parser, VhdlLexer.TOKEN_MAP, "Expected 'map' after 'generic'"
 
-        Let generic_map be proc parse_association_list from parser
+        Let generic_map be proc parse_association_list with parser
         proc set_node_value with node, "generic_map", generic_map
     End If
 
@@ -2104,7 +2166,7 @@ Process called "parse_component_instantiation" that takes parser as Integer, lab
     If proc match_token with parser, VhdlLexer.TOKEN_PORT:
         proc expect_token with parser, VhdlLexer.TOKEN_MAP, "Expected 'map' after 'port'"
 
-        Let port_map be proc parse_association_list from parser
+        Let port_map be proc parse_association_list with parser
         proc set_node_value with node, "port_map", port_map
     End If
 
@@ -2127,26 +2189,26 @@ Process called "parse_association_list" that takes parser as Integer returns Int
 
     proc expect_token with parser, VhdlLexer.TOKEN_LPAREN, "Expected '(' for association list"
 
-    Let associations be proc create_list from ListCore
+    Let associations be proc list_create from ListCore
 
     While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_RPAREN:
         Note: Parse formal => actual or positional
         Let formal be 0
-        Let actual be proc parse_expression from parser
+        Let actual be proc parse_expression with parser
 
         Note: Check for named association
         If proc match_token with parser, VhdlLexer.TOKEN_ARROW:
             Set formal to actual
-            Set actual to proc parse_expression from parser
+            Set actual to proc parse_expression with parser
         End If
 
-        Let assoc be proc create_node from NODE_ASSOCIATION
+        Let assoc be proc create_node with NODE_ASSOCIATION
         If formal is not equal to 0:
             proc set_node_value with assoc, "formal", formal
         End If
         proc set_node_value with assoc, "actual", actual
 
-        proc list_append with associations, assoc
+        proc list_append from ListCore with associations, assoc
 
         If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
             Break
@@ -2174,13 +2236,13 @@ Process called "parse_generate_statement" that takes parser as Integer, label as
 
     Note: Check for for generate
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_FOR:
-        proc advance from parser
+        proc advance with parser
 
-        Let gen_var be proc token_value from parser
+        Let gen_var be proc token_value with parser
         proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected generate variable"
         proc expect_token with parser, VhdlLexer.TOKEN_IN, "Expected 'in' after generate variable"
 
-        Let range_start be proc parse_expression from parser
+        Let range_start be proc parse_expression with parser
 
         Let direction be "to"
         If proc match_token with parser, VhdlLexer.TOKEN_TO:
@@ -2191,16 +2253,16 @@ Process called "parse_generate_statement" that takes parser as Integer, label as
             proc parser_error with parser, "Expected 'to' or 'downto' in generate range"
         End If
 
-        Let range_end be proc parse_expression from parser
+        Let range_end be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_GENERATE, "Expected 'generate' after range"
 
-        Let concurrent_stmts be proc parse_concurrent_statements from parser
+        Let concurrent_stmts be proc parse_concurrent_statements with parser
 
         proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after generate"
         proc expect_token with parser, VhdlLexer.TOKEN_GENERATE, "Expected 'generate' after 'end'"
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after generate"
 
-        Let node be proc create_node from NODE_GENERATE
+        Let node be proc create_node with NODE_GENERATE
         proc set_node_value with node, "label", label
         proc set_node_value with node, "type", "for"
         proc set_node_value with node, "gen_var", gen_var
@@ -2214,18 +2276,18 @@ Process called "parse_generate_statement" that takes parser as Integer, label as
 
     Note: Check for if generate
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IF:
-        proc advance from parser
+        proc advance with parser
 
-        Let condition be proc parse_expression from parser
+        Let condition be proc parse_expression with parser
         proc expect_token with parser, VhdlLexer.TOKEN_GENERATE, "Expected 'generate' after condition"
 
-        Set concurrent_stmts to proc parse_concurrent_statements from parser
+        Set concurrent_stmts to proc parse_concurrent_statements with parser
 
         proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after generate"
         proc expect_token with parser, VhdlLexer.TOKEN_GENERATE, "Expected 'generate' after 'end'"
         proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after generate"
 
-        Set node to proc create_node from NODE_GENERATE
+        Set node to proc create_node with NODE_GENERATE
         proc set_node_value with node, "label", label
         proc set_node_value with node, "type", "if"
         proc set_node_value with node, "condition", condition
@@ -2235,7 +2297,7 @@ Process called "parse_generate_statement" that takes parser as Integer, label as
     End If
 
     proc parser_error with parser, "Expected 'for' or 'if' in generate statement"
-    Return proc create_node from NODE_GENERATE
+    Return proc create_node with NODE_GENERATE
 End Process
 
 @Reasoning:
@@ -2252,21 +2314,21 @@ Otherwise direct dispatch (PROCESS, target-IDENT for assignment).
 Process called "parse_concurrent_statement" that takes parser as Integer returns Integer:
     Note: Parse single concurrent statement
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Process statement
     If token_type is equal to VhdlLexer.TOKEN_PROCESS:
-        Return proc parse_process_statement from parser
+        Return proc parse_process_statement with parser
     End If
 
     Note: Component instantiation or concurrent assignment (both start with identifier)
     If token_type is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        Let label_or_target be proc token_value from parser
-        proc advance from parser
+        Let label_or_target be proc token_value with parser
+        proc advance with parser
 
         Note: Check for label (identifier followed by colon)
         If proc match_token with parser, VhdlLexer.TOKEN_COLON:
-            Let next_token be proc current_token_type from parser
+            Let next_token be proc current_token_type with parser
 
             Note: For generate or if generate
             If next_token is equal to VhdlLexer.TOKEN_FOR:
@@ -2278,7 +2340,7 @@ Process called "parse_concurrent_statement" that takes parser as Integer returns
 
             Note: Process with label
             If next_token is equal to VhdlLexer.TOKEN_PROCESS:
-                Let process_node be proc parse_process_statement from parser
+                Let process_node be proc parse_process_statement with parser
                 proc set_node_value with process_node, "label", label_or_target
                 Return process_node
             End If
@@ -2288,19 +2350,19 @@ Process called "parse_concurrent_statement" that takes parser as Integer returns
         End If
 
         Note: Concurrent signal assignment (target <= value;)
-        Let target_node be proc create_node from NODE_IDENTIFIER
+        Let target_node be proc create_node with NODE_IDENTIFIER
         proc set_node_value with target_node, "name", label_or_target
 
         Note: Handle postfix operations on target
         While 1 is equal to 1:
-            Let curr_type be proc current_token_type from parser
+            Let curr_type be proc current_token_type with parser
 
             If curr_type is equal to VhdlLexer.TOKEN_LPAREN:
-                proc advance from parser
-                Let index be proc parse_expression from parser
+                proc advance with parser
+                Let index be proc parse_expression with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after index"
 
-                Let indexed_node be proc create_node from NODE_INDEXED_NAME
+                Let indexed_node be proc create_node with NODE_INDEXED_NAME
                 proc add_child with indexed_node, target_node
                 proc add_child with indexed_node, index
                 Set target_node to indexed_node
@@ -2308,11 +2370,11 @@ Process called "parse_concurrent_statement" that takes parser as Integer returns
             End If
 
             If curr_type is equal to VhdlLexer.TOKEN_DOT:
-                proc advance from parser
-                Let field be proc token_value from parser
+                proc advance with parser
+                Let field be proc token_value with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected field name"
 
-                Let selected_node be proc create_node from NODE_SELECTED_NAME
+                Let selected_node be proc create_node with NODE_SELECTED_NAME
                 proc add_child with selected_node, target_node
                 proc set_node_value with selected_node, "field", field
                 Set target_node to selected_node
@@ -2326,7 +2388,7 @@ Process called "parse_concurrent_statement" that takes parser as Integer returns
     End If
 
     proc parser_error with parser, "Expected concurrent statement"
-    Return proc create_node from NODE_NULL_STMT
+    Return proc create_node with NODE_NULL_STMT
 End Process
 
 @Reasoning:
@@ -2340,10 +2402,10 @@ STATEMENT_LIST.
 Process called "parse_concurrent_statements" that takes parser as Integer returns Integer:
     Note: Parse block of concurrent statements until end keyword
 
-    Let statements be proc create_list from ListCore
+    Let statements be proc list_create from ListCore
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Stop at end keywords
         If token_type is equal to VhdlLexer.TOKEN_END:
@@ -2353,11 +2415,227 @@ Process called "parse_concurrent_statements" that takes parser as Integer return
             Break
         End If
 
-        Let stmt be proc parse_concurrent_statement from parser
-        proc list_append with statements, stmt
+        Let stmt be proc parse_concurrent_statement with parser
+        proc list_append from ListCore with statements, stmt
     End While
 
     Return statements
+End Process
+
+@Reasoning:
+Parses a subprogram parameter list: the parenthesized, semicolon-separated
+formal parameter interface elements of a function or procedure. Unlike a
+port/generic clause, a parameter list lives entirely inside one set of
+parentheses and is NOT followed by its own terminating semicolon (the
+semicolon, when present, belongs to the enclosing declaration). Each
+element is one-or-more comma-grouped names, a colon, an optional mode
+(in/out/inout), an optional object class already consumed by the caller's
+keyword (constant/variable/signal handled here when present), the subtype
+indication, and an optional default value.
+@End Reasoning
+@Implementation:
+Consume LPAREN; loop until RPAREN parsing one interface element per
+iteration; between elements require SEMICOLON; consume the closing RPAREN.
+Returns the list of NODE_PORT_DECL parameter nodes. An empty parameter
+list (immediately closing paren) yields an empty list.
+@End Implementation
+Process called "parse_subprogram_parameter_list" that takes parser as Integer returns Integer:
+    Note: Parse parenthesized subprogram parameter list (no trailing semicolon)
+
+    Let params be proc list_create from ListCore
+
+    If proc current_token_type with parser is not equal to VhdlLexer.TOKEN_LPAREN:
+        Return params
+    End If
+
+    proc expect_token with parser, VhdlLexer.TOKEN_LPAREN, "Expected '(' before parameter list"
+
+    While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_RPAREN:
+        Let elem_token be proc current_token_type with parser
+        If elem_token is equal to VhdlLexer.TOKEN_EOF:
+            proc parser_error with parser, "Unexpected end of input in parameter list"
+            Break
+        End If
+
+        Note: Optional object class keyword (constant/variable/signal)
+        Let object_class be proc create_from_literal from StringCore with "constant"
+        If elem_token is equal to VhdlLexer.TOKEN_CONSTANT:
+            proc advance with parser
+        Otherwise If elem_token is equal to VhdlLexer.TOKEN_VARIABLE:
+            Set object_class to proc create_from_literal from StringCore with "variable"
+            proc advance with parser
+        Otherwise If elem_token is equal to VhdlLexer.TOKEN_SIGNAL:
+            Set object_class to proc create_from_literal from StringCore with "signal"
+            proc advance with parser
+        End If
+
+        Note: One-or-more comma-separated parameter names
+        Let names be proc list_create from ListCore
+        While 1 is equal to 1:
+            Let name be proc token_value with parser
+            proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected parameter name"
+            proc list_append from ListCore with names, name
+
+            If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
+                Break
+            End If
+        End While
+
+        proc expect_token with parser, VhdlLexer.TOKEN_COLON, "Expected ':' after parameter names"
+
+        Note: Optional mode
+        Let mode be proc create_from_literal from StringCore with "in"
+        Let mode_token be proc current_token_type with parser
+        If mode_token is equal to VhdlLexer.TOKEN_IN:
+            proc advance with parser
+        Otherwise If mode_token is equal to VhdlLexer.TOKEN_OUT:
+            Set mode to proc create_from_literal from StringCore with "out"
+            proc advance with parser
+        Otherwise If mode_token is equal to VhdlLexer.TOKEN_INOUT:
+            Set mode to proc create_from_literal from StringCore with "inout"
+            proc advance with parser
+        End If
+
+        Let param_type be proc parse_subtype_indication with parser
+
+        Let default_value be 0
+        If proc match_token with parser, VhdlLexer.TOKEN_COLON_EQUAL:
+            Set default_value to proc parse_expression with parser
+        End If
+
+        Let param_node be proc create_node with NODE_PORT_DECL
+        proc set_node_value with param_node, "names", names
+        proc set_node_value with param_node, "object_class", object_class
+        proc set_node_value with param_node, "mode", mode
+        proc set_node_value with param_node, "subtype", param_type
+        If default_value is not equal to 0:
+            proc set_node_value with param_node, "default_value", default_value
+        End If
+
+        proc list_append from ListCore with params, param_node
+
+        If proc match_token with parser, VhdlLexer.TOKEN_SEMICOLON is equal to 0:
+            Break
+        End If
+    End While
+
+    proc expect_token with parser, VhdlLexer.TOKEN_RPAREN, "Expected ')' after parameter list"
+
+    Return params
+End Process
+
+@Reasoning:
+`function Name [(parameter_list)] return Type [is declarations begin
+sequential_statements end [function] [Name]] ;`. A pure VHDL function
+either declares its specification only (subprogram declaration, ends at
+the semicolon directly after the return type) or supplies a body (the
+`is ... begin ... end` form). The parser handles both by checking for the
+IS keyword after the return type.
+@End Reasoning
+@Implementation:
+Consume FUNCTION; read the designator (identifier); parse the optional
+parameter list; expect RETURN; parse the return subtype indication; if IS
+follows, parse the body's declarative part, BEGIN, sequential statements,
+END (with optional FUNCTION keyword and designator repetition); finally
+expect the terminating SEMICOLON. Attaches name, parameters, return_type
+and (when present) declarations/body children onto a NODE_FUNCTION_DECL.
+@End Implementation
+Process called "parse_function_declaration" that takes parser as Integer returns Integer:
+    Note: Parse VHDL function declaration or body
+
+    proc expect_token with parser, VhdlLexer.TOKEN_FUNCTION, "Expected 'function'"
+
+    Let func_name be proc token_value with parser
+    proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected function name"
+
+    Let node be proc create_node with NODE_FUNCTION_DECL
+    proc set_node_value with node, "name", func_name
+
+    Let params be proc parse_subprogram_parameter_list with parser
+    proc set_node_value with node, "parameters", params
+
+    proc expect_token with parser, VhdlLexer.TOKEN_RETURN, "Expected 'return' in function declaration"
+
+    Let return_type be proc parse_subtype_indication with parser
+    proc set_node_value with node, "return_type", return_type
+
+    Note: Optional body
+    If proc match_token with parser, VhdlLexer.TOKEN_IS:
+        Let declarations be proc parse_declarations with parser
+        proc set_node_value with node, "declarations", declarations
+
+        proc expect_token with parser, VhdlLexer.TOKEN_BEGIN, "Expected 'begin' in function body"
+
+        Let body be proc parse_sequential_statements with parser
+        proc set_node_value with node, "body", body
+
+        proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after function body"
+
+        Note: Optional 'function' keyword and designator repetition
+        If proc current_token_type with parser is equal to VhdlLexer.TOKEN_FUNCTION:
+            proc advance with parser
+        End If
+        If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
+            proc advance with parser
+        End If
+    End If
+
+    proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after function declaration"
+
+    Return node
+End Process
+
+@Reasoning:
+`procedure Name [(parameter_list)] [is declarations begin
+sequential_statements end [procedure] [Name]] ;`. A procedure differs from
+a function only in that it has no return type. As with functions, the
+specification-only and body forms are both valid, distinguished by the IS
+keyword.
+@End Reasoning
+@Implementation:
+Consume PROCEDURE; read the designator; parse the optional parameter list;
+if IS follows, parse the body (declarations, BEGIN, sequential statements,
+END with optional PROCEDURE keyword and designator); expect the
+terminating SEMICOLON. Attaches name, parameters and (when present)
+declarations/body onto a NODE_PROCEDURE_DECL.
+@End Implementation
+Process called "parse_procedure_declaration" that takes parser as Integer returns Integer:
+    Note: Parse VHDL procedure declaration or body
+
+    proc expect_token with parser, VhdlLexer.TOKEN_PROCEDURE, "Expected 'procedure'"
+
+    Let proc_name be proc token_value with parser
+    proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected procedure name"
+
+    Let node be proc create_node with NODE_PROCEDURE_DECL
+    proc set_node_value with node, "name", proc_name
+
+    Let params be proc parse_subprogram_parameter_list with parser
+    proc set_node_value with node, "parameters", params
+
+    Note: Optional body
+    If proc match_token with parser, VhdlLexer.TOKEN_IS:
+        Let declarations be proc parse_declarations with parser
+        proc set_node_value with node, "declarations", declarations
+
+        proc expect_token with parser, VhdlLexer.TOKEN_BEGIN, "Expected 'begin' in procedure body"
+
+        Let body be proc parse_sequential_statements with parser
+        proc set_node_value with node, "body", body
+
+        proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after procedure body"
+
+        If proc current_token_type with parser is equal to VhdlLexer.TOKEN_PROCEDURE:
+            proc advance with parser
+        End If
+        If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
+            proc advance with parser
+        End If
+    End If
+
+    proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after procedure declaration"
+
+    Return node
 End Process
 
 @Reasoning:
@@ -2372,10 +2650,10 @@ TYPE, SUBTYPE, COMPONENT, FUNCTION, PROCEDURE, etc.); break on BEGIN.
 Process called "parse_declarations" that takes parser as Integer returns Integer:
     Note: Parse declaration section (before begin)
 
-    Let declarations be proc create_list from ListCore
+    Let declarations be proc list_create from ListCore
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Stop at begin or end
         If token_type is equal to VhdlLexer.TOKEN_BEGIN:
@@ -2390,58 +2668,58 @@ Process called "parse_declarations" that takes parser as Integer returns Integer
 
         Note: Parse different declaration types
         If token_type is equal to VhdlLexer.TOKEN_SIGNAL:
-            Let decl be proc parse_signal_declaration from parser
-            proc list_append with declarations, decl
+            Let decl be proc parse_signal_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         If token_type is equal to VhdlLexer.TOKEN_VARIABLE:
-            Set decl to proc parse_variable_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_variable_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         If token_type is equal to VhdlLexer.TOKEN_CONSTANT:
-            Set decl to proc parse_constant_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_constant_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         If token_type is equal to VhdlLexer.TOKEN_TYPE:
-            Set decl to proc parse_type_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_type_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         If token_type is equal to VhdlLexer.TOKEN_SUBTYPE:
-            Set decl to proc parse_subtype_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_subtype_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         If token_type is equal to VhdlLexer.TOKEN_COMPONENT:
-            Set decl to proc parse_component_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_component_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         Note: Function declarations
         If token_type is equal to VhdlLexer.TOKEN_FUNCTION:
-            Set decl to proc parse_function_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_function_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         Note: Procedure declarations
         If token_type is equal to VhdlLexer.TOKEN_PROCEDURE:
-            Set decl to proc parse_procedure_declaration from parser
-            proc list_append with declarations, decl
+            Set decl to proc parse_procedure_declaration with parser
+            proc list_append from ListCore with declarations, decl
             Continue
         End If
 
         Note: Unknown declaration
         proc parser_error with parser, "Expected declaration"
-        proc synchronize from parser
+        proc synchronize with parser
         Break
     End While
 
@@ -2465,22 +2743,22 @@ Process called "parse_entity_declaration" that takes parser as Integer returns I
 
     proc expect_token with parser, VhdlLexer.TOKEN_ENTITY, "Expected 'entity'"
 
-    Let entity_name be proc token_value from parser
+    Let entity_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected entity name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after entity name"
 
-    Let node be proc create_node from NODE_ENTITY
+    Let node be proc create_node with NODE_ENTITY
     proc set_node_value with node, "name", entity_name
 
     Note: Optional generic clause
     If proc match_token with parser, VhdlLexer.TOKEN_GENERIC:
-        Let generics be proc parse_interface_list from parser
+        Let generics be proc parse_interface_list with parser
         proc set_node_value with node, "generics", generics
     End If
 
     Note: Optional port clause
     If proc match_token with parser, VhdlLexer.TOKEN_PORT:
-        Let ports be proc parse_interface_list from parser
+        Let ports be proc parse_interface_list with parser
         proc set_node_value with node, "ports", ports
     End If
 
@@ -2491,7 +2769,7 @@ Process called "parse_entity_declaration" that takes parser as Integer returns I
 
     Note: Optional entity name repetition
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after entity declaration"
@@ -2515,21 +2793,21 @@ Process called "parse_architecture_body" that takes parser as Integer returns In
 
     proc expect_token with parser, VhdlLexer.TOKEN_ARCHITECTURE, "Expected 'architecture'"
 
-    Let arch_name be proc token_value from parser
+    Let arch_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected architecture name"
     proc expect_token with parser, VhdlLexer.TOKEN_OF, "Expected 'of' after architecture name"
 
-    Let entity_name be proc token_value from parser
+    Let entity_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected entity name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after entity name"
 
-    Let node be proc create_node from NODE_ARCHITECTURE
+    Let node be proc create_node with NODE_ARCHITECTURE
     proc set_node_value with node, "name", arch_name
     proc set_node_value with node, "entity_name", entity_name
 
     Note: Parse declarative region
-    Let declarations be proc parse_declarations from parser
-    If proc list_length with declarations is greater than 0:
+    Let declarations be proc parse_declarations with parser
+    If proc list_length from ListCore with declarations is greater than 0:
         proc set_node_value with node, "declarations", declarations
     End If
 
@@ -2537,7 +2815,7 @@ Process called "parse_architecture_body" that takes parser as Integer returns In
     proc expect_token with parser, VhdlLexer.TOKEN_BEGIN, "Expected 'begin' in architecture"
 
     Note: Parse concurrent statements
-    Let statements be proc parse_concurrent_statements from parser
+    Let statements be proc parse_concurrent_statements with parser
     proc set_node_value with node, "statements", statements
 
     proc expect_token with parser, VhdlLexer.TOKEN_END, "Expected 'end' after architecture"
@@ -2547,7 +2825,7 @@ Process called "parse_architecture_body" that takes parser as Integer returns In
 
     Note: Optional architecture name repetition
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after architecture body"
@@ -2569,16 +2847,16 @@ Process called "parse_package_declaration" that takes parser as Integer returns 
 
     proc expect_token with parser, VhdlLexer.TOKEN_PACKAGE, "Expected 'package'"
 
-    Let package_name be proc token_value from parser
+    Let package_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected package name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after package name"
 
-    Let node be proc create_node from NODE_PACKAGE
+    Let node be proc create_node with NODE_PACKAGE
     proc set_node_value with node, "name", package_name
 
     Note: Parse package declarations
-    Let declarations be proc parse_declarations from parser
-    If proc list_length with declarations is greater than 0:
+    Let declarations be proc parse_declarations with parser
+    If proc list_length from ListCore with declarations is greater than 0:
         proc set_node_value with node, "declarations", declarations
     End If
 
@@ -2589,7 +2867,7 @@ Process called "parse_package_declaration" that takes parser as Integer returns 
 
     Note: Optional package name repetition
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after package declaration"
@@ -2612,16 +2890,16 @@ Process called "parse_package_body" that takes parser as Integer returns Integer
     proc expect_token with parser, VhdlLexer.TOKEN_PACKAGE, "Expected 'package'"
     proc expect_token with parser, VhdlLexer.TOKEN_BODY, "Expected 'body' after 'package'"
 
-    Let package_name be proc token_value from parser
+    Let package_name be proc token_value with parser
     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected package name"
     proc expect_token with parser, VhdlLexer.TOKEN_IS, "Expected 'is' after package name"
 
-    Let node be proc create_node from NODE_PACKAGE_BODY
+    Let node be proc create_node with NODE_PACKAGE_BODY
     proc set_node_value with node, "name", package_name
 
     Note: Parse package body declarations
-    Let declarations be proc parse_declarations from parser
-    If proc list_length with declarations is greater than 0:
+    Let declarations be proc parse_declarations with parser
+    If proc list_length from ListCore with declarations is greater than 0:
         proc set_node_value with node, "declarations", declarations
     End If
 
@@ -2634,7 +2912,7 @@ Process called "parse_package_body" that takes parser as Integer returns Integer
 
     Note: Optional package name repetition
     If proc current_token_type with parser is equal to VhdlLexer.TOKEN_IDENTIFIER:
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after package body"
@@ -2654,22 +2932,22 @@ expect SEMICOLON, continue.
 Process called "parse_context_clause" that takes parser as Integer returns Integer:
     Note: Parse context clause (library and use statements)
 
-    Let context_items be proc create_list from ListCore
+    Let context_items be proc list_create from ListCore
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         Note: Library clause
         If token_type is equal to VhdlLexer.TOKEN_LIBRARY:
-            proc advance from parser
+            proc advance with parser
 
-            Let node be proc create_node from NODE_LIBRARY_CLAUSE
-            Let library_names be proc create_list from ListCore
+            Let node be proc create_node with NODE_LIBRARY_CLAUSE
+            Let library_names be proc list_create from ListCore
 
             While 1 is equal to 1:
-                Let lib_name be proc token_value from parser
+                Let lib_name be proc token_value with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected library name"
-                proc list_append with library_names, lib_name
+                proc list_append from ListCore with library_names, lib_name
 
                 If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                     Break
@@ -2678,32 +2956,33 @@ Process called "parse_context_clause" that takes parser as Integer returns Integ
 
             proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after library clause"
             proc set_node_value with node, "libraries", library_names
-            proc list_append with context_items, node
+            proc list_append from ListCore with context_items, node
             Continue
         End If
 
         Note: Use clause
         If token_type is equal to VhdlLexer.TOKEN_USE:
-            proc advance from parser
+            proc advance with parser
 
-            Set node to proc create_node from NODE_USE_CLAUSE
-            Let use_names be proc create_list from ListCore
+            Set node to proc create_node with NODE_USE_CLAUSE
+            Let use_names be proc list_create from ListCore
 
             While 1 is equal to 1:
-                Let use_name be proc token_value from parser
+                Let use_name be proc token_value with parser
                 proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected name in use clause"
 
                 Note: Parse selected name (library.package.item)
                 While proc match_token with parser, VhdlLexer.TOKEN_DOT:
-                    Let next_part be proc token_value from parser
+                    Let next_part be proc token_value with parser
                     proc expect_token with parser, VhdlLexer.TOKEN_IDENTIFIER, "Expected identifier after '.'"
 
-                    Let combined be proc string_concat from StringCore with use_name, "."
-                    Set combined to proc string_concat from StringCore with combined, next_part
+                    Let dot_str be proc create_from_literal from StringCore with "."
+                    Let combined be proc string_concat from StringPrim with use_name, dot_str
+                    Set combined to proc string_concat from StringPrim with combined, next_part
                     Set use_name to combined
                 End While
 
-                proc list_append with use_names, use_name
+                proc list_append from ListCore with use_names, use_name
 
                 If proc match_token with parser, VhdlLexer.TOKEN_COMMA is equal to 0:
                     Break
@@ -2712,7 +2991,7 @@ Process called "parse_context_clause" that takes parser as Integer returns Integ
 
             proc expect_token with parser, VhdlLexer.TOKEN_SEMICOLON, "Expected ';' after use clause"
             proc set_node_value with node, "names", use_names
-            proc list_append with context_items, node
+            proc list_append from ListCore with context_items, node
             Continue
         End If
 
@@ -2736,20 +3015,20 @@ Process called "parse_design_unit" that takes parser as Integer returns Integer:
     Note: Parse single design unit (entity, architecture, package, etc.)
 
     Note: Parse context clause (library/use statements)
-    Let context_clause be proc parse_context_clause from parser
+    Let context_clause be proc parse_context_clause with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Entity declaration
     If token_type is equal to VhdlLexer.TOKEN_ENTITY:
-        Let entity be proc parse_entity_declaration from parser
+        Let entity be proc parse_entity_declaration with parser
         proc set_node_value with entity, "context", context_clause
         Return entity
     End If
 
     Note: Architecture body
     If token_type is equal to VhdlLexer.TOKEN_ARCHITECTURE:
-        Let arch be proc parse_architecture_body from parser
+        Let arch be proc parse_architecture_body with parser
         proc set_node_value with arch, "context", context_clause
         Return arch
     End If
@@ -2760,18 +3039,18 @@ Process called "parse_design_unit" that takes parser as Integer returns Integer:
         Let next_token be proc peek_token_type with parser, 1
 
         If next_token is equal to VhdlLexer.TOKEN_BODY:
-            Let pkg_body be proc parse_package_body from parser
+            Let pkg_body be proc parse_package_body with parser
             proc set_node_value with pkg_body, "context", context_clause
             Return pkg_body
         Otherwise:
-            Let pkg be proc parse_package_declaration from parser
+            Let pkg be proc parse_package_declaration with parser
             proc set_node_value with pkg, "context", context_clause
             Return pkg
         End If
     End If
 
     proc parser_error with parser, "Expected design unit (entity, architecture, or package)"
-    Return proc create_node from NODE_ENTITY
+    Return proc create_node with NODE_ENTITY
 End Process
 
 Note: ==================== Main Parse Function ====================
@@ -2792,17 +3071,17 @@ Process called "parse" that takes tokens as Integer, token_count as Integer retu
 
     Let parser be proc create_parser with tokens, token_count
 
-    Let root be proc create_node from NODE_DESIGN_FILE
-    Let design_units be proc create_list from ListCore
+    Let root be proc create_node with NODE_DESIGN_FILE
+    Let design_units be proc list_create from ListCore
 
     Note: Parse all design units in file
     While proc current_token_type with parser is not equal to VhdlLexer.TOKEN_EOF:
-        Let unit be proc parse_design_unit from parser
-        proc list_append with design_units, unit
+        Let unit be proc parse_design_unit with parser
+        proc list_append from ListCore with design_units, unit
 
         Note: Error recovery
         If parser.had_error is equal to 1:
-            proc synchronize from parser
+            proc synchronize with parser
             Set parser.had_error to 0
         End If
     End While
