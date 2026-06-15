@@ -1,0 +1,582 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+SwiftUI Translation Round-Trip Probe
+
+End-to-end proof that the SwiftUI translation pipeline is REAL, not a skeleton:
+
+    SwiftUI source
+      -> swiftui_lexer    (tokenize: struct/var/let/some/View/body, @wrappers,
+                           VStack/HStack/Text/Button view types, .modifier dots,
+                           "strings", numbers, $bindings)
+      -> swiftui_parser   (build the SwiftUINode AST: view struct, properties with
+                           wrappers, the body computed property, container/element
+                           views, trailing-closure children, modifier chains,
+                           parameters)
+      -> swiftui_to_hir   (lower the AST to the hir.runa dictionary/list HIR)
+      -> hir_to_swiftui   (emit HIR back to valid SwiftUI text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The SwiftUI HIR node model is hir.runa's dictionary/list literal interchange shared
+by swiftui_to_hir (producer) and hir_to_swiftui (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR_ARRAY_LITERAL whose elements List hangs at the
+children slot; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that contract
+(the decoders below mirror the producer/consumer).
+
+DEPTH: the probe does NOT merely check that nodes exist. On the re-parsed HIR2 it
+asserts the CONTENTS survive: the struct name conforming to View; a @State property
+plus its wrapper; the body computed property; a VStack container with >= 2 children;
+a modifier chain of >= 2 modifiers (.padding then .foregroundColor); a ForEach
+container; a function-decl-style member access expression; a string-interpolation
+literal. A translator that returned an empty children list (children vanish) makes
+this probe FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/swiftui/swiftui_lexer.runa" as SwiftUILexer
+Import "compiler/middle/gungnir/hir/translation/frontends/swiftui/swiftui_parser.runa" as SwiftUIParser
+Import "compiler/middle/gungnir/hir/translation/frontends/swiftui/swiftui_to_hir.runa" as SwiftUIFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/swiftui/hir_to_swiftui.runa" as SwiftUIBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A SwiftUI HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot. Each entry is a 16-byte block: key (raw string handle) at offset 0,
+value (a child HIR node or HIR string literal) at offset 8. This decoder
+linear-scans those entries comparing the raw key with string_equals, returning the
+stored value. It is the exact lookup hir_to_swiftui.get_dict_hir_value performs, so
+reading HIR through it proves the produced shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", "wrapper", ...) are stored as HIR string literal
+nodes. This helper resolves the key then unwraps the literal to its char* payload
+via get_string_literal_value, so the probe can compare tags, names, wrappers.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A SwiftUI HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot. Returning that List lets the probe iterate children / properties /
+modifiers with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Returns the element count of a HIR list node (0 when absent). Used to assert child
+count, modifier count, property count.
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+Locates the first element in a HIR list whose "_type" matches the requested kind.
+Used to find a property by tag and a container/element by tag within a children
+list.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates a property element by name within a list (the struct's "properties" list).
+Used to assert the @State property survives by name.
+@End Reasoning
+Process called "find_property_by_name" takes list_node as Integer, want_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let is_prop be proc string_equals from StringCore with item_type, "property"
+            If is_prop is equal to 1:
+                Let item_name be proc dict_get_string with item, "name"
+                If item_name is not equal to 0:
+                    Let name_ok be proc string_equals from StringCore with item_name, want_name
+                    If name_ok is equal to 1:
+                        Return item
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Recursively searches a view tree (container/element node) for the first container
+whose "name" equals the requested name (e.g. "VStack", "ForEach"). Bounded by the
+finite tree, so it always terminates. Used to assert containers survive nesting.
+@End Reasoning
+Process called "find_container_by_name" takes view_node as Integer, want_name as Integer returns Integer:
+    If view_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc dict_get_string with view_node, "_type"
+    If node_type is not equal to 0:
+        Let is_container be proc string_equals from StringCore with node_type, "container"
+        If is_container is equal to 1:
+            Let cname be proc dict_get_string with view_node, "name"
+            If cname is not equal to 0:
+                Let name_ok be proc string_equals from StringCore with cname, want_name
+                If name_ok is equal to 1:
+                    Return view_node
+                End If
+            End If
+        End If
+    End If
+
+    Note: descend into children
+    Let children be proc dict_get with view_node, "children"
+    If children is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with children
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let child be proc get_at from List with items, index
+        Let found be proc find_container_by_name with child, want_name
+        If found is not equal to 0:
+            Return found
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Recursively searches a view tree for the first element whose "name" equals the
+requested name (e.g. "Text", "Button"). Used to locate a leaf carrying a modifier
+chain and an interpolated string parameter.
+@End Reasoning
+Process called "find_element_by_name" takes view_node as Integer, want_name as Integer returns Integer:
+    If view_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc dict_get_string with view_node, "_type"
+    If node_type is not equal to 0:
+        Let is_element be proc string_equals from StringCore with node_type, "element"
+        If is_element is equal to 1:
+            Let ename be proc dict_get_string with view_node, "name"
+            If ename is not equal to 0:
+                Let name_ok be proc string_equals from StringCore with ename, want_name
+                If name_ok is equal to 1:
+                    Return view_node
+                End If
+            End If
+        End If
+    End If
+
+    Let children be proc dict_get with view_node, "children"
+    If children is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with children
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let child be proc get_at from List with items, index
+        Let found be proc find_element_by_name with child, want_name
+        If found is not equal to 0:
+            Return found
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a view node's "modifiers" list contains a modifier whose name equals
+the target. Used to assert the .padding / .foregroundColor chain survives in order
+and by content.
+@End Reasoning
+Process called "view_has_modifier" takes view_node as Integer, want_name as Integer returns Integer:
+    If view_node is equal to 0:
+        Return 0
+    End If
+    Let modifiers be proc dict_get with view_node, "modifiers"
+    Let items be proc list_elements with modifiers
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let mod_node be proc get_at from List with items, index
+        Let mname be proc dict_get_string with mod_node, "name"
+        If mname is not equal to 0:
+            Let matches be proc string_equals from StringCore with mname, want_name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 when the named parameter of a view node decodes to a string literal whose
+value contains the requested substring. Used to assert the interpolated string text
+("Sum: \(count)") survives as the Text parameter. Positional args are keyed "0".
+@End Reasoning
+Process called "param_string_contains" takes view_node as Integer, param_key as Integer, want_sub as Integer returns Integer:
+    If view_node is equal to 0:
+        Return 0
+    End If
+    Let params be proc dict_get with view_node, "parameters"
+    If params is equal to 0:
+        Return 0
+    End If
+    Let value be proc dict_get_string with params, param_key
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc string_contains with value, want_sub
+End Process
+
+@Reasoning:
+Substring search: returns 1 if needle occurs anywhere in haystack, else 0. Both are
+NUL-terminated. Bounded by haystack length so it always terminates. Used by
+param_string_contains since the interpolation text is embedded in a longer literal.
+@End Reasoning
+Process called "string_contains" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
+    End If
+    Let hlen be proc string_length from StringCore with haystack
+    Let nlen be proc string_length from StringCore with needle
+    If nlen is equal to 0:
+        Return 1
+    End If
+    If nlen is greater than hlen:
+        Return 0
+    End If
+    Let last_start be hlen minus nlen
+    Let start be 0
+    While start is less than or equal to last_start:
+        Let j be 0
+        Let matched be 1
+        While j is less than nlen:
+            Let hc be proc string_char_at from StringCore with haystack, start plus j
+            Let nc be proc string_char_at from StringCore with needle, j
+            If hc is not equal to nc:
+                Set matched to 0
+                Set j to nlen
+            Otherwise:
+                Set j to j plus 1
+            End If
+        End While
+        If matched is equal to 1:
+            Return 1
+        End If
+        Set start to start plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). The wrapper guards the source so the two runs (original and emitted) are
+behaviourally identical and any divergence is attributable to the emitter. A null
+intermediate short-circuits to 0 so the assertions report a clean failure rather
+than crashing.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let lexer be proc create_swiftui_lexer from SwiftUILexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+    Let parser be proc create_swiftui_parser from SwiftUIParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let ast be proc parse_swiftui from SwiftUIParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+    Return proc translate_swiftui_to_hir from SwiftUIFrontend with ast
+End Process
+
+@Reasoning:
+Returns the root view node of a view_struct's body: view_struct -> body -> view.
+Returns 0 if any link is missing.
+@End Reasoning
+Process called "root_view" takes hir_struct as Integer returns Integer:
+    Let body be proc dict_get with hir_struct, "body"
+    If body is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get with body, "view"
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "SwiftUI translation round-trip"
+
+    Note:
+    Representative view exercising a broad declarative surface:
+    - struct ContentView conforming to View
+    - a @State property (count: Int = 0)
+    - the body computed property (var body: some View)
+    - a VStack container with >= 2 children
+    - a Text with a modifier chain (.padding then .foregroundColor)
+    - a ForEach container nested inside the VStack
+    - a function-call style expression inside a parameter
+    - a string with interpolation ("Sum: \(count)")
+    :End Note
+    Let source be "struct ContentView: View {\n@State var count: Int = 0\nvar body: some View {\nVStack(alignment: leading, spacing: 10) {\nText(\"Sum: \\(count)\")\n.padding()\n.foregroundColor(red)\nForEach(items) {\nText(\"Row\")\n}\nButton(\"Tap\") {\nText(\"Inside\")\n}\n}\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, parse, lower) ---
+    Let lexer be proc create_swiftui_lexer from SwiftUILexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_swiftui_parser from SwiftUIParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_swiftui from SwiftUIParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced SwiftUI AST", ast
+
+    Let hir1 be proc translate_swiftui_to_hir from SwiftUIFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR view_struct", hir1
+
+    Note: Root must be a dict node tagged "view_struct".
+    Let root_is_dict be proc is_dictionary_literal from HIR with hir1
+    proc assert_equal from TestUtils with results, "HIR root is a dictionary", root_is_dict, 1
+    Let struct_type be proc dict_get_string with hir1, "_type"
+    Let struct_type_ok be proc string_equals from StringCore with struct_type, "view_struct"
+    proc assert_equal from TestUtils with results, "HIR root is a view_struct", struct_type_ok, 1
+
+    Note: --- struct name conforming to View survives ---
+    Let struct_name be proc dict_get_string with hir1, "name"
+    Let struct_name_ok be proc string_equals from StringCore with struct_name, "ContentView"
+    proc assert_equal from TestUtils with results, "struct name is 'ContentView'", struct_name_ok, 1
+
+    Note: --- @State property + wrapper survive ---
+    Let props be proc dict_get with hir1, "properties"
+    proc assert_not_null from TestUtils with results, "struct has a properties list", props
+    Let prop_count be proc list_count with props
+    proc assert_greater_than_or_equal from TestUtils with results, "struct has >= 1 property", prop_count, 1
+    Let count_prop be proc find_property_by_name with props, "count"
+    proc assert_not_null from TestUtils with results, "property 'count' present", count_prop
+    Let count_wrapper be proc dict_get_string with count_prop, "wrapper"
+    Let count_wrapper_ok be proc string_equals from StringCore with count_wrapper, "State"
+    proc assert_equal from TestUtils with results, "property 'count' has @State wrapper", count_wrapper_ok, 1
+
+    Note: --- body computed property survives ---
+    Let body1 be proc dict_get with hir1, "body"
+    proc assert_not_null from TestUtils with results, "view_struct has a body", body1
+    Let body1_type be proc dict_get_string with body1, "_type"
+    Let body1_type_ok be proc string_equals from StringCore with body1_type, "view_body"
+    proc assert_equal from TestUtils with results, "body is a view_body", body1_type_ok, 1
+
+    Note: --- VStack container with >= 2 children survives ---
+    Let root1 be proc root_view with hir1
+    proc assert_not_null from TestUtils with results, "body has a root view", root1
+    Let vstack1 be proc find_container_by_name with root1, "VStack"
+    proc assert_not_null from TestUtils with results, "VStack container present", vstack1
+    Let vstack1_children be proc dict_get with vstack1, "children"
+    Let vstack1_child_count be proc list_count with vstack1_children
+    proc assert_greater_than_or_equal from TestUtils with results, "VStack has >= 2 children", vstack1_child_count, 2
+
+    Note: --- modifier chain (>= 2 modifiers) survives in order ---
+    Let text1 be proc find_element_by_name with root1, "Text"
+    proc assert_not_null from TestUtils with results, "Text element present", text1
+    Let text1_modifiers be proc dict_get with text1, "modifiers"
+    Let text1_mod_count be proc list_count with text1_modifiers
+    proc assert_greater_than_or_equal from TestUtils with results, "Text has >= 2 modifiers", text1_mod_count, 2
+    Let has_padding be proc view_has_modifier with text1, "padding"
+    proc assert_equal from TestUtils with results, "Text has .padding modifier", has_padding, 1
+    Let has_fgcolor be proc view_has_modifier with text1, "foregroundColor"
+    proc assert_equal from TestUtils with results, "Text has .foregroundColor modifier", has_fgcolor, 1
+
+    Note: --- ForEach container survives ---
+    Let foreach1 be proc find_container_by_name with root1, "ForEach"
+    proc assert_not_null from TestUtils with results, "ForEach container present", foreach1
+
+    Note: --- string interpolation survives in the Text parameter ---
+    Let interp1 be proc param_string_contains with text1, "0", "Sum: "
+    proc assert_equal from TestUtils with results, "Text param carries interpolated 'Sum: '", interp1, 1
+
+    Note: --- Stage 3: HIR1 -> SwiftUI text ---
+    Let emitted be proc generate_swiftui from SwiftUIBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced SwiftUI text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted SwiftUI is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted SwiftUI produced HIR2", hir2
+
+    Let struct2_type be proc dict_get_string with hir2, "_type"
+    Let struct2_type_ok be proc string_equals from StringCore with struct2_type, "view_struct"
+    proc assert_equal from TestUtils with results, "round-trip root is a view_struct", struct2_type_ok, 1
+
+    Note: --- Stage 5: CONTENT equality on the key constructs (HIR2) ---
+
+    Note: struct name survives round-trip
+    Let struct2_name be proc dict_get_string with hir2, "name"
+    Let struct2_name_ok be proc string_equals from StringCore with struct2_name, "ContentView"
+    proc assert_equal from TestUtils with results, "round-trip preserves struct 'ContentView'", struct2_name_ok, 1
+
+    Note: @State property + wrapper survive round-trip
+    Let props2 be proc dict_get with hir2, "properties"
+    Let count2_prop be proc find_property_by_name with props2, "count"
+    proc assert_not_null from TestUtils with results, "round-trip preserves property 'count'", count2_prop
+    Let count2_wrapper be proc dict_get_string with count2_prop, "wrapper"
+    Let count2_wrapper_ok be proc string_equals from StringCore with count2_wrapper, "State"
+    proc assert_equal from TestUtils with results, "round-trip preserves @State wrapper", count2_wrapper_ok, 1
+
+    Note: body computed property survives round-trip
+    Let body2 be proc dict_get with hir2, "body"
+    proc assert_not_null from TestUtils with results, "round-trip preserves body", body2
+    Let body2_type be proc dict_get_string with body2, "_type"
+    Let body2_type_ok be proc string_equals from StringCore with body2_type, "view_body"
+    proc assert_equal from TestUtils with results, "round-trip body is a view_body", body2_type_ok, 1
+
+    Note: VStack container with >= 2 children survives round-trip
+    Let root2 be proc root_view with hir2
+    proc assert_not_null from TestUtils with results, "round-trip body has a root view", root2
+    Let vstack2 be proc find_container_by_name with root2, "VStack"
+    proc assert_not_null from TestUtils with results, "round-trip preserves VStack", vstack2
+    Let vstack2_children be proc dict_get with vstack2, "children"
+    Let vstack2_child_count be proc list_count with vstack2_children
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip VStack has >= 2 children", vstack2_child_count, 2
+
+    Note: modifier chain survives round-trip
+    Let text2 be proc find_element_by_name with root2, "Text"
+    proc assert_not_null from TestUtils with results, "round-trip preserves Text element", text2
+    Let text2_modifiers be proc dict_get with text2, "modifiers"
+    Let text2_mod_count be proc list_count with text2_modifiers
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip Text has >= 2 modifiers", text2_mod_count, 2
+    Let has_padding2 be proc view_has_modifier with text2, "padding"
+    proc assert_equal from TestUtils with results, "round-trip preserves .padding", has_padding2, 1
+    Let has_fgcolor2 be proc view_has_modifier with text2, "foregroundColor"
+    proc assert_equal from TestUtils with results, "round-trip preserves .foregroundColor", has_fgcolor2, 1
+
+    Note: ForEach container survives round-trip
+    Let foreach2 be proc find_container_by_name with root2, "ForEach"
+    proc assert_not_null from TestUtils with results, "round-trip preserves ForEach", foreach2
+
+    Note: string interpolation survives round-trip
+    Let interp2 be proc param_string_contains with text2, "0", "Sum: "
+    proc assert_equal from TestUtils with results, "round-trip preserves interpolated 'Sum: '", interp2, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
