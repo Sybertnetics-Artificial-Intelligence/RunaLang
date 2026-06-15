@@ -50,6 +50,7 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: LLVM IR AST Node Types
@@ -292,7 +293,7 @@ Calls peek_token_type and compares against expected_type. Returns
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches type
 
-    Let actual_type be proc peek_token_type from parser
+    Let actual_type be proc peek_token_type with parser
 
     If actual_type is equal to expected_type:
         Return 1
@@ -316,14 +317,14 @@ On match calls advance_token to consume and returns 1.
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect specific token type
 
-    Let actual_type be proc peek_token_type from parser
+    Let actual_type be proc peek_token_type with parser
 
     If actual_type is not equal to expected_type:
         proc set_parse_error with parser, error_msg
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return 1
 End Process
@@ -360,7 +361,7 @@ Process called "set_parse_error" takes parser as Integer, message as Integer ret
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -473,7 +474,7 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
         Return 0
     End If
 
-    proc memory_copy from Layout with name_copy, 0, name, 0, name_length
+    proc memory_copy from Layout with name_copy, name, name_length
     proc memory_set_byte from Layout with name_copy, name_length, 0
 
     proc memory_set_int64 from Layout with node, 8, name_copy
@@ -503,7 +504,7 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
         Return 0
     End If
 
-    proc memory_copy from Layout with value_copy, 0, value, 0, value_length
+    proc memory_copy from Layout with value_copy, value, value_length
     proc memory_set_byte from Layout with value_copy, value_length, 0
 
     proc memory_set_int64 from Layout with node, 16, value_copy
@@ -617,49 +618,291 @@ Note: Type Parsing
 Note: ============================================================================
 
 @Reasoning:
-Parses LLVM IR type expressions. The full LLVM type grammar includes
-primitives (i1/i8/i16/i32/i64/float/double), void, pointer (ptr),
-aggregates ([n x T], {T1, T2}), and vectors (<n x T>). This bootstrap
-implementation handles the primitive-token form (lexer-classified
-TOKEN_TYPE) and the keyword "void" form, which together cover the
-vast majority of real LLVM IR. Other forms route through here too
-but emit "Expected type" — known gap for a later extension.
+Parses the LLVM IR type grammar and produces a single LLVM_TYPE node
+whose name holds the canonical textual spelling of the whole type, so
+the type round-trips byte-faithfully through the string-literal HIR
+model. The grammar covers: scalar primitives (i1/i8/.../float/double/
+ptr, lexer-classified TOKEN_TYPE or the "void"/"ptr" keywords),
+pointer suffixes (one or more trailing '*'), fixed-size arrays
+([N x ElemType]), vectors (<N x ElemType>), and literal struct types
+({T1, T2, ...}). Aggregate element types recurse through parse_type so
+nested composites (e.g. [4 x i32]*, {i8*, [2 x i64]}) spell correctly.
 @End Reasoning
 
 @Implementation:
-Reads peek token type. On TOKEN_TYPE creates an LLVM_TYPE node with
-the lexeme as its name and advances. On TOKEN_KEYWORD with lexeme
-"void" creates a void-named LLVM_TYPE node similarly. Anything else
-sets parse error "Expected type" and returns 0.
+Dispatches on the leading token to parse a base spelling:
+  - TOKEN_TYPE: the lexeme is the base spelling.
+  - TOKEN_KEYWORD "void"/"ptr": the keyword is the base spelling.
+  - TOKEN_LBRACKET: '[' Number 'x' ElemType ']' -> "[N x <elem>]".
+  - TOKEN_LANGLE:   '<' Number 'x' ElemType '>' -> "<N x <elem>>".
+  - TOKEN_LBRACE:   '{' Type (',' Type)* '}'     -> "{T1, T2}".
+After the base, consumes zero or more TOKEN_STAR suffixes, appending a
+'*' to the spelling for each (via StringUtils.string_concat). On any
+malformed form sets "Expected type" and returns 0. On success creates
+an LLVM_TYPE node, stores the assembled spelling as its name, and
+returns it.
 @End Implementation
 
 Process called "parse_type" takes parser as Integer returns Integer:
-    Note: Parse LLVM IR type
+    Note: Parse LLVM IR type and capture its canonical spelling
 
-    Let token_type be proc peek_token_type from parser
+    Let spelling be proc parse_type_spelling with parser
+
+    If spelling is equal to 0:
+        proc set_parse_error with parser, "Expected type"
+        Return 0
+    End If
+
+    Note: Consume trailing pointer-star suffixes
+    While 1 is equal to 1:
+        Let is_star be proc check_token_type with parser, TOKEN_STAR from Lexer
+
+        If is_star is equal to 0:
+            Break
+        End If
+
+        proc advance_token with parser
+        Set spelling to proc string_concat from StringUtils with spelling, "*"
+    End While
+
+    Let type_node be proc create_llvm_node with LLVM_TYPE
+    proc set_node_name with type_node, spelling
+    Return type_node
+End Process
+
+@Reasoning:
+Parses a single base type form (no trailing pointer suffix) and returns
+its canonical spelling string, or 0 on a malformed form. Split out from
+parse_type so the pointer-suffix loop and the aggregate element parses
+share one base-form routine. Returns a heap-owned NUL-terminated string
+in every success path.
+@End Reasoning
+
+@Implementation:
+Switches on the leading token. TOKEN_TYPE / "void" / "ptr" return the
+lexeme spelling directly (advancing past it). TOKEN_LBRACKET parses
+'[' Number 'x' ElemType ']' assembling "[" + N + " x " + elem + "]".
+TOKEN_LANGLE parses the analogous vector form with angle brackets.
+TOKEN_LBRACE parses a comma-separated element list into "{" + ... + "}".
+Element types recurse through parse_type (capturing their own pointer
+suffixes). Any structural mismatch returns 0.
+@End Implementation
+
+Process called "parse_type_spelling" takes parser as Integer returns Integer:
+    Note: Parse one base type form, returning its spelling string
+
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_TYPE from Lexer:
-        Let type_node be proc create_llvm_node from LLVM_TYPE
-        Let type_name be proc peek_token_lexeme from parser
-        proc set_node_name with type_node, type_name
-        proc advance_token from parser
-        Return type_node
+        Let lexeme be proc peek_token_lexeme with parser
+        Note: Copy so the returned spelling owns its bytes independently
+        Let base be proc string_concat from StringUtils with lexeme, ""
+        proc advance_token with parser
+        Return base
     End If
 
     If token_type is equal to TOKEN_KEYWORD from Lexer:
-        Let lexeme be proc peek_token_lexeme from parser
-        Let is_void be proc strings_equal from StringCore with lexeme, "void"
+        Let kw be proc peek_token_lexeme with parser
+        Let is_void be proc string_equals from StringCore with kw, "void"
+        Let is_ptr be proc string_equals from StringCore with kw, "ptr"
 
         If is_void is equal to 1:
-            Set type_node to proc create_llvm_node from LLVM_TYPE
-            proc set_node_name with type_node, "void"
-            proc advance_token from parser
-            Return type_node
+            proc advance_token with parser
+            Return proc string_concat from StringUtils with "void", ""
+        End If
+
+        If is_ptr is equal to 1:
+            proc advance_token with parser
+            Return proc string_concat from StringUtils with "ptr", ""
+        End If
+
+        Return 0
+    End If
+
+    If token_type is equal to TOKEN_LBRACKET from Lexer:
+        Return proc parse_sized_aggregate_spelling with parser, 0
+    End If
+
+    If token_type is equal to TOKEN_LANGLE from Lexer:
+        Return proc parse_sized_aggregate_spelling with parser, 1
+    End If
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_struct_spelling with parser
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Parses the two sized-aggregate forms that share the "[N x T]" / "<N x T>"
+shape: arrays (square brackets) and vectors (angle brackets). A single
+routine parameterised by is_vector handles both, assembling the spelling
+"<open>N x <elem><close>" so the round-trip reproduces canonical LLVM IR.
+@End Reasoning
+
+@Implementation:
+Picks the bracket pair from is_vector (0 -> "[]", 1 -> "<>"). Consumes
+the opening bracket. Expects a TOKEN_NUMBER count; captures its lexeme.
+Expects the 'x' separator (TOKEN_X, or a TOKEN_KEYWORD "x" since the
+lone letter lexes as an identifier). Recurses into parse_type for the
+element type (so element pointer suffixes and nested aggregates spell
+correctly), then reads the element node's name spelling. Consumes the
+closing bracket. Assembles "<open>" + count + " x " + elem + "<close>".
+Returns 0 on any structural mismatch.
+@End Implementation
+
+Process called "parse_sized_aggregate_spelling" takes parser as Integer, is_vector as Integer returns Integer:
+    Note: Parse [N x T] (array) or <N x T> (vector) into a spelling
+
+    Let open_bracket be "["
+    Let close_bracket be "]"
+
+    If is_vector is equal to 1:
+        Set open_bracket to "<"
+        Set close_bracket to ">"
+    End If
+
+    Note: Consume opening bracket
+    proc advance_token with parser
+
+    Note: Element count
+    Let is_number be proc check_token_type with parser, TOKEN_NUMBER from Lexer
+
+    If is_number is equal to 0:
+        Return 0
+    End If
+
+    Let count_lexeme be proc peek_token_lexeme with parser
+    Let count_copy be proc string_concat from StringUtils with count_lexeme, ""
+    proc advance_token with parser
+
+    Note: 'x' separator. The single letter 'x' lexes as a TOKEN_KEYWORD
+    Note: (identifier) because is_alpha catches it before the single-char
+    Note: TOKEN_X branch, so accept either the dedicated TOKEN_X tag or a
+    Note: bare "x" keyword lexeme.
+    Let sep_type be proc peek_token_type with parser
+    Let sep_ok be 0
+
+    If sep_type is equal to TOKEN_X from Lexer:
+        Set sep_ok to 1
+    End If
+
+    If sep_type is equal to TOKEN_KEYWORD from Lexer:
+        Let sep_lexeme be proc peek_token_lexeme with parser
+        Let is_x_kw be proc string_equals from StringCore with sep_lexeme, "x"
+
+        If is_x_kw is equal to 1:
+            Set sep_ok to 1
         End If
     End If
 
-    proc set_parse_error with parser, "Expected type"
-    Return 0
+    If sep_ok is equal to 0:
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Element type (recurse for nested composites / pointer suffix)
+    Let elem_node be proc parse_type with parser
+
+    If elem_node is equal to 0:
+        Return 0
+    End If
+
+    Let elem_spelling be proc memory_get_int64 from Layout with elem_node, 8
+
+    Note: Closing bracket
+    Let is_close be 0
+
+    If is_vector is equal to 1:
+        Set is_close to proc check_token_type with parser, TOKEN_RANGLE from Lexer
+    Otherwise:
+        Set is_close to proc check_token_type with parser, TOKEN_RBRACKET from Lexer
+    End If
+
+    If is_close is equal to 0:
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Assemble "<open>N x <elem><close>"
+    Let part1 be proc string_concat from StringUtils with open_bracket, count_copy
+    Let part2 be proc string_concat from StringUtils with part1, " x "
+    Let part3 be proc string_concat from StringUtils with part2, elem_spelling
+    Let result be proc string_concat from StringUtils with part3, close_bracket
+
+    Return result
+End Process
+
+@Reasoning:
+Parses a literal struct type "{T1, T2, ...}" into its canonical spelling.
+Struct fields are arbitrary types, so each field recurses through
+parse_type; the fields are joined with ", " between the braces to match
+LLVM's canonical printer.
+@End Reasoning
+
+@Implementation:
+Consumes '{'. Loops reading field types via parse_type until '}' or EOF;
+between fields emits ", " into the spelling. Reads each field node's name
+spelling and concatenates. After the loop consumes '}' and wraps the
+joined fields in braces: "{" + fields + "}". The empty struct "{}" is
+handled naturally (no fields appended). Returns 0 on EOF before '}'.
+@End Implementation
+
+Process called "parse_struct_spelling" takes parser as Integer returns Integer:
+    Note: Parse {T1, T2, ...} into a spelling
+
+    Note: Consume '{'
+    proc advance_token with parser
+
+    Let fields be proc string_concat from StringUtils with "", ""
+    Let first_field be 1
+
+    While 1 is equal to 1:
+        Let is_rbrace be proc check_token_type with parser, TOKEN_RBRACE from Lexer
+
+        If is_rbrace is equal to 1:
+            Break
+        End If
+
+        Let tok be proc peek_token_type with parser
+
+        If tok is equal to TOKEN_EOF from Lexer:
+            Return 0
+        End If
+
+        Note: Field separator
+        If first_field is equal to 0:
+            Let is_comma be proc check_token_type with parser, TOKEN_COMMA from Lexer
+
+            If is_comma is equal to 1:
+                proc advance_token with parser
+            End If
+
+            Set fields to proc string_concat from StringUtils with fields, ", "
+        Otherwise:
+            Set first_field to 0
+        End If
+
+        Let field_node be proc parse_type with parser
+
+        If field_node is equal to 0:
+            Return 0
+        End If
+
+        Let field_spelling be proc memory_get_int64 from Layout with field_node, 8
+        Set fields to proc string_concat from StringUtils with fields, field_spelling
+    End While
+
+    Note: Consume '}'
+    proc advance_token with parser
+
+    Let opened be proc string_concat from StringUtils with "{", fields
+    Let closed be proc string_concat from StringUtils with opened, "}"
+
+    Return closed
 End Process
 
 Note: ============================================================================
@@ -688,64 +931,64 @@ LLVM_VALUE nodes with the literal as value. Anything else fires
 Process called "parse_value" takes parser as Integer returns Integer:
     Note: Parse LLVM IR value (register, global, constant)
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_LOCAL_ID from Lexer:
-        Let value_node be proc create_llvm_node from LLVM_VALUE
-        Let value_name be proc peek_token_lexeme from parser
+        Let value_node be proc create_llvm_node with LLVM_VALUE
+        Let value_name be proc peek_token_lexeme with parser
         proc set_node_name with value_node, value_name
-        proc advance_token from parser
+        proc advance_token with parser
         Return value_node
     End If
 
     If token_type is equal to TOKEN_GLOBAL_ID from Lexer:
-        Set value_node to proc create_llvm_node from LLVM_GLOBAL
-        Set value_name to proc peek_token_lexeme from parser
+        Set value_node to proc create_llvm_node with LLVM_GLOBAL
+        Set value_name to proc peek_token_lexeme with parser
         proc set_node_name with value_node, value_name
-        proc advance_token from parser
+        proc advance_token with parser
         Return value_node
     End If
 
     If token_type is equal to TOKEN_NUMBER from Lexer:
-        Set value_node to proc create_llvm_node from LLVM_VALUE
-        Let value_str be proc peek_token_lexeme from parser
+        Set value_node to proc create_llvm_node with LLVM_VALUE
+        Let value_str be proc peek_token_lexeme with parser
         proc set_node_value with value_node, value_str
-        proc advance_token from parser
+        proc advance_token with parser
         Return value_node
     End If
 
     If token_type is equal to TOKEN_STRING from Lexer:
-        Set value_node to proc create_llvm_node from LLVM_VALUE
-        Set value_str to proc peek_token_lexeme from parser
+        Set value_node to proc create_llvm_node with LLVM_VALUE
+        Set value_str to proc peek_token_lexeme with parser
         proc set_node_value with value_node, value_str
-        proc advance_token from parser
+        proc advance_token with parser
         Return value_node
     End If
 
     If token_type is equal to TOKEN_KEYWORD from Lexer:
-        Let lexeme be proc peek_token_lexeme from parser
-        Let is_null be proc strings_equal from StringCore with lexeme, "null"
-        Let is_true be proc strings_equal from StringCore with lexeme, "true"
-        Let is_false be proc strings_equal from StringCore with lexeme, "false"
+        Let lexeme be proc peek_token_lexeme with parser
+        Let is_null be proc string_equals from StringCore with lexeme, "null"
+        Let is_true be proc string_equals from StringCore with lexeme, "true"
+        Let is_false be proc string_equals from StringCore with lexeme, "false"
 
         If is_null is equal to 1:
-            Set value_node to proc create_llvm_node from LLVM_VALUE
+            Set value_node to proc create_llvm_node with LLVM_VALUE
             proc set_node_value with value_node, "null"
-            proc advance_token from parser
+            proc advance_token with parser
             Return value_node
         End If
 
         If is_true is equal to 1:
-            Set value_node to proc create_llvm_node from LLVM_VALUE
+            Set value_node to proc create_llvm_node with LLVM_VALUE
             proc set_node_value with value_node, "true"
-            proc advance_token from parser
+            proc advance_token with parser
             Return value_node
         End If
 
         If is_false is equal to 1:
-            Set value_node to proc create_llvm_node from LLVM_VALUE
+            Set value_node to proc create_llvm_node with LLVM_VALUE
             proc set_node_value with value_node, "false"
-            proc advance_token from parser
+            proc advance_token with parser
             Return value_node
         End If
     End If
@@ -785,8 +1028,8 @@ type, op1, comma, op2.
 Process called "parse_instruction" takes parser as Integer returns Integer:
     Note: Parse LLVM IR instruction
 
-    Let token_type be proc peek_token_type from parser
-    Let inst_node be proc create_llvm_node from LLVM_INSTRUCTION
+    Let token_type be proc peek_token_type with parser
+    Let inst_node be proc create_llvm_node with LLVM_INSTRUCTION
 
     If inst_node is equal to 0:
         Return 0
@@ -794,9 +1037,9 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     Note: Check for result assignment (%result = ...)
     If token_type is equal to TOKEN_LOCAL_ID from Lexer:
-        Let result_name be proc peek_token_lexeme from parser
+        Let result_name be proc peek_token_lexeme with parser
         proc set_node_name with inst_node, result_name
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Expect equals
         proc expect_token with parser, TOKEN_EQUALS from Lexer, "Expected '=' after register"
@@ -810,31 +1053,31 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Let opcode be proc peek_token_lexeme from parser
+    Let opcode be proc peek_token_lexeme with parser
     proc set_node_value with inst_node, opcode
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse operands based on instruction type
-    Let is_ret be proc strings_equal from StringCore with opcode, "ret"
-    Let is_br be proc strings_equal from StringCore with opcode, "br"
-    Let is_call be proc strings_equal from StringCore with opcode, "call"
-    Let is_load be proc strings_equal from StringCore with opcode, "load"
-    Let is_store be proc strings_equal from StringCore with opcode, "store"
-    Let is_alloca be proc strings_equal from StringCore with opcode, "alloca"
+    Let is_ret be proc string_equals from StringCore with opcode, "ret"
+    Let is_br be proc string_equals from StringCore with opcode, "br"
+    Let is_call be proc string_equals from StringCore with opcode, "call"
+    Let is_load be proc string_equals from StringCore with opcode, "load"
+    Let is_store be proc string_equals from StringCore with opcode, "store"
+    Let is_alloca be proc string_equals from StringCore with opcode, "alloca"
 
     If is_ret is equal to 1:
         Note: ret type value OR ret void
-        Let type_node be proc parse_type from parser
+        Let type_node be proc parse_type with parser
 
         If type_node is not equal to 0:
             proc add_operand with inst_node, type_node
 
             Note: Check if void or has value
             Let type_name be proc memory_get_int64 from Layout with type_node, 8
-            Let is_void be proc strings_equal from StringCore with type_name, "void"
+            Let is_void be proc string_equals from StringCore with type_name, "void"
 
             If is_void is equal to 0:
-                Let value_node be proc parse_value from parser
+                Let value_node be proc parse_value with parser
 
                 If value_node is not equal to 0:
                     proc add_operand with inst_node, value_node
@@ -850,48 +1093,48 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
         Let is_label be proc check_token_type with parser, TOKEN_KEYWORD from Lexer
 
         If is_label is equal to 1:
-            Let lexeme be proc peek_token_lexeme from parser
-            Let is_label_kw be proc strings_equal from StringCore with lexeme, "label"
+            Let lexeme be proc peek_token_lexeme with parser
+            Let is_label_kw be proc string_equals from StringCore with lexeme, "label"
 
             If is_label_kw is equal to 1:
-                proc advance_token from parser
-                Let target be proc parse_value from parser
+                proc advance_token with parser
+                Let target be proc parse_value with parser
                 proc add_operand with inst_node, target
                 Return inst_node
             End If
         End If
 
         Note: Conditional branch
-        Let cond_type be proc parse_type from parser
+        Let cond_type be proc parse_type with parser
         proc add_operand with inst_node, cond_type
 
-        Let cond_value be proc parse_value from parser
+        Let cond_value be proc parse_value with parser
         proc add_operand with inst_node, cond_value
 
         proc expect_token with parser, TOKEN_COMMA from Lexer, "Expected ','"
 
         Note: Parse true label
-        Set lexeme to proc peek_token_lexeme from parser
-        Set is_label_kw to proc strings_equal from StringCore with lexeme, "label"
+        Set lexeme to proc peek_token_lexeme with parser
+        Set is_label_kw to proc string_equals from StringCore with lexeme, "label"
 
         If is_label_kw is equal to 1:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
-        Let true_label be proc parse_value from parser
+        Let true_label be proc parse_value with parser
         proc add_operand with inst_node, true_label
 
         proc expect_token with parser, TOKEN_COMMA from Lexer, "Expected ','"
 
         Note: Parse false label
-        Set lexeme to proc peek_token_lexeme from parser
-        Set is_label_kw to proc strings_equal from StringCore with lexeme, "label"
+        Set lexeme to proc peek_token_lexeme with parser
+        Set is_label_kw to proc string_equals from StringCore with lexeme, "label"
 
         If is_label_kw is equal to 1:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
-        Let false_label be proc parse_value from parser
+        Let false_label be proc parse_value with parser
         proc add_operand with inst_node, false_label
 
         Return inst_node
@@ -899,22 +1142,22 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     If is_alloca is equal to 1:
         Note: alloca type
-        Set type_node to proc parse_type from parser
+        Set type_node to proc parse_type with parser
         proc add_operand with inst_node, type_node
         Return inst_node
     End If
 
     If is_load is equal to 1:
         Note: load type, ptr value
-        Set type_node to proc parse_type from parser
+        Set type_node to proc parse_type with parser
         proc add_operand with inst_node, type_node
 
         proc expect_token with parser, TOKEN_COMMA from Lexer, "Expected ','"
 
-        Let ptr_type be proc parse_type from parser
+        Let ptr_type be proc parse_type with parser
         proc add_operand with inst_node, ptr_type
 
-        Let ptr_value be proc parse_value from parser
+        Let ptr_value be proc parse_value with parser
         proc add_operand with inst_node, ptr_value
 
         Return inst_node
@@ -922,18 +1165,18 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     If is_store is equal to 1:
         Note: store type value, ptr destination
-        Set type_node to proc parse_type from parser
+        Set type_node to proc parse_type with parser
         proc add_operand with inst_node, type_node
 
-        Set value_node to proc parse_value from parser
+        Set value_node to proc parse_value with parser
         proc add_operand with inst_node, value_node
 
         proc expect_token with parser, TOKEN_COMMA from Lexer, "Expected ','"
 
-        Set ptr_type to proc parse_type from parser
+        Set ptr_type to proc parse_type with parser
         proc add_operand with inst_node, ptr_type
 
-        Set ptr_value to proc parse_value from parser
+        Set ptr_value to proc parse_value with parser
         proc add_operand with inst_node, ptr_value
 
         Return inst_node
@@ -941,10 +1184,10 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     If is_call is equal to 1:
         Note: call return_type function_name(args)
-        Let ret_type be proc parse_type from parser
+        Let ret_type be proc parse_type with parser
         proc add_operand with inst_node, ret_type
 
-        Let func_name be proc parse_value from parser
+        Let func_name be proc parse_value with parser
         proc add_operand with inst_node, func_name
 
         Note: Parse argument list
@@ -957,16 +1200,16 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
                 Break
             End If
 
-            Let arg_type be proc parse_type from parser
+            Let arg_type be proc parse_type with parser
             proc add_operand with inst_node, arg_type
 
-            Let arg_value be proc parse_value from parser
+            Let arg_value be proc parse_value with parser
             proc add_operand with inst_node, arg_value
 
             Let is_comma be proc check_token_type with parser, TOKEN_COMMA from Lexer
 
             If is_comma is equal to 1:
-                proc advance_token from parser
+                proc advance_token with parser
             Otherwise:
                 Break
             End If
@@ -979,12 +1222,12 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     Note: Binary operations (add, sub, mul, etc.)
     Note: Parse: type operand1, operand2
-    Set type_node to proc parse_type from parser
+    Set type_node to proc parse_type with parser
 
     If type_node is not equal to 0:
         proc add_operand with inst_node, type_node
 
-        Let op1 be proc parse_value from parser
+        Let op1 be proc parse_value with parser
 
         If op1 is not equal to 0:
             proc add_operand with inst_node, op1
@@ -992,9 +1235,9 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
             Set is_comma to proc check_token_type with parser, TOKEN_COMMA from Lexer
 
             If is_comma is equal to 1:
-                proc advance_token from parser
+                proc advance_token with parser
 
-                Let op2 be proc parse_value from parser
+                Let op2 be proc parse_value with parser
 
                 If op2 is not equal to 0:
                     proc add_operand with inst_node, op2
@@ -1011,60 +1254,124 @@ Note: Basic Block Parsing
 Note: ============================================================================
 
 @Reasoning:
-Basic blocks in LLVM IR are sequences of instructions starting with
-a label and ending with a terminator (br/ret/switch/etc). The parser
-treats end-of-block as "next token is another label" (local-id
-followed by colon), end of function `}`, or EOF. Reading instructions
-until that boundary produces the right block structure even without
-parsing terminator types specifically.
+Distinguishing a basic-block label from an instruction requires a
+single-token lookahead: a label is `<identifier>:` whereas a result
+register is `<local-id> =` and an opcode keyword is `<keyword> <operand>`.
+This helper performs the lookahead non-destructively so both the label
+parse and the next-block-boundary detection can ask "is the token after
+the current one a colon?" without permanently advancing the parser.
 @End Reasoning
 
 @Implementation:
-Creates an LLVM_BASIC_BLOCK node. Parses label: accepts either
-TOKEN_LOCAL_ID (named label %foo) or TOKEN_NUMBER (numbered label %0)
-as the name. Expects `:` after the label. Then loops reading
-instructions. Exit on TOKEN_EOF, TOKEN_RBRACE (end of function), or
-the lookahead pattern "local_id followed by colon" — the lookahead
-saves the lexer cursor at offset 16, advances to peek the next
-token's type, then restores the cursor by writing back the saved
-position and re-fetching the token. Non-instructions or null
-instruction returns also break out. Each successful instruction
+Saves the full lexer cursor (position @16, line @24, column @32) and the
+parser's current_token pointer @8. Advances one token, reads the new
+token's type, then restores the lexer cursor exactly and re-fetches the
+token via next_token so the parser's current_token is identical to its
+pre-call state (lexemes are owned copies, so re-fetch reproduces the
+same logical token). Returns 1 if the looked-ahead token is TOKEN_COLON,
+0 otherwise.
+@End Implementation
+
+Process called "lookahead_is_colon" takes parser as Integer returns Integer:
+    Note: Non-destructive one-token lookahead for a ':' terminator
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let saved_token be proc memory_get_int64 from Layout with parser, 8
+    Let saved_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+
+    proc advance_token with parser
+    Let next_type be proc peek_token_type with parser
+
+    Note: Restore the lexer cursor and re-fetch the original current token
+    proc memory_set_int64 from Layout with lexer, 16, saved_pos
+    proc memory_set_int64 from Layout with lexer, 24, saved_line
+    proc memory_set_int64 from Layout with lexer, 32, saved_column
+    proc memory_set_int64 from Layout with parser, 8, saved_token
+
+    If next_type is equal to TOKEN_COLON from Lexer:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Basic blocks in LLVM IR are sequences of instructions starting with
+an optional label and ending with a terminator (br/ret/switch/etc).
+The parser treats end-of-block as "next token is another label"
+(an identifier followed by colon), end of function `}`, or EOF. Reading
+instructions until that boundary produces the right block structure even
+without parsing terminator types specifically.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_BASIC_BLOCK node. Parses an OPTIONAL label: a leading
+TOKEN_LOCAL_ID / TOKEN_NUMBER / TOKEN_KEYWORD / TOKEN_LABEL is treated
+as a label only when lookahead_is_colon confirms a ':' follows; the
+label name is captured and the ':' consumed. When no ':' follows, the
+block is unlabeled (implicit entry) and parsing proceeds straight to the
+instruction loop. The loop reads instructions until TOKEN_EOF,
+TOKEN_RBRACE (end of function), or the next-block boundary (an
+identifier token followed by ':' per lookahead_is_colon). Non-instruction
+or null instruction returns also break out. Each successful instruction
 appends to the block via add_instruction.
 @End Implementation
 
 Process called "parse_basic_block" takes parser as Integer returns Integer:
     Note: Parse LLVM IR basic block
 
-    Let bb_node be proc create_llvm_node from LLVM_BASIC_BLOCK
+    Let bb_node be proc create_llvm_node with LLVM_BASIC_BLOCK
 
     If bb_node is equal to 0:
         Return 0
     End If
 
-    Note: Parse label (can be local_id or number followed by colon)
-    Let token_type be proc peek_token_type from parser
+    Note: Parse the optional block label. LLVM IR labels are bare
+    Note: identifiers (lexed as TOKEN_KEYWORD), numeric labels
+    Note: (TOKEN_NUMBER), or %-prefixed locals (TOKEN_LOCAL_ID), in
+    Note: every case followed by a ':'. The first block of a function
+    Note: frequently has NO explicit label (implicit entry); in that
+    Note: case the leading token is an instruction keyword / local-id
+    Note: NOT followed by ':', so the label is absent and parsing falls
+    Note: straight through to the instruction loop.
+    Let token_type be proc peek_token_type with parser
+    Let label_is_candidate be 0
 
     If token_type is equal to TOKEN_LOCAL_ID from Lexer:
-        Let label_name be proc peek_token_lexeme from parser
-        proc set_node_name with bb_node, label_name
-        proc advance_token from parser
-    Otherwise:
-        If token_type is equal to TOKEN_NUMBER from Lexer:
-            Set label_name to proc peek_token_lexeme from parser
+        Set label_is_candidate to 1
+    End If
+
+    If token_type is equal to TOKEN_NUMBER from Lexer:
+        Set label_is_candidate to 1
+    End If
+
+    If token_type is equal to TOKEN_KEYWORD from Lexer:
+        Set label_is_candidate to 1
+    End If
+
+    If token_type is equal to TOKEN_LABEL from Lexer:
+        Set label_is_candidate to 1
+    End If
+
+    If label_is_candidate is equal to 1:
+        Note: Confirm the candidate is a label by looking ahead for ':'.
+        Let label_followed_by_colon be proc lookahead_is_colon with parser
+
+        If label_followed_by_colon is equal to 1:
+            Let label_name be proc peek_token_lexeme with parser
             proc set_node_name with bb_node, label_name
-            proc advance_token from parser
-        Otherwise:
-            proc set_parse_error with parser, "Expected basic block label"
-            Return 0
+            proc advance_token with parser
+
+            Note: Consume the ':' terminator
+            proc expect_token with parser, TOKEN_COLON from Lexer, "Expected ':' after label"
         End If
     End If
 
-    Note: Expect colon
-    proc expect_token with parser, TOKEN_COLON from Lexer, "Expected ':' after label"
-
     Note: Parse instructions until next label or end of function
     While 1 is equal to 1:
-        Let token_type2 be proc peek_token_type from parser
+        Let token_type2 be proc peek_token_type with parser
 
         If token_type2 is equal to TOKEN_EOF from Lexer:
             Break
@@ -1074,26 +1381,38 @@ Process called "parse_basic_block" takes parser as Integer returns Integer:
             Break
         End If
 
-        Note: Check if next basic block
+        Note: Detect the start of the next basic block: an identifier
+        Note: token (local-id / number / bare keyword) immediately
+        Note: followed by ':'. Distinguishes a label from a result
+        Note: register (which is followed by '=') or an opcode keyword
+        Note: (which is followed by an operand, not ':').
+        Let boundary_candidate be 0
+
         If token_type2 is equal to TOKEN_LOCAL_ID from Lexer:
-            Note: Peek ahead for colon
-            Let lexer be proc memory_get_int64 from Layout with parser, 0
-            Let saved_pos be proc memory_get_int64 from Layout with lexer, 16
+            Set boundary_candidate to 1
+        End If
 
-            proc advance_token from parser
-            Let next_type be proc peek_token_type from parser
+        If token_type2 is equal to TOKEN_NUMBER from Lexer:
+            Set boundary_candidate to 1
+        End If
 
-            Note: Restore position
-            proc memory_set_int64 from Layout with lexer, 16, saved_pos
-            Let saved_token be proc next_token from Lexer with lexer
-            proc memory_set_int64 from Layout with parser, 8, saved_token
+        If token_type2 is equal to TOKEN_KEYWORD from Lexer:
+            Set boundary_candidate to 1
+        End If
 
-            If next_type is equal to TOKEN_COLON from Lexer:
+        If token_type2 is equal to TOKEN_LABEL from Lexer:
+            Set boundary_candidate to 1
+        End If
+
+        If boundary_candidate is equal to 1:
+            Let next_is_colon be proc lookahead_is_colon with parser
+
+            If next_is_colon is equal to 1:
                 Break  Note: Start of next basic block
             End If
         End If
 
-        Let inst be proc parse_instruction from parser
+        Let inst be proc parse_instruction with parser
 
         If inst is not equal to 0:
             proc add_instruction with bb_node, inst
@@ -1113,21 +1432,22 @@ Note: ==========================================================================
 Parses an LLVM function definition starting with `define`. The full
 form is `define RetType @name(ParamType %param, ...) { body }`.
 Return type goes into the type_info slot; basic blocks of the body
-go into the basic_blocks list. Parameters are attached as child
-nodes via add_child so they can be enumerated by traversal passes.
+go into the basic_blocks list. Parameters are attached as operand
+nodes via add_operand so they can be enumerated by traversal passes.
 @End Reasoning
 
 @Implementation:
 Creates an LLVM_FUNCTION node. Verifies the current token is the
-keyword "define" via strings_equal on the lexeme; mismatch sets
+keyword "define" via string_equals on the lexeme; mismatch sets
 "Expected 'define'" and returns 0. Advances, parses return type into
 type_info (node offset 24). Expects TOKEN_GLOBAL_ID for the function
 name, captures it via set_node_name, advances. Expects `(`. The
-parameter loop reads param_type, then param_name (peek_token_lexeme),
-constructs an AST_PARAMETER node, attaches the type as child and
-sets name. First-iteration flag suppresses the comma check; subsequent
+parameter loop reads param_type, then optional param_name
+(peek_token_lexeme), constructs an LLVM_VALUE node, stores the type
+in its type_info slot and sets the name when a local id is present.
+First-iteration flag suppresses the comma check; subsequent
 iterations expect `,` first. After parameters are gathered into
-param_list, iterates and add_child's each onto func_node. Expects
+param_list, iterates and add_operand's each onto func_node. Expects
 `)` and `{`. Then loops reading basic_blocks until `}` or EOF.
 Finally expects `}` as the function terminator.
 @End Implementation
@@ -1135,25 +1455,25 @@ Finally expects `}` as the function terminator.
 Process called "parse_function" takes parser as Integer returns Integer:
     Note: Parse LLVM IR function definition
 
-    Let func_node be proc create_llvm_node from LLVM_FUNCTION
+    Let func_node be proc create_llvm_node with LLVM_FUNCTION
 
     If func_node is equal to 0:
         Return 0
     End If
 
     Note: Expect 'define' keyword
-    Let lexeme be proc peek_token_lexeme from parser
-    Let is_define be proc strings_equal from StringCore with lexeme, "define"
+    Let lexeme be proc peek_token_lexeme with parser
+    Let is_define be proc string_equals from StringCore with lexeme, "define"
 
     If is_define is equal to 0:
         proc set_parse_error with parser, "Expected 'define'"
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse return type
-    Let ret_type be proc parse_type from parser
+    Let ret_type be proc parse_type with parser
 
     If ret_type is not equal to 0:
         proc memory_set_int64 from Layout with func_node, 24, ret_type
@@ -1167,16 +1487,17 @@ Process called "parse_function" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Let func_name be proc peek_token_lexeme from parser
+    Let func_name be proc peek_token_lexeme with parser
     proc set_node_name with func_node, func_name
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse parameter list
     proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '('"
 
     Note: Parse function parameters: type %name, type %name, ...
-    Let param_list be proc create_list from ListCore
+    Let param_list be proc create from List
     Let first_param be 1
+    Let param_lexer be proc memory_get_int64 from Layout with parser, 0
 
     While 1 is equal to 1:
         Let is_rparen be proc check_token_type with parser, TOKEN_RPAREN from Lexer
@@ -1184,6 +1505,21 @@ Process called "parse_function" takes parser as Integer returns Integer:
         If is_rparen is equal to 1:
             Break
         End If
+
+        Note: Forward-progress / malformed-input guard: stop at EOF or
+        Note: at a closing brace so a missing ')' cannot spin the loop.
+        Let ptok_top be proc peek_token_type with parser
+
+        If ptok_top is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        If ptok_top is equal to TOKEN_RBRACE from Lexer:
+            Break
+        End If
+
+        Note: Capture the lexer cursor to detect zero-consumption loops.
+        Let param_pos_before be proc memory_get_int64 from Layout with param_lexer, 16
 
         Note: Parse comma separator after first parameter
         If first_param is equal to 0:
@@ -1193,28 +1529,42 @@ Process called "parse_function" takes parser as Integer returns Integer:
         End If
 
         Note: Parse parameter type
-        Let param_type be proc parse_llvm_type from parser
+        Let param_type be proc parse_type with parser
 
-        Note: Parse parameter name (starts with %)
-        Let param_name_token be proc peek_token from parser
-        Let param_name be proc peek_token_lexeme from parser
+        Note: Build the parameter as an LLVM_VALUE node carrying the
+        Note: type in its type_info slot and the register name (if any).
+        Let param_node be proc create_llvm_node with LLVM_VALUE
 
-        Note: Create parameter node
-        Let param_node be proc create_ast_node from AST_PARAMETER
-        proc add_child with param_node, param_type
-        proc set_node_name with param_node, param_name
+        If param_type is not equal to 0:
+            proc memory_set_int64 from Layout with param_node, 24, param_type
+        End If
 
-        proc list_append from ListCore with param_list, param_node
+        Note: Parameter name (starts with %) is optional in declarations
+        Let param_tok_type be proc peek_token_type with parser
 
-        proc advance_token from parser
+        If param_tok_type is equal to TOKEN_LOCAL_ID from Lexer:
+            Let param_name be proc peek_token_lexeme with parser
+            proc set_node_name with param_node, param_name
+            proc advance_token with parser
+        End If
+
+        proc add from List with param_list, param_node
+
+        Note: If the iteration consumed no input (malformed parameter),
+        Note: abandon the loop to guarantee termination.
+        Let param_pos_after be proc memory_get_int64 from Layout with param_lexer, 16
+
+        If param_pos_after is equal to param_pos_before:
+            Break
+        End If
     End While
 
-    Note: Attach parameter list to function node
+    Note: Attach parameter list to function node operands in order
     Let i be 0
-    Let param_count be proc list_length from ListCore with param_list
+    Let param_count be proc size from List with param_list
     While i is less than param_count:
-        Let param be proc list_get from ListCore with param_list, i
-        proc add_child with func_node, param
+        Let param be proc get from List with param_list, i
+        proc add_operand with func_node, param
         Set i to i plus 1
     End While
 
@@ -1231,17 +1581,30 @@ Process called "parse_function" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Break
         End If
 
-        Let bb be proc parse_basic_block from parser
+        Note: Forward-progress guard: capture the lexer cursor before
+        Note: the block parse so a block that consumes nothing cannot
+        Note: spin the loop forever.
+        Let body_lexer be proc memory_get_int64 from Layout with parser, 0
+        Let pos_before be proc memory_get_int64 from Layout with body_lexer, 16
+
+        Let bb be proc parse_basic_block with parser
 
         If bb is not equal to 0:
             proc add_basic_block with func_node, bb
         Otherwise:
+            Break
+        End If
+
+        Let pos_after be proc memory_get_int64 from Layout with body_lexer, 16
+
+        If pos_after is equal to pos_before:
+            Note: No tokens consumed — abandon to guarantee termination
             Break
         End If
     End While
@@ -1249,6 +1612,487 @@ Process called "parse_function" takes parser as Integer returns Integer:
     proc expect_token with parser, TOKEN_RBRACE from Lexer, "Expected '}'"
 
     Return func_node
+End Process
+
+Note: ============================================================================
+Note: Module-Level Declaration Parsing
+Note: ============================================================================
+
+@Reasoning:
+A function declaration (prototype) has the same prefix as a definition
+but ends at the parameter list with no body: `declare RetType @name
+(ParamType, ...)`. It is represented with the same LLVM_FUNCTION node
+kind as a definition; the absence of basic blocks distinguishes a
+declaration from a definition for downstream consumers.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_FUNCTION node. Consumes the "declare" keyword, parses
+the return type into the type_info slot, expects a TOKEN_GLOBAL_ID for
+the callee name, and parses a parenthesised parameter-type list. Each
+parameter is an LLVM_VALUE node carrying only the type (declarations
+typically omit parameter names). Parameters are attached via
+add_operand. No body braces are consumed.
+@End Implementation
+
+Process called "parse_function_declaration" takes parser as Integer returns Integer:
+    Note: Parse LLVM IR function declaration (prototype, no body)
+
+    Let decl_node be proc create_llvm_node with LLVM_FUNCTION
+
+    If decl_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Consume 'declare'
+    Let lexeme be proc peek_token_lexeme with parser
+    Let is_declare be proc string_equals from StringCore with lexeme, "declare"
+
+    If is_declare is equal to 0:
+        proc set_parse_error with parser, "Expected 'declare'"
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Return type into type_info slot
+    Let ret_type be proc parse_type with parser
+
+    If ret_type is not equal to 0:
+        proc memory_set_int64 from Layout with decl_node, 24, ret_type
+    End If
+
+    Note: Function name (@name)
+    Let is_global be proc check_token_type with parser, TOKEN_GLOBAL_ID from Lexer
+
+    If is_global is equal to 0:
+        proc set_parse_error with parser, "Expected function name in declaration"
+        Return 0
+    End If
+
+    Let decl_name be proc peek_token_lexeme with parser
+    proc set_node_name with decl_node, decl_name
+    proc advance_token with parser
+
+    Note: Parameter-type list
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '('"
+
+    Let first_param be 1
+
+    While 1 is equal to 1:
+        Let is_rparen be proc check_token_type with parser, TOKEN_RPAREN from Lexer
+
+        If is_rparen is equal to 1:
+            Break
+        End If
+
+        If first_param is equal to 0:
+            proc expect_token with parser, TOKEN_COMMA from Lexer, "Expected ','"
+        Otherwise:
+            Set first_param to 0
+        End If
+
+        Let param_type be proc parse_type with parser
+
+        If param_type is equal to 0:
+            Break
+        End If
+
+        Let param_node be proc create_llvm_node with LLVM_VALUE
+        proc memory_set_int64 from Layout with param_node, 24, param_type
+
+        Note: Declarations may carry an optional parameter name
+        Let ptok be proc peek_token_type with parser
+
+        If ptok is equal to TOKEN_LOCAL_ID from Lexer:
+            Let pname be proc peek_token_lexeme with parser
+            proc set_node_name with param_node, pname
+            proc advance_token with parser
+        End If
+
+        proc add_operand with decl_node, param_node
+    End While
+
+    proc expect_token with parser, TOKEN_RPAREN from Lexer, "Expected ')'"
+
+    Return decl_node
+End Process
+
+@Reasoning:
+A global variable definition is `@name = [linkage] global|constant
+Type Initializer`. The node captures the global's name, whether it is
+mutable (global) or immutable (constant) as its value string, the
+declared type in type_info, and the initializer expression as an
+operand when present.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_GLOBAL node. Expects TOKEN_GLOBAL_ID for the name,
+captures it, advances. Expects `=`. Skips any optional linkage/visibility
+keyword tokens that precede the global/constant keyword by consuming
+keyword tokens until the global/constant marker is found (bounded by a
+forward-progress break on non-keyword tokens). Records "global" or
+"constant" as the node value. Parses the type into type_info. If a
+value token follows (not end-of-statement), parses the initializer via
+parse_value and attaches it as an operand.
+@End Implementation
+
+Process called "parse_global_variable" takes parser as Integer returns Integer:
+    Note: Parse LLVM IR global variable definition
+
+    Let global_node be proc create_llvm_node with LLVM_GLOBAL
+
+    If global_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Global name (@name)
+    Let is_global be proc check_token_type with parser, TOKEN_GLOBAL_ID from Lexer
+
+    If is_global is equal to 0:
+        proc set_parse_error with parser, "Expected global variable name"
+        Return 0
+    End If
+
+    Let global_name be proc peek_token_lexeme with parser
+    proc set_node_name with global_node, global_name
+    proc advance_token with parser
+
+    Note: Expect '='
+    proc expect_token with parser, TOKEN_EQUALS from Lexer, "Expected '=' in global definition"
+
+    Note: Consume optional linkage/visibility keywords until the
+    Note: global/constant marker. Forward progress is guaranteed: each
+    Note: iteration either matches the marker (and breaks) or consumes
+    Note: one keyword token; a non-keyword token also breaks.
+    Let marker_found be 0
+
+    While 1 is equal to 1:
+        Let is_kw be proc check_token_type with parser, TOKEN_KEYWORD from Lexer
+
+        If is_kw is equal to 0:
+            Break
+        End If
+
+        Let kw_lexeme be proc peek_token_lexeme with parser
+        Let is_global_kw be proc string_equals from StringCore with kw_lexeme, "global"
+        Let is_constant_kw be proc string_equals from StringCore with kw_lexeme, "constant"
+
+        If is_global_kw is equal to 1:
+            proc set_node_value with global_node, "global"
+            proc advance_token with parser
+            Set marker_found to 1
+            Break
+        End If
+
+        If is_constant_kw is equal to 1:
+            proc set_node_value with global_node, "constant"
+            proc advance_token with parser
+            Set marker_found to 1
+            Break
+        End If
+
+        Note: Optional linkage/visibility/thread-local keyword — skip
+        proc advance_token with parser
+    End While
+
+    Note: Declared type into type_info slot
+    Let var_type be proc parse_type with parser
+
+    If var_type is not equal to 0:
+        proc memory_set_int64 from Layout with global_node, 24, var_type
+    End If
+
+    Note: Optional initializer value
+    Let next_type be proc peek_token_type with parser
+    Let has_init be 0
+
+    If next_type is equal to TOKEN_NUMBER from Lexer:
+        Set has_init to 1
+    End If
+
+    If next_type is equal to TOKEN_STRING from Lexer:
+        Set has_init to 1
+    End If
+
+    If next_type is equal to TOKEN_GLOBAL_ID from Lexer:
+        Set has_init to 1
+    End If
+
+    If next_type is equal to TOKEN_LOCAL_ID from Lexer:
+        Set has_init to 1
+    End If
+
+    If next_type is equal to TOKEN_KEYWORD from Lexer:
+        Let init_lexeme be proc peek_token_lexeme with parser
+        Let init_is_null be proc string_equals from StringCore with init_lexeme, "null"
+        Let init_is_true be proc string_equals from StringCore with init_lexeme, "true"
+        Let init_is_false be proc string_equals from StringCore with init_lexeme, "false"
+
+        If init_is_null is equal to 1:
+            Set has_init to 1
+        End If
+
+        If init_is_true is equal to 1:
+            Set has_init to 1
+        End If
+
+        If init_is_false is equal to 1:
+            Set has_init to 1
+        End If
+    End If
+
+    If has_init is equal to 1:
+        Let init_value be proc parse_value with parser
+
+        If init_value is not equal to 0:
+            proc add_operand with global_node, init_value
+        End If
+    End If
+
+    Return global_node
+End Process
+
+@Reasoning:
+A named type definition is `%name = type Body`. It introduces a type
+alias usable elsewhere in the module. The node carries the alias name
+and the aliased type in its type_info slot.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_TYPE node. Expects TOKEN_LOCAL_ID for the %name alias,
+captures it, advances. Expects `=`. Consumes the "type" keyword.
+Parses the aliased type into type_info via parse_type for primitive
+spellings. Aggregate bodies (struct {..}) begin with `{`; when the
+next token is a brace the brace-delimited body is consumed token-by-
+token with depth tracking so the alias parse terminates correctly,
+and the alias is recorded with value "struct". Forward progress is
+guaranteed inside the brace loop by always advancing or breaking on
+EOF.
+@End Implementation
+
+Process called "parse_type_definition" takes parser as Integer returns Integer:
+    Note: Parse LLVM IR named type definition (%name = type ...)
+
+    Let type_node be proc create_llvm_node with LLVM_TYPE
+
+    If type_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Alias name (%name)
+    Let is_local be proc check_token_type with parser, TOKEN_LOCAL_ID from Lexer
+
+    If is_local is equal to 0:
+        proc set_parse_error with parser, "Expected type name"
+        Return 0
+    End If
+
+    Let alias_name be proc peek_token_lexeme with parser
+    proc set_node_name with type_node, alias_name
+    proc advance_token with parser
+
+    Note: Expect '='
+    proc expect_token with parser, TOKEN_EQUALS from Lexer, "Expected '=' in type definition"
+
+    Note: Consume 'type' keyword
+    Let lexeme be proc peek_token_lexeme with parser
+    Let is_type_kw be proc string_equals from StringCore with lexeme, "type"
+
+    If is_type_kw is equal to 0:
+        proc set_parse_error with parser, "Expected 'type' keyword"
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Aggregate struct body { ... } or a primitive type spelling
+    Let body_tok be proc peek_token_type with parser
+
+    If body_tok is equal to TOKEN_LBRACE from Lexer:
+        proc set_node_value with type_node, "struct"
+        proc advance_token with parser
+
+        Note: Consume the brace-delimited body with depth tracking
+        Let depth be 1
+
+        While 1 is equal to 1:
+            Let t be proc peek_token_type with parser
+
+            If t is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+
+            If t is equal to TOKEN_LBRACE from Lexer:
+                Set depth to depth plus 1
+            End If
+
+            If t is equal to TOKEN_RBRACE from Lexer:
+                Set depth to depth minus 1
+
+                If depth is equal to 0:
+                    proc advance_token with parser
+                    Break
+                End If
+            End If
+
+            proc advance_token with parser
+        End While
+    Otherwise:
+        Let aliased_type be proc parse_type with parser
+
+        If aliased_type is not equal to 0:
+            proc memory_set_int64 from Layout with type_node, 24, aliased_type
+        End If
+    End If
+
+    Return type_node
+End Process
+
+@Reasoning:
+A target directive is `target triple = "..."` or `target datalayout
+= "..."`. The node captures which kind (triple or datalayout) as its
+name and the quoted spec string as its value. These directives drive
+backend code generation so they must survive translation.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_VALUE node tagged via name with the directive kind.
+Consumes the "target" keyword. Reads the next keyword (triple or
+datalayout) as the directive kind name. Expects `=`. Captures the
+following TOKEN_STRING lexeme as the directive value via set_node_value.
+@End Implementation
+
+Process called "parse_target_info" takes parser as Integer returns Integer:
+    Note: Parse LLVM IR target directive (triple/datalayout)
+
+    Let target_node be proc create_llvm_node with LLVM_VALUE
+
+    If target_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Consume 'target'
+    Let lexeme be proc peek_token_lexeme with parser
+    Let is_target be proc string_equals from StringCore with lexeme, "target"
+
+    If is_target is equal to 0:
+        proc set_parse_error with parser, "Expected 'target'"
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Directive kind (triple or datalayout) as the node name
+    Let kind_tok be proc check_token_type with parser, TOKEN_KEYWORD from Lexer
+
+    If kind_tok is equal to 0:
+        proc set_parse_error with parser, "Expected target directive kind"
+        Return 0
+    End If
+
+    Let kind_name be proc peek_token_lexeme with parser
+    proc set_node_name with target_node, kind_name
+    proc advance_token with parser
+
+    Note: Expect '='
+    proc expect_token with parser, TOKEN_EQUALS from Lexer, "Expected '=' in target directive"
+
+    Note: Spec string value
+    Let is_str be proc check_token_type with parser, TOKEN_STRING from Lexer
+
+    If is_str is equal to 0:
+        proc set_parse_error with parser, "Expected target spec string"
+        Return 0
+    End If
+
+    Let spec be proc peek_token_lexeme with parser
+    proc set_node_value with target_node, spec
+    proc advance_token with parser
+
+    Return target_node
+End Process
+
+@Reasoning:
+An attribute group definition is `attributes #N = { attr attr ... }`.
+The node records the group identifier and the brace-delimited attribute
+list. Attribute groups are referenced by functions; preserving them
+keeps the module structurally complete.
+@End Reasoning
+
+@Implementation:
+Creates an LLVM_VALUE node. Consumes the "attributes" keyword. The
+group id token (#N) is lexed as TOKEN_METADATA-like or generic; the
+parser captures whatever lexeme follows as the node name and advances.
+Expects `=`. Consumes the brace-delimited body with depth tracking so
+nested braces terminate correctly; forward progress is guaranteed by
+advancing every iteration or breaking on EOF.
+@End Implementation
+
+Process called "parse_attributes" takes parser as Integer returns Integer:
+    Note: Parse LLVM IR attribute group definition
+
+    Let attr_node be proc create_llvm_node with LLVM_VALUE
+
+    If attr_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Consume 'attributes'
+    Let lexeme be proc peek_token_lexeme with parser
+    Let is_attributes be proc string_equals from StringCore with lexeme, "attributes"
+
+    If is_attributes is equal to 0:
+        proc set_parse_error with parser, "Expected 'attributes'"
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Note: Group identifier (whatever token form the lexer produced)
+    Let id_tok be proc peek_token_type with parser
+
+    If id_tok is not equal to TOKEN_EOF from Lexer:
+        Let id_lexeme be proc peek_token_lexeme with parser
+        proc set_node_name with attr_node, id_lexeme
+        proc advance_token with parser
+    End If
+
+    Note: Expect '='
+    proc expect_token with parser, TOKEN_EQUALS from Lexer, "Expected '=' in attributes group"
+
+    Note: Brace-delimited attribute body with depth tracking
+    Let open_brace be proc check_token_type with parser, TOKEN_LBRACE from Lexer
+
+    If open_brace is equal to 1:
+        proc advance_token with parser
+        Let depth be 1
+
+        While 1 is equal to 1:
+            Let t be proc peek_token_type with parser
+
+            If t is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+
+            If t is equal to TOKEN_LBRACE from Lexer:
+                Set depth to depth plus 1
+            End If
+
+            If t is equal to TOKEN_RBRACE from Lexer:
+                Set depth to depth minus 1
+
+                If depth is equal to 0:
+                    proc advance_token with parser
+                    Break
+                End If
+            End If
+
+            proc advance_token with parser
+        End While
+    End If
+
+    Return attr_node
 End Process
 
 Note: ============================================================================
@@ -1260,23 +2104,29 @@ Top-level entry point for parsing a complete LLVM IR module. A module
 mixes function definitions (define), declarations (declare), global
 variables (@name = ...), named type definitions (%name = type ...),
 target triple/datalayout directives, and attributes groups. Dispatch
-is keyword-driven from the current token's lexeme.
+is driven by the current token's type for sigil-led forms (@name,
+%name) and by the keyword lexeme for word-led forms.
 @End Reasoning
 
 @Implementation:
 Creates an LLVM_MODULE node. Loops over module contents until
-TOKEN_EOF. Each iteration peeks the lexeme and dispatches:
-  - "define" -> parse_function, attached via add_basic_block (the
-    function goes into the basic_blocks slot of the module — this
-    is a reuse of the slot since the module itself has no real BBs).
-  - "declare" -> parse_function_declaration for prototype-only
-    declarations.
-  - "@" -> parse_global_variable for module-scoped variables.
-  - "%" -> parse_type_definition for named type aliases.
-  - "target" -> parse_target_info (triple/datalayout).
-  - "attributes" -> parse_attributes for attribute group definitions.
+TOKEN_EOF. Each iteration peeks the token type and lexeme and
+dispatches:
+  - lexeme "define" -> parse_function, attached via add_basic_block
+    (the function goes into the basic_blocks slot of the module —
+    this is a reuse of the slot since the module itself has no real
+    BBs).
+  - lexeme "declare" -> parse_function_declaration for prototype-only
+    declarations (attached via add_operand).
+  - TOKEN_GLOBAL_ID -> parse_global_variable for @name module-scoped
+    variables (attached via add_operand).
+  - TOKEN_LOCAL_ID -> parse_type_definition for %name named type
+    aliases (attached via add_operand).
+  - lexeme "target" -> parse_target_info (triple/datalayout).
+  - lexeme "attributes" -> parse_attributes for attribute group
+    definitions.
   - Anything else: skip one token to avoid infinite loop on
-    unrecognised syntax.
+    unrecognised syntax (forward-progress guarantee).
 After each iteration checks has_parse_error; non-zero returns 0 to
 abandon the module on first failure.
 @End Implementation
@@ -1284,7 +2134,7 @@ abandon the module on first failure.
 Process called "parse_module" takes parser as Integer returns Integer:
     Note: Parse LLVM IR module (top-level entry point)
 
-    Let module_node be proc create_llvm_node from LLVM_MODULE
+    Let module_node be proc create_llvm_node with LLVM_MODULE
 
     If module_node is equal to 0:
         Return 0
@@ -1292,19 +2142,19 @@ Process called "parse_module" takes parser as Integer returns Integer:
 
     Note: Parse module contents
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Break
         End If
 
-        Let lexeme be proc peek_token_lexeme from parser
+        Let lexeme be proc peek_token_lexeme with parser
 
         Note: Check for function definition
-        Let is_define be proc strings_equal from StringCore with lexeme, "define"
+        Let is_define be proc string_equals from StringCore with lexeme, "define"
 
         If is_define is equal to 1:
-            Let func be proc parse_function from parser
+            Let func be proc parse_function with parser
 
             If func is not equal to 0:
                 proc add_basic_block with module_node, func
@@ -1312,50 +2162,62 @@ Process called "parse_module" takes parser as Integer returns Integer:
                 Break
             End If
         Otherwise:
-            Note: Handle other module-level declarations
-            Let is_declare be proc strings_equal from StringCore with lexeme, "declare"
-            Let is_global be proc strings_equal from StringCore with lexeme, "@"
-            Let is_type be proc strings_equal from StringCore with lexeme, "%"
-            Let is_target be proc strings_equal from StringCore with lexeme, "target"
-            Let is_attributes be proc strings_equal from StringCore with lexeme, "attributes"
+            Note: Handle other module-level declarations. The global
+            Note: and named-type forms are recognised by token TYPE
+            Note: (TOKEN_GLOBAL_ID for @name, TOKEN_LOCAL_ID for %name),
+            Note: while declare/target/attributes are bare keyword
+            Note: lexemes classified as TOKEN_KEYWORD.
+            Let is_declare be proc string_equals from StringCore with lexeme, "declare"
+            Let is_target be proc string_equals from StringCore with lexeme, "target"
+            Let is_attributes be proc string_equals from StringCore with lexeme, "attributes"
+            Let is_global_id be 0
+            Let is_local_id be 0
+
+            If token_type is equal to TOKEN_GLOBAL_ID from Lexer:
+                Set is_global_id to 1
+            End If
+
+            If token_type is equal to TOKEN_LOCAL_ID from Lexer:
+                Set is_local_id to 1
+            End If
 
             If is_declare is equal to 1:
                 Note: Function declaration (prototype)
-                Let decl be proc parse_function_declaration from parser
+                Let decl be proc parse_function_declaration with parser
                 If decl is not equal to 0:
-                    proc add_child with module_node, decl
+                    proc add_operand with module_node, decl
                 End If
-            Otherwise If is_global is equal to 1:
-                Note: Global variable declaration
-                Let global be proc parse_global_variable from parser
+            Otherwise If is_global_id is equal to 1:
+                Note: Global variable declaration (@name = ...)
+                Let global be proc parse_global_variable with parser
                 If global is not equal to 0:
-                    proc add_child with module_node, global
+                    proc add_operand with module_node, global
                 End If
-            Otherwise If is_type is equal to 1:
-                Note: Named type definition
-                Let type_def be proc parse_type_definition from parser
+            Otherwise If is_local_id is equal to 1:
+                Note: Named type definition (%name = type ...)
+                Let type_def be proc parse_type_definition with parser
                 If type_def is not equal to 0:
-                    proc add_child with module_node, type_def
+                    proc add_operand with module_node, type_def
                 End If
             Otherwise If is_target is equal to 1:
                 Note: Target triple or datalayout
-                Let target_info be proc parse_target_info from parser
+                Let target_info be proc parse_target_info with parser
                 If target_info is not equal to 0:
-                    proc add_child with module_node, target_info
+                    proc add_operand with module_node, target_info
                 End If
             Otherwise If is_attributes is equal to 1:
                 Note: Function attributes definition
-                Let attrs be proc parse_attributes from parser
+                Let attrs be proc parse_attributes with parser
                 If attrs is not equal to 0:
-                    proc add_child with module_node, attrs
+                    proc add_operand with module_node, attrs
                 End If
             Otherwise:
                 Note: Unknown declaration - skip token to avoid infinite loop
-                proc advance_token from parser
+                proc advance_token with parser
             End If
         End If
 
-        Let has_error be proc has_parse_error from parser
+        Let has_error be proc has_parse_error with parser
 
         If has_error is equal to 1:
             Return 0

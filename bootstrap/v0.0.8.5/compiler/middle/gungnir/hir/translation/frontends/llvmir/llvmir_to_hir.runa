@@ -170,7 +170,7 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -654,37 +654,82 @@ Process called "translate_value" takes context as Integer, llvm_node as Integer 
 End Process
 
 @Reasoning:
-A global declaration / definition is currently lowered to just its
-mangled name -- the body (type / initialiser / linkage) is preserved
-by the parser but not yet projected into HIR. This keeps the global
-sites locateable in HIR for now; richer modelling can be added later
-without changing the call site shape.
+A LLVM global becomes a fully-projected HIR dictionary
+{_type:"llvm_global", name:..., kind:..., global_type:..., initializer:...}
+so the backend and any downstream pass can reconstruct the complete
+`@name = <kind> <type> <init>` form. The parser captures every part:
+the mangled name (offset 8), the global/constant marker (offset 16),
+the declared type (offset 24), and the optional initializer value(s)
+(operands at offset 32); this translator projects all of them rather
+than collapsing the global to a bare name string.
 @End Reasoning
 
 @Implementation:
-Read global_name at offset 8; guard null with translation error. Wrap
-via HIR.create_hir_string_literal and return; guard construction
-failure.
+Create the HIR dict; on OOM set error and return 0. Bind "_type" ->
+"llvm_global". Read name at offset 8 and bind "name" when present.
+Read the kind marker at offset 16 and bind "kind" when present. Read
+the declared type node at offset 24; recurse via translate_llvm_node_
+to_hir (the type collapses to its string spelling) and bind
+"global_type" when non-null. Read the operands list at offset 32; the
+first operand, if any, is the initializer value -- recurse on it and
+bind "initializer". Returns the hir_dict.
 @End Implementation
 
 Process called "translate_global" takes context as Integer, llvm_node as Integer returns Integer:
-    Note: Translate LLVM global to HIR
+    Note: Translate LLVM global to HIR dictionary
 
+    Let hir_dict be proc create_hir_dictionary_literal from HIR
+
+    If hir_dict is equal to 0:
+        proc set_translation_error with context, "Failed to create HIR dictionary"
+        Return 0
+    End If
+
+    Note: Type metadata
+    Let type_value be proc create_hir_string_literal from HIR with "llvm_global"
+    proc add_dictionary_entry from HIR with hir_dict, "_type", type_value
+
+    Note: Global name (@name, sigil included)
     Let global_name be proc memory_get_int64 from Layout with llvm_node, 8
 
-    If global_name is equal to 0:
-        proc set_translation_error with context, "Null global name"
-        Return 0
+    If global_name is not equal to 0:
+        Let name_hir be proc create_hir_string_literal from HIR with global_name
+        proc add_dictionary_entry from HIR with hir_dict, "name", name_hir
     End If
 
-    Let global_hir be proc create_hir_string_literal from HIR with global_name
+    Note: Mutability marker: "global" or "constant"
+    Let kind be proc memory_get_int64 from Layout with llvm_node, 16
 
-    If global_hir is equal to 0:
-        proc set_translation_error with context, "Failed to create HIR string literal"
-        Return 0
+    If kind is not equal to 0:
+        Let kind_hir be proc create_hir_string_literal from HIR with kind
+        proc add_dictionary_entry from HIR with hir_dict, "kind", kind_hir
     End If
 
-    Return global_hir
+    Note: Declared type
+    Let global_type be proc memory_get_int64 from Layout with llvm_node, 24
+
+    If global_type is not equal to 0:
+        Let type_hir be proc translate_llvm_node_to_hir with context, global_type
+        proc add_dictionary_entry from HIR with hir_dict, "global_type", type_hir
+    End If
+
+    Note: Optional initializer value (first operand, if present)
+    Let operands be proc memory_get_int64 from Layout with llvm_node, 32
+
+    If operands is not equal to 0:
+        Let op_count be proc size from List with operands
+
+        If op_count is greater than 0:
+            Let init_node be proc get_at from List with operands, 0
+            Let init_hir be proc translate_llvm_node_to_hir with context, init_node
+
+            If init_hir is not equal to 0:
+                proc add_dictionary_entry from HIR with hir_dict, "initializer", init_hir
+            End If
+        End If
+    End If
+
+    Return hir_dict
 End Process
 
 Note: ============================================================================
@@ -722,14 +767,14 @@ Process called "translate_llvmir_to_hir" takes llvm_ast as Integer returns Integ
 
     Let hir_result be proc translate_llvm_node_to_hir with context, llvm_ast
 
-    Let has_error be proc has_translation_error from context
+    Let has_error be proc has_translation_error with context
 
     If has_error is equal to 1:
-        proc destroy_translation_context from context
+        proc destroy_translation_context with context
         Return 0
     End If
 
-    proc destroy_translation_context from context
+    proc destroy_translation_context with context
 
     Return hir_result
 End Process

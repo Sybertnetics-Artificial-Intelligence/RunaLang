@@ -1,0 +1,531 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+LLVM IR (textual .ll) Translation Round-Trip Probe
+
+End-to-end proof that the LLVM IR translation pipeline is REAL, not a skeleton:
+
+    LLVM IR textual source
+      -> create_llvmir_lexer   (wrap source; the parser drives next_token which
+                                tokenizes keywords (define/ret/add/...), value
+                                types (i32/...), @global / %local identifiers,
+                                numbers, strings, and single-character punctuation
+                                with NUL-terminated owned lexemes)
+      -> create_llvm_parser    (one-token-lookahead recursive-descent parser; each
+                                construct builds an LLVMNode tagged LLVM_MODULE,
+                                LLVM_FUNCTION, LLVM_BASIC_BLOCK, LLVM_INSTRUCTION,
+                                LLVM_TYPE, LLVM_VALUE, or LLVM_GLOBAL)
+      -> parse_module          (top-level entry: functions/declares/globals/types/
+                                target/attributes)
+      -> translate_llvmir_to_hir  (project the LLVMNode tree into the HIR
+                                dictionary/list-literal model; module ->
+                                {_type:"llvm_module", functions:[...]}, function ->
+                                {_type:"llvm_function", name, return_type,
+                                basic_blocks:[...]}, basic_block ->
+                                {_type:"llvm_basic_block", label, instructions:[...]},
+                                instruction -> {_type:"llvm_instruction", opcode,
+                                result?, operands:[string...]})
+      -> generate_llvmir       (emit the HIR dictionary back to canonical LLVM IR
+                                text)
+
+The HIR model is the dictionary/list-literal model (raw string-keyed entries on a
+HIR_DICTIONARY_LITERAL node), NOT the typed hir.runa tree. Every accessor in this
+probe reads the dictionary structure directly via get_dictionary_entries +
+string_equals on entry keys (the same read contract the backend uses), and reads
+leaf values via get_string_literal_value and list contents via get_list_elements.
+
+The probe feeds a representative LLVM IR snippet:
+
+    define i32 @add(i32 %a, i32 %b) {
+    entry:
+      %r = add i32 %a, %b
+      ret i32 %r
+    }
+
+exercising: a define with a return type and @-name, a named basic block label, a
+result-assigning binary instruction (%r = add i32 %a, %b) whose operands are the
+type "i32" and the two register values "%a"/"%b", and a terminator (ret i32 %r).
+
+It then:
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     dictionary _type tag and the top-level function count.
+  2. Asserts the lowered function name, return type, basic-block label, and the
+     two instructions' opcodes / result registers / operand streams survived on
+     the FIRST emission's HIR.
+  3. Emits the HIR back to LLVM IR text and asserts the text is non-empty.
+  4. Re-parses the emitted text back into HIR (the SECOND emission) and asserts
+     the two HIR streams are STRUCTURALLY EQUAL via recursive comparators: same
+     function count, and per-function the same name / return type / basic-block
+     stream (label + per-instruction opcode + result + operand string stream) at
+     every position. The backend canonicalises whitespace and folded forms, so the
+     byte stream differs while the meaning is identical; structural equality is the
+     correct fidelity check.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/llvmir/llvmir_lexer.runa" as LlvmLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/llvmir/llvmir_parser.runa" as LlvmParser
+Import "compiler/middle/gungnir/hir/translation/frontends/llvmir/llvmir_to_hir.runa" as LlvmFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/llvmir/hir_to_llvmir.runa" as LlvmBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: LLVM IR source -> HIR dictionary
+Note: ============================================================================
+
+@Reasoning:
+The LLVM IR pipeline has no single source-to-HIR convenience, so the probe owns
+the chain explicitly: create_llvmir_lexer wraps the source, create_llvm_parser
+binds the lexer and pre-fetches the first token, parse_module builds the LLVMNode
+AST, and translate_llvmir_to_hir projects it into the HIR dictionary. Returning the
+dictionary pointer (or 0 on any stage failure) lets the caller assert on one value.
+@End Reasoning
+Process called "llvmir_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_llvmir_lexer from LlvmLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_llvm_parser from LlvmParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_module from LlvmParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_llvmir_to_hir from LlvmFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: HIR dictionary accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+The HIR dictionary literal stores entries as raw 16-byte [key(0), value(8)] blocks
+whose keys are plain string pointers compared with string_equals — exactly the
+contract get_dict_string_value / get_dict_hir_value use inside the backend. This
+helper builds the key literal, scans the entries list, and returns the raw value
+node (or 0 if absent) so the comparators and assertions read it uniformly.
+@End Reasoning
+Process called "hir_dict_get" takes node as Integer, key as String returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let key_str be proc create_from_literal from StringCore with key
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Let matches be proc string_equals from StringCore with key_str, entry_key
+        If matches is equal to 1:
+            Return entry_value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Convenience wrapper that fetches a dictionary entry and unwraps it as a string
+literal value. The leaf fields in the LLVM IR HIR (name, return type, label,
+opcode, result, operand) are all HIR string literals, so this returns the C-string
+pointer for assert_string_equal / string_equals comparison.
+@End Reasoning
+Process called "hir_dict_get_string" takes node as Integer, key as String returns Integer:
+    Let value be proc hir_dict_get with node, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value
+End Process
+
+@Reasoning:
+Returns the number of elements in a HIR list literal, tolerating a missing (0)
+list so count assertions read uniformly.
+@End Reasoning
+Process called "hir_list_count" takes lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let items be proc get_list_elements from HIR with lst
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+Returns element i of a HIR list literal as a raw node pointer so callers can read
+its dictionary fields.
+@End Reasoning
+Process called "hir_list_at" takes lst as Integer, index as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let items be proc get_list_elements from HIR with lst
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc get_at from List with items, index
+End Process
+
+Note: ============================================================================
+Note: Structural equality comparators (recursive)
+Note: ============================================================================
+
+@Reasoning:
+Two operand streams are equal when they have the same length and the same string
+value at every position. Frontend operands are HIR string literals (a type spelling
+like "i32" or a value spelling like "%a"), so position-for-position string equality
+is the right operand-level fidelity check.
+@End Reasoning
+Process called "operand_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc hir_list_count with a
+    Let count_b be proc hir_list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let op_a be proc hir_list_at with a, i
+        Let op_b be proc hir_list_at with b, i
+
+        Let val_a be proc get_string_literal_value from HIR with op_a
+        Let val_b be proc get_string_literal_value from HIR with op_b
+        Let vals_match be proc string_equals from StringCore with val_a, val_b
+        If vals_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two instructions are equal when their opcodes match, their result registers match
+(both absent counts as a match), and their operand streams are equal. This is the
+load-bearing per-instruction round-trip check.
+@End Reasoning
+Process called "instructions_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let opcode_a be proc hir_dict_get_string with a, "opcode"
+    Let opcode_b be proc hir_dict_get_string with b, "opcode"
+    Let opcodes_match be proc string_equals from StringCore with opcode_a, opcode_b
+    If opcodes_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Result register: compare presence first, then value when present.
+    Let result_a be proc hir_dict_get with a, "result"
+    Let result_b be proc hir_dict_get with b, "result"
+
+    If result_a is equal to 0:
+        If result_b is not equal to 0:
+            Return 0
+        End If
+    Otherwise:
+        If result_b is equal to 0:
+            Return 0
+        End If
+
+        Let res_str_a be proc get_string_literal_value from HIR with result_a
+        Let res_str_b be proc get_string_literal_value from HIR with result_b
+        Let results_match be proc string_equals from StringCore with res_str_a, res_str_b
+        If results_match is not equal to 1:
+            Return 0
+        End If
+    End If
+
+    Let ops_a be proc hir_dict_get with a, "operands"
+    Let ops_b be proc hir_dict_get with b, "operands"
+    Let operands_match be proc operand_streams_equal with ops_a, ops_b
+    If operands_match is not equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Two instruction streams are equal when they have the same length and structurally
+equal instructions at every position.
+@End Reasoning
+Process called "instruction_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc hir_list_count with a
+    Let count_b be proc hir_list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let instr_a be proc hir_list_at with a, i
+        Let instr_b be proc hir_list_at with b, i
+        Let match be proc instructions_equal with instr_a, instr_b
+        If match is not equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two basic-block streams are equal when they have the same length and, at every
+position, the same label and structurally equal instruction streams.
+@End Reasoning
+Process called "basic_block_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc hir_list_count with a
+    Let count_b be proc hir_list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let bb_a be proc hir_list_at with a, i
+        Let bb_b be proc hir_list_at with b, i
+
+        Let label_a be proc hir_dict_get_string with bb_a, "label"
+        Let label_b be proc hir_dict_get_string with bb_b, "label"
+        Let labels_match be proc string_equals from StringCore with label_a, label_b
+        If labels_match is not equal to 1:
+            Return 0
+        End If
+
+        Let insts_a be proc hir_dict_get with bb_a, "instructions"
+        Let insts_b be proc hir_dict_get with bb_b, "instructions"
+        Let insts_match be proc instruction_streams_equal with insts_a, insts_b
+        If insts_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two function streams are equal when they have the same length and, at every
+position, the same name, the same return type, and structurally equal basic-block
+streams. This is the load-bearing whole-function round-trip check.
+@End Reasoning
+Process called "function_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc hir_list_count with a
+    Let count_b be proc hir_list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let fa be proc hir_list_at with a, i
+        Let fb be proc hir_list_at with b, i
+
+        Let name_a be proc hir_dict_get_string with fa, "name"
+        Let name_b be proc hir_dict_get_string with fb, "name"
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+
+        Let ret_a be proc hir_dict_get_string with fa, "return_type"
+        Let ret_b be proc hir_dict_get_string with fb, "return_type"
+        Let rets_match be proc string_equals from StringCore with ret_a, ret_b
+        If rets_match is not equal to 1:
+            Return 0
+        End If
+
+        Let bbs_a be proc hir_dict_get with fa, "basic_blocks"
+        Let bbs_b be proc hir_dict_get with fb, "basic_blocks"
+        Let bbs_match be proc basic_block_streams_equal with bbs_a, bbs_b
+        If bbs_match is not equal to 1:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "LLVM IR translation round-trip"
+
+    Note:
+    Representative LLVM IR snippet. Newlines are explicit \n in the Runa string
+    literal. "define"/"ret" are keywords; "add" is classified as a generic
+    keyword identifier; "i32" is a value type; "@add" is a global id; "%a"/"%b"/
+    "%r" are local ids; "entry" is the basic-block label.
+    :End Note
+    Let source be "define i32 @add(i32 %a, i32 %b) {\nentry:\n  %r = add i32 %a, %b\n  ret i32 %r\n}\n"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc llvmir_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR dictionary", hir1
+
+    Let type_value be proc hir_dict_get_string with hir1, "_type"
+    Let type_is_module be proc string_equals from StringCore with type_value, "llvm_module"
+    proc assert_equal from TestUtils with results, "HIR _type is llvm_module", type_is_module, 1
+
+    Let functions1 be proc hir_dict_get with hir1, "functions"
+    proc assert_not_null from TestUtils with results, "HIR carries a functions section", functions1
+    Let func_count1 be proc hir_list_count with functions1
+    proc assert_equal from TestUtils with results, "1 function parsed", func_count1, 1
+
+    Note: --- Stage 1 content: function @add signature ---
+    Let func0 be proc hir_list_at with functions1, 0
+    Let func0_type be proc hir_dict_get_string with func0, "_type"
+    Let func0_is_function be proc string_equals from StringCore with func0_type, "llvm_function"
+    proc assert_equal from TestUtils with results, "function node _type is llvm_function", func0_is_function, 1
+
+    Let func0_name be proc hir_dict_get_string with func0, "name"
+    proc assert_string_equal from TestUtils with results, "function name is '@add'", func0_name, "@add"
+
+    Let func0_ret be proc hir_dict_get_string with func0, "return_type"
+    proc assert_string_equal from TestUtils with results, "function return type is 'i32'", func0_ret, "i32"
+
+    Note: --- Stage 1 content: basic block 'entry' ---
+    Let bbs1 be proc hir_dict_get with func0, "basic_blocks"
+    Let bb_count1 be proc hir_list_count with bbs1
+    proc assert_equal from TestUtils with results, "function has 1 basic block", bb_count1, 1
+
+    Let bb0 be proc hir_list_at with bbs1, 0
+    Let bb0_label be proc hir_dict_get_string with bb0, "label"
+    proc assert_string_equal from TestUtils with results, "basic block label is 'entry'", bb0_label, "entry"
+
+    Note: --- Stage 1 content: instructions (%r = add i32 %a, %b ; ret i32 %r) ---
+    Let insts1 be proc hir_dict_get with bb0, "instructions"
+    Let inst_count1 be proc hir_list_count with insts1
+    proc assert_equal from TestUtils with results, "basic block has 2 instructions", inst_count1, 2
+
+    Let add_instr be proc hir_list_at with insts1, 0
+    Let add_opcode be proc hir_dict_get_string with add_instr, "opcode"
+    proc assert_string_equal from TestUtils with results, "instruction[0] opcode is 'add'", add_opcode, "add"
+
+    Let add_result be proc hir_dict_get_string with add_instr, "result"
+    proc assert_string_equal from TestUtils with results, "instruction[0] result is '%r'", add_result, "%r"
+
+    Let add_ops be proc hir_dict_get with add_instr, "operands"
+    Let add_op_count be proc hir_list_count with add_ops
+    proc assert_equal from TestUtils with results, "add has 3 operands (type + 2 values)", add_op_count, 3
+
+    Let add_op0 be proc hir_list_at with add_ops, 0
+    Let add_op0_val be proc get_string_literal_value from HIR with add_op0
+    proc assert_string_equal from TestUtils with results, "add operand[0] type is 'i32'", add_op0_val, "i32"
+
+    Let add_op1 be proc hir_list_at with add_ops, 1
+    Let add_op1_val be proc get_string_literal_value from HIR with add_op1
+    proc assert_string_equal from TestUtils with results, "add operand[1] is '%a'", add_op1_val, "%a"
+
+    Let add_op2 be proc hir_list_at with add_ops, 2
+    Let add_op2_val be proc get_string_literal_value from HIR with add_op2
+    proc assert_string_equal from TestUtils with results, "add operand[2] is '%b'", add_op2_val, "%b"
+
+    Let ret_instr be proc hir_list_at with insts1, 1
+    Let ret_opcode be proc hir_dict_get_string with ret_instr, "opcode"
+    proc assert_string_equal from TestUtils with results, "instruction[1] opcode is 'ret'", ret_opcode, "ret"
+
+    Let ret_ops be proc hir_dict_get with ret_instr, "operands"
+    Let ret_op_count be proc hir_list_count with ret_ops
+    proc assert_equal from TestUtils with results, "ret has 2 operands (type + value)", ret_op_count, 2
+
+    Let ret_op0 be proc hir_list_at with ret_ops, 0
+    Let ret_op0_val be proc get_string_literal_value from HIR with ret_op0
+    proc assert_string_equal from TestUtils with results, "ret operand[0] type is 'i32'", ret_op0_val, "i32"
+
+    Let ret_op1 be proc hir_list_at with ret_ops, 1
+    Let ret_op1_val be proc get_string_literal_value from HIR with ret_op1
+    proc assert_string_equal from TestUtils with results, "ret operand[1] is '%r'", ret_op1_val, "%r"
+
+    Note: --- Stage 2: HIR -> LLVM IR text ---
+    Let emitted be proc generate_llvmir from LlvmBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced LLVM IR text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted LLVM IR is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted text -> HIR (the SECOND emission),
+    Note: then assert the section streams are structurally equal. This is the
+    Note: load-bearing round-trip assertion. ---
+    Let hir2 be proc llvmir_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted LLVM IR produced HIR", hir2
+
+    Let type_value2 be proc hir_dict_get_string with hir2, "_type"
+    Let type_is_module2 be proc string_equals from StringCore with type_value2, "llvm_module"
+    proc assert_equal from TestUtils with results, "re-parsed HIR _type is llvm_module", type_is_module2, 1
+
+    Let functions2 be proc hir_dict_get with hir2, "functions"
+    Let func_count2 be proc hir_list_count with functions2
+    proc assert_equal from TestUtils with results, "re-parsed preserves 1 function", func_count2, 1
+
+    Note: Spot-check survival on the SECOND emission directly (not just stage 1).
+    Let r_func0 be proc hir_list_at with functions2, 0
+    Let r_func0_name be proc hir_dict_get_string with r_func0, "name"
+    proc assert_string_equal from TestUtils with results, "round-trip function name survives", r_func0_name, "@add"
+
+    Let r_bbs be proc hir_dict_get with r_func0, "basic_blocks"
+    Let r_bb0 be proc hir_list_at with r_bbs, 0
+    Let r_bb0_label be proc hir_dict_get_string with r_bb0, "label"
+    proc assert_string_equal from TestUtils with results, "round-trip basic block label survives", r_bb0_label, "entry"
+
+    Let r_insts be proc hir_dict_get with r_bb0, "instructions"
+    Let r_inst0 be proc hir_list_at with r_insts, 0
+    Let r_inst0_op be proc hir_dict_get_string with r_inst0, "opcode"
+    proc assert_string_equal from TestUtils with results, "round-trip add opcode survives", r_inst0_op, "add"
+    Let r_inst0_res be proc hir_dict_get_string with r_inst0, "result"
+    proc assert_string_equal from TestUtils with results, "round-trip add result survives", r_inst0_res, "%r"
+
+    Let r_inst1 be proc hir_list_at with r_insts, 1
+    Let r_inst1_op be proc hir_dict_get_string with r_inst1, "opcode"
+    proc assert_string_equal from TestUtils with results, "round-trip ret opcode survives", r_inst1_op, "ret"
+
+    Note: --- Full structural equality across the function stream ---
+    Let funcs_equal be proc function_streams_equal with functions1, functions2
+    proc assert_equal from TestUtils with results, "round-trip functions structurally equal", funcs_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
