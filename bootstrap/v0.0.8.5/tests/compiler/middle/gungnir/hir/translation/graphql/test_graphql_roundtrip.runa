@@ -1,0 +1,370 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+GraphQL Translation Round-Trip Probe
+
+End-to-end proof that the GraphQL translation pipeline is REAL, not a skeleton:
+
+    GraphQL source
+      -> graphql_lexer    (tokenize: names, keywords, punctuation, strings,
+                           numbers, '...', directives, '#' comments)
+      -> graphql_parser   (build GraphQL AST: definitions, operations,
+                           selection sets, fragments, type system)
+      -> graphql_to_hir   (lower GraphQL AST to the keyed dictionary HIR model)
+      -> hir_to_graphql   (emit HIR back to GraphQL source text)
+
+The probe feeds a representative schema-and-operation document covering an
+object type with multiple fields (including a non-null and a list type), a
+field carrying an argument, an interface with an implementing object type, an
+enum, an input object, a query operation declaring a variable and a nested
+selection set, and a fragment with a fragment-spread inside an operation's
+selection set. It then:
+
+  1. Translates the source to HIR and asserts CONTENT survives at the HIR
+     level: the document holds the expected definitions, a type with >= 3
+     fields including a non-null ("ID!") and a list ("[String]") field, a field
+     with an argument, an interface plus the implementing type's implements
+     clause, an enum with values, an input type, a query operation with a
+     variable and a nested selection, and a fragment plus a fragment spread.
+  2. Emits the HIR back to GraphQL text and asserts the text is non-empty.
+  3. Re-parses the emitted GraphQL back into HIR (HIR2) and asserts the same
+     deep content survives the second pass, proving the round-trip preserves
+     structure rather than merely producing output.
+
+The HIR model used by the GraphQL pipeline is a bespoke parallel-array
+dictionary (size@0, capacity@8, keys@16, values@24) and a parallel-array list
+(size@0, capacity@8, items@16); the helpers below read those layouts directly,
+exactly as the backend's dict_get / list_size / list_get do.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/graphql/graphql_to_hir.runa" as Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/graphql/hir_to_graphql.runa" as Backend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Bespoke HIR dictionary / list readers (mirror the backend's layout)
+Note: ============================================================================
+
+@Reasoning:
+The GraphQL HIR dictionary stores its size at offset 0 and parallel key/value
+pointer arrays at offsets 16 and 24. Looking values up by content-compared key
+makes the probe robust to insertion order, exactly as the backend's dict_get
+does.
+@End Reasoning
+@Implementation:
+Reads size@0, keys@16, values@24; scans for a key whose bytes equal the query
+key via string_equals; returns the matching value pointer or 0.
+@End Implementation
+Process called "dget" takes dict as Integer, key as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_int64 from Layout with dict, 0
+    Let keys be proc memory_get_int64 from Layout with dict, 16
+    Let values be proc memory_get_int64 from Layout with dict, 24
+
+    Let index be 0
+    While index is less than size:
+        Let current_key be proc memory_get_int64 from Layout with keys, index multiplied by 8
+        Let matches be proc string_equals from StringCore with current_key, key
+
+        If matches is equal to 1:
+            Return proc memory_get_int64 from Layout with values, index multiplied by 8
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A small spelling convenience: look a key up by a string literal rather than a
+pre-built key pointer, so the assertions below read naturally.
+@End Reasoning
+@Implementation:
+Materializes the literal via create_from_literal (identity over a rodata
+pointer) and delegates to dget.
+@End Implementation
+Process called "dget_lit" takes dict as Integer, literal as Integer returns Integer:
+    Let key be proc create_from_literal from StringCore with literal
+    Return proc dget with dict, key
+End Process
+
+@Reasoning:
+The HIR list header stores its element count at offset 0.
+@End Reasoning
+@Implementation:
+Reads the int64 at offset 0; returns 0 for a null list.
+@End Implementation
+Process called "lsize" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with list, 0
+End Process
+
+@Reasoning:
+The HIR list stores its element-pointer array at offset 16; entries are
+int64-sized.
+@End Reasoning
+@Implementation:
+Reads the items pointer at offset 16, then the index*8 entry within it.
+@End Implementation
+Process called "lget" takes list as Integer, index as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let items be proc memory_get_int64 from Layout with list, 16
+    Return proc memory_get_int64 from Layout with items, index multiplied by 8
+End Process
+
+@Reasoning:
+Several assertions need to find a definition of a given "type" tag inside the
+document's "definitions" list regardless of position (the parser preserves
+source order, but searching by tag keeps the assertions decoupled from the
+exact ordering).
+@End Reasoning
+@Implementation:
+Walks the definitions list; for each definition dictionary reads its "type"
+value and compares to the requested type literal; returns the first match or 0.
+@End Implementation
+Process called "find_def" takes definitions as Integer, type_literal as Integer returns Integer:
+    Let want be proc create_from_literal from StringCore with type_literal
+    Let count be proc lsize with definitions
+    Let index be 0
+    While index is less than count:
+        Let def be proc lget with definitions, index
+        Let def_type be proc dget_lit with def, "type"
+        If def_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with def_type, want
+            If matches is equal to 1:
+                Return def
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Field definitions inside a type carry their declared type under "field_type".
+Locating a field by name lets the probe assert that the non-null and list
+markers survive on the right fields.
+@End Reasoning
+@Implementation:
+Walks the type's "fields" list; for each field-definition dictionary reads
+"name" and compares to the requested name; returns the first match or 0.
+@End Implementation
+Process called "find_field" takes fields as Integer, name_literal as Integer returns Integer:
+    Let want be proc create_from_literal from StringCore with name_literal
+    Let count be proc lsize with fields
+    Let index be 0
+    While index is less than count:
+        Let field be proc lget with fields, index
+        Let fname be proc dget_lit with field, "name"
+        If fname is not equal to 0:
+            Let matches be proc string_equals from StringCore with fname, want
+            If matches is equal to 1:
+                Return field
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Deep content assertions over one HIR document
+Note: ============================================================================
+
+@Reasoning:
+Both the first lowering (hir1) and the re-parse of the emitted text (hir2) must
+exhibit the same content. Asserting the full set of content checks against a
+given HIR root, then invoking it twice, proves the round-trip preserves
+structure without duplicating the assertion code.
+@End Reasoning
+@Implementation:
+Reads the document "definitions" list and asserts: the User type has >= 3
+fields with a non-null "id: ID!" and a list "tags: [String]"; the Query type
+has a field "user" carrying an argument string; an interface "Node" exists; the
+User type's implements clause names "Node"; an enum exists with >= 3 values; an
+input type exists with >= 1 field; a query operation declares a variable and a
+nested selection; and a fragment exists alongside a fragment spread reachable
+from the operation's selection set.
+@End Implementation
+Process called "assert_document_content" takes results as Integer, label as String, root as Integer returns Integer:
+    proc assert_not_null from TestUtils with results, label, root
+
+    Let definitions be proc dget_lit with root, "definitions"
+    proc assert_not_null from TestUtils with results, "document has definitions", definitions
+
+    Let def_count be proc lsize with definitions
+    proc assert_greater_than_or_equal from TestUtils with results, "document has >= 6 definitions", def_count, 6
+
+    Note: --- Object type with >= 3 fields incl non-null + list ---
+    Let user_type be proc find_def with definitions, "type_definition"
+    proc assert_not_null from TestUtils with results, "object type definition present", user_type
+
+    Let user_name be proc dget_lit with user_type, "name"
+    proc assert_string_equal from TestUtils with results, "object type is named User", user_name, "User"
+
+    Let user_fields be proc dget_lit with user_type, "fields"
+    Let user_field_count be proc lsize with user_fields
+    proc assert_greater_than_or_equal from TestUtils with results, "User has >= 3 fields", user_field_count, 3
+
+    Let id_field be proc find_field with user_fields, "id"
+    proc assert_not_null from TestUtils with results, "User has field 'id'", id_field
+    Let id_type be proc dget_lit with id_field, "field_type"
+    proc assert_string_equal from TestUtils with results, "field 'id' is non-null 'ID!'", id_type, "ID!"
+
+    Let tags_field be proc find_field with user_fields, "tags"
+    proc assert_not_null from TestUtils with results, "User has field 'tags'", tags_field
+    Let tags_type be proc dget_lit with tags_field, "field_type"
+    proc assert_string_equal from TestUtils with results, "field 'tags' is list '[String]'", tags_type, "[String]"
+
+    Note: --- User implements the Node interface ---
+    Let implements_val be proc dget_lit with user_type, "implements"
+    proc assert_not_null from TestUtils with results, "User has implements clause", implements_val
+    proc assert_string_equal from TestUtils with results, "User implements Node", implements_val, "Node"
+
+    Note: --- Interface definition ---
+    Let node_iface be proc find_def with definitions, "interface"
+    proc assert_not_null from TestUtils with results, "interface definition present", node_iface
+    Let iface_name be proc dget_lit with node_iface, "name"
+    proc assert_string_equal from TestUtils with results, "interface is named Node", iface_name, "Node"
+
+    Note: --- Object type with a field carrying an argument (Query.user) ---
+    Let query_type be proc find_def with definitions, "type_definition"
+    Note: find_def returns the FIRST type_definition (User); locate Query explicitly
+    Let q_index be 0
+    Let q_count be proc lsize with definitions
+    Let query_def be 0
+    Let query_want be proc create_from_literal from StringCore with "type_definition"
+    Let query_name_want be proc create_from_literal from StringCore with "Query"
+    While q_index is less than q_count:
+        Let cand be proc lget with definitions, q_index
+        Let cand_type be proc dget_lit with cand, "type"
+        If cand_type is not equal to 0:
+            Let ct_match be proc string_equals from StringCore with cand_type, query_want
+            If ct_match is equal to 1:
+                Let cand_name be proc dget_lit with cand, "name"
+                Let cn_match be proc string_equals from StringCore with cand_name, query_name_want
+                If cn_match is equal to 1:
+                    Set query_def to cand
+                End If
+            End If
+        End If
+        Set q_index to q_index plus 1
+    End While
+    proc assert_not_null from TestUtils with results, "Query type definition present", query_def
+
+    Let query_fields be proc dget_lit with query_def, "fields"
+    Let user_field be proc find_field with query_fields, "user"
+    proc assert_not_null from TestUtils with results, "Query has field 'user'", user_field
+    Let user_args be proc dget_lit with user_field, "arguments"
+    proc assert_not_null from TestUtils with results, "Query.user carries an argument", user_args
+
+    Note: --- Enum definition with >= 3 values ---
+    Let enum_def be proc find_def with definitions, "enum"
+    proc assert_not_null from TestUtils with results, "enum definition present", enum_def
+    Let enum_values be proc dget_lit with enum_def, "values"
+    Let enum_value_count be proc lsize with enum_values
+    proc assert_greater_than_or_equal from TestUtils with results, "enum has >= 3 values", enum_value_count, 3
+
+    Note: --- Input object definition with >= 1 field ---
+    Let input_def be proc find_def with definitions, "input"
+    proc assert_not_null from TestUtils with results, "input definition present", input_def
+    Let input_fields be proc dget_lit with input_def, "fields"
+    Let input_field_count be proc lsize with input_fields
+    proc assert_greater_than_or_equal from TestUtils with results, "input has >= 1 field", input_field_count, 1
+
+    Note: --- Query operation with a variable and a nested selection ---
+    Let query_op be proc find_def with definitions, "query"
+    proc assert_not_null from TestUtils with results, "query operation present", query_op
+    Let op_vars be proc dget_lit with query_op, "variables"
+    Let op_var_count be proc lsize with op_vars
+    proc assert_greater_than_or_equal from TestUtils with results, "query op declares >= 1 variable", op_var_count, 1
+
+    Let op_fields be proc dget_lit with query_op, "fields"
+    Let op_field_count be proc lsize with op_fields
+    proc assert_greater_than_or_equal from TestUtils with results, "query op has >= 1 selection", op_field_count, 1
+
+    Note: The top selection is a field with a nested selection set
+    Let top_sel be proc lget with op_fields, 0
+    Let nested_fields be proc dget_lit with top_sel, "fields"
+    Let nested_count be proc lsize with nested_fields
+    proc assert_greater_than_or_equal from TestUtils with results, "query op top field has a nested selection", nested_count, 1
+
+    Note: --- Fragment definition with a type condition ---
+    Let fragment_def be proc find_def with definitions, "fragment"
+    proc assert_not_null from TestUtils with results, "fragment definition present", fragment_def
+    Let frag_on be proc dget_lit with fragment_def, "on_type"
+    proc assert_not_null from TestUtils with results, "fragment carries its type condition", frag_on
+    proc assert_string_equal from TestUtils with results, "fragment is 'on User'", frag_on, "User"
+
+    Note: --- Fragment spread reachable from the operation's nested selection ---
+    Let spread_found be 0
+    Let s_index be 0
+    Let frag_spread_want be proc create_from_literal from StringCore with "fragment_spread"
+    While s_index is less than nested_count:
+        Let sel be proc lget with nested_fields, s_index
+        Let sel_type be proc dget_lit with sel, "type"
+        If sel_type is not equal to 0:
+            Let st_match be proc string_equals from StringCore with sel_type, frag_spread_want
+            If st_match is equal to 1:
+                Set spread_found to 1
+            End If
+        End If
+        Set s_index to s_index plus 1
+    End While
+    proc assert_equal from TestUtils with results, "fragment spread survives in operation selection", spread_found, 1
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "GraphQL translation round-trip"
+
+    Note:
+    Representative document: an interface, an object type implementing it with
+    multiple fields (a non-null and a list), an object type with a field that
+    takes an argument, an enum, an input type, a fragment with a type condition,
+    and a query operation that declares a variable, has a nested selection set,
+    and uses a fragment spread.
+    :End Note
+    Let source be "interface Node { id: ID! } type User implements Node { id: ID! name: String tags: [String] } type Query { user(id: ID!): User } enum Role { ADMIN EDITOR VIEWER } input UserFilter { active: Boolean } fragment UserFields on User { name email } query GetUser($id: ID!) { user(id: $id) { name ...UserFields } }"
+
+    Note: --- Stage 1: source -> HIR, assert deep content ---
+    Let hir1 be proc graphql_to_hir_from_source from Frontend with source
+    proc assert_document_content with results, "frontend produced HIR document", hir1
+
+    Note: --- Stage 2: HIR -> GraphQL text ---
+    Let emitted be proc generate_graphql from Backend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced GraphQL text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted GraphQL is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted GraphQL -> HIR2, assert same deep content ---
+    Let hir2 be proc graphql_to_hir_from_source from Frontend with emitted
+    proc assert_document_content with results, "re-parse of emitted GraphQL produced HIR", hir2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
