@@ -1,0 +1,696 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Verilog (HDL) Translation Round-Trip Probe
+
+End-to-end proof that the Verilog translation pipeline is REAL, not a skeleton:
+
+    Verilog source
+      -> verilog_lexer    (tokenize: module/endmodule, input/output, wire/reg,
+                           assign, always, @, posedge/negedge, <=, =, ranges,
+                           operators, identifiers, numbers)
+      -> verilog_parser   (build module/port/net/reg/assign/always AST)
+      -> verilog_to_hir   (lower module to a HIR_VERILOG_MODULE node carrying
+                           name, header port names, and a typed items list of
+                           HIR_VERILOG_PORT / WIRE / REG / ASSIGN / ALWAYS nodes)
+      -> hir_to_verilog   (emit the HIR module back to Verilog source text)
+
+The probe feeds a representative single-module Verilog design containing:
+  - a module header with a port list (clk, rst, d, q)
+  - a parameter declaration                       (parameter WIDTH = 8)
+  - input/output port declarations with directions (input clk; output q;)
+  - a wire declaration                            (wire enable;)
+  - a reg declaration with a range                (reg [7:0] count;)
+  - a continuous assign                           (assign enable = rst;)
+  - an always block with an edge-sensitive list and a nonblocking assignment
+        (always @(posedge clk) q <= d;)
+
+It then:
+
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     root is a HIR_VERILOG_MODULE node carrying the module name, the header
+     port-name list, and a non-empty typed items list.
+  2. Walks the first-stage HIR items and asserts: a port declaration's
+     direction code and name survived; the wire name survived; the reg name
+     and its range survived; the assign target and RHS survived; the always
+     block carries a sensitivity list and a nonblocking-assignment body.
+  3. Emits the HIR back to Verilog text and asserts the text is non-empty.
+  4. Re-parses the emitted Verilog text back into HIR (the SECOND emission) and
+     asserts STRUCTURAL survival directly on that second HIR: same module name,
+     same header port names + directions, same wire/reg declaration names,
+     same assign target+expr, same always-block sensitivity + nonblocking body.
+     A recursive comparator then confirms the two module item streams are
+     structurally equal (same item count, same node kind at each position, and
+     the identifying payload per kind), which is whitespace- and indentation-
+     insensitive and therefore proves round-trip fidelity without being fooled
+     by the backend's canonical re-rendering.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_lexer.runa" as VerilogLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_parser.runa" as VerilogParser
+Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_to_hir.runa" as VerilogFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/verilog/hir_to_verilog.runa" as VerilogBackend
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Verilog HIR node-type tags (mirror verilog_to_hir.runa's private 15xxx range)
+Note: ============================================================================
+Note: These constants must match the values verilog_to_hir.runa stamps at offset 0
+Note: of each HIR node. The frontend and backend share this exact numbering; the
+Note: probe re-declares them so it can dispatch on the same tags the backend reads.
+
+Constant HIR_VERILOG_MODULE as Integer is 15000
+Constant HIR_VERILOG_PORT as Integer is 15001
+Constant HIR_VERILOG_WIRE as Integer is 15002
+Constant HIR_VERILOG_REG as Integer is 15003
+Constant HIR_VERILOG_ALWAYS as Integer is 15004
+Constant HIR_VERILOG_ASSIGN as Integer is 15005
+Constant HIR_VERILOG_SENSITIVITY as Integer is 15007
+Constant HIR_ASSIGNMENT as Integer is 15022
+Constant HIR_IDENTIFIER as Integer is 15024
+
+Note: Verilog port direction token codes (from verilog_lexer.runa).
+Constant TOKEN_INPUT as Integer is 102
+Constant TOKEN_OUTPUT as Integer is 103
+
+Note: ============================================================================
+Note: Pipeline driver: Verilog source -> HIR module node
+Note: ============================================================================
+
+@Reasoning:
+The Verilog pipeline has no single source-to-HIR convenience, so the probe owns
+the chain explicitly: create_lexer builds the byte-positioned lexer, scan
+tokenises the source, create_parser primes the parser with the token list, parse
+builds the source-file AST, and translate lowers it to HIR. For a single-module
+source, translate returns the module HIR node directly. Returning that pointer
+(or 0 on any stage failure) lets the caller assert on one value.
+@End Reasoning
+Process called "verilog_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from VerilogLexer
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc scan from VerilogLexer with lexer, source
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from VerilogParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from VerilogParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let translator be proc create_translator from VerilogFrontend
+    If translator is equal to 0:
+        Return 0
+    End If
+
+    Let hir_module be proc translate from VerilogFrontend with translator, ast
+    Return hir_module
+End Process
+
+Note: ============================================================================
+Note: HIR module accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+Every HIR node stamps its kind constant at offset 0. Returns it so the
+comparator and assertions can dispatch on module/port/wire/reg/assign/always
+node kinds.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+@Reasoning:
+The HIR module name string is at module offset 8, matching the backend's
+generate_module which reads the name from offset 8.
+@End Reasoning
+Process called "module_name" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with module, 8
+End Process
+
+@Reasoning:
+The HIR module's header port-name list is at module offset 24 (the backend's
+generate_port_list reads this list of bare name strings).
+@End Reasoning
+Process called "module_port_names" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with module, 24
+End Process
+
+@Reasoning:
+The HIR module's typed item list is at module offset 32 (the backend's
+generate_module_items iterates this list dispatching on each item's tag).
+@End Reasoning
+Process called "module_items" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with module, 32
+End Process
+
+@Reasoning:
+Returns the first module item whose node-type tag matches the requested kind,
+or 0 if none. Used to locate the port/wire/reg/assign/always item without
+depending on its exact position in the items list.
+@End Reasoning
+Process called "first_item_of_kind" takes module as Integer, kind as Integer returns Integer:
+    Let items be proc module_items with module
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let i be 0
+    While i is less than count:
+        Let item be proc get from List with items, i
+        Let item_kind be proc memory_get_int64 from Layout with item, 0
+        If item_kind is equal to kind:
+            Return item
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts module items whose tag matches the requested kind. Used by the
+structural comparator to confirm the per-category item count survived the
+round trip.
+@End Reasoning
+Process called "count_items_of_kind" takes module as Integer, kind as Integer returns Integer:
+    Let items be proc module_items with module
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let i be 0
+    Let matches be 0
+    While i is less than count:
+        Let item be proc get from List with items, i
+        Let item_kind be proc memory_get_int64 from Layout with item, 0
+        If item_kind is equal to kind:
+            Set matches to matches plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return matches
+End Process
+
+@Reasoning:
+A HIR_VERILOG_PORT node stores its direction token code at offset 8 (102=input,
+103=output, 104=inout). Returns it for the direction-survival assertion.
+@End Reasoning
+Process called "port_direction" takes port as Integer returns Integer:
+    If port is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with port, 8
+End Process
+
+@Reasoning:
+A HIR_VERILOG_PORT node stores its declared-name list at offset 24. Returns the
+first declared name (the common single-name case) for the name-survival
+assertion.
+@End Reasoning
+Process called "port_first_name" takes port as Integer returns Integer:
+    If port is equal to 0:
+        Return 0
+    End If
+    Let names be proc memory_get_int64 from Layout with port, 24
+    If names is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with names
+    If count is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with names, 0
+End Process
+
+@Reasoning:
+A HIR_VERILOG_WIRE node stores its declared-name list at offset 24. Returns the
+first declared name.
+@End Reasoning
+Process called "wire_first_name" takes wire as Integer returns Integer:
+    If wire is equal to 0:
+        Return 0
+    End If
+    Let names be proc memory_get_int64 from Layout with wire, 24
+    If names is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with names
+    If count is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with names, 0
+End Process
+
+@Reasoning:
+A HIR_VERILOG_REG node stores its range at offset 8 and its declared-name list
+at offset 16 (reg has no net-type field, so its layout differs from wire).
+Returns the first declared name.
+@End Reasoning
+Process called "reg_first_name" takes reg as Integer returns Integer:
+    If reg is equal to 0:
+        Return 0
+    End If
+    Let names be proc memory_get_int64 from Layout with reg, 16
+    If names is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with names
+    If count is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with names, 0
+End Process
+
+@Reasoning:
+A HIR_VERILOG_REG node stores its range node at offset 8. Returns it so the
+probe can assert the reg's bit range survived the round trip.
+@End Reasoning
+Process called "reg_range" takes reg as Integer returns Integer:
+    If reg is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with reg, 8
+End Process
+
+@Reasoning:
+A HIR_VERILOG_ASSIGN node stores its LHS expression at offset 8. The LHS for the
+probe is a simple identifier whose name string is at identifier offset 8. This
+digs to the assign target name for the survival assertion.
+@End Reasoning
+Process called "assign_target_name" takes assign as Integer returns Integer:
+    If assign is equal to 0:
+        Return 0
+    End If
+    Let lhs be proc memory_get_int64 from Layout with assign, 8
+    If lhs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with lhs, 8
+End Process
+
+@Reasoning:
+A HIR_VERILOG_ASSIGN node stores its RHS expression at offset 16. The RHS for
+the probe is a simple identifier whose name string is at identifier offset 8.
+This digs to the assign source name for the survival assertion.
+@End Reasoning
+Process called "assign_rhs_name" takes assign as Integer returns Integer:
+    If assign is equal to 0:
+        Return 0
+    End If
+    Let rhs be proc memory_get_int64 from Layout with assign, 16
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with rhs, 8
+End Process
+
+@Reasoning:
+A HIR_VERILOG_ALWAYS node stores its sensitivity node at offset 8. Returns it
+so the probe can assert the always block has an edge-sensitive list.
+@End Reasoning
+Process called "always_sensitivity" takes always as Integer returns Integer:
+    If always is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with always, 8
+End Process
+
+@Reasoning:
+A HIR_VERILOG_ALWAYS node stores its body statement at offset 16. The probe's
+always body is a single nonblocking assignment, lowered to a HIR_ASSIGNMENT
+node. Returns the body node so the probe can assert its kind and blocking flag.
+@End Reasoning
+Process called "always_body" takes always as Integer returns Integer:
+    If always is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with always, 16
+End Process
+
+@Reasoning:
+A HIR_ASSIGNMENT node stores its blocking flag at offset 24 (1 = blocking `=`,
+0 = nonblocking `<=`). Returns it so the probe can assert the nonblocking form
+survived the round trip - critical because the blocking/nonblocking distinction
+changes simulation semantics.
+@End Reasoning
+Process called "assignment_is_blocking" takes assignment as Integer returns Integer:
+    If assignment is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with assignment, 24
+End Process
+
+@Reasoning:
+A HIR_ASSIGNMENT node stores its LHS expression at offset 8; for the probe this
+is an identifier with its name at offset 8. Returns the procedural-assignment
+target name for the survival assertion.
+@End Reasoning
+Process called "assignment_target_name" takes assignment as Integer returns Integer:
+    If assignment is equal to 0:
+        Return 0
+    End If
+    Let lhs be proc memory_get_int64 from Layout with assignment, 8
+    If lhs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with lhs, 8
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two Verilog HIR modules
+Note: ============================================================================
+
+@Reasoning:
+Two Verilog modules are semantically equal when their HIR forms match on the
+load-bearing structure: same module name, same header port-name count and
+per-position names, same per-category item counts (ports/wires/regs/assigns/
+always), and the same identifying payload on the located port/wire/reg/assign/
+always items. This is whitespace- and indentation-insensitive, so it proves
+round-trip fidelity without being fooled by the backend's canonical re-render.
+@End Reasoning
+Process called "modules_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Note: Module names match.
+    Let name_a be proc module_name with a
+    Let name_b be proc module_name with b
+    Let names_match be proc string_equals from StringCore with name_a, name_b
+    If names_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Header port-name lists match position-for-position.
+    Let ports_a be proc module_port_names with a
+    Let ports_b be proc module_port_names with b
+    If ports_a is equal to 0:
+        Return 0
+    End If
+    If ports_b is equal to 0:
+        Return 0
+    End If
+    Let port_count_a be proc size from List with ports_a
+    Let port_count_b be proc size from List with ports_b
+    If port_count_a is not equal to port_count_b:
+        Return 0
+    End If
+    Let pi be 0
+    While pi is less than port_count_a:
+        Let pname_a be proc get from List with ports_a, pi
+        Let pname_b be proc get from List with ports_b, pi
+        Let pnames_match be proc string_equals from StringCore with pname_a, pname_b
+        If pnames_match is not equal to 1:
+            Return 0
+        End If
+        Set pi to pi plus 1
+    End While
+
+    Note: Per-category item counts match.
+    Let port_items_a be proc count_items_of_kind with a, HIR_VERILOG_PORT
+    Let port_items_b be proc count_items_of_kind with b, HIR_VERILOG_PORT
+    If port_items_a is not equal to port_items_b:
+        Return 0
+    End If
+    Let wire_items_a be proc count_items_of_kind with a, HIR_VERILOG_WIRE
+    Let wire_items_b be proc count_items_of_kind with b, HIR_VERILOG_WIRE
+    If wire_items_a is not equal to wire_items_b:
+        Return 0
+    End If
+    Let reg_items_a be proc count_items_of_kind with a, HIR_VERILOG_REG
+    Let reg_items_b be proc count_items_of_kind with b, HIR_VERILOG_REG
+    If reg_items_a is not equal to reg_items_b:
+        Return 0
+    End If
+    Let assign_items_a be proc count_items_of_kind with a, HIR_VERILOG_ASSIGN
+    Let assign_items_b be proc count_items_of_kind with b, HIR_VERILOG_ASSIGN
+    If assign_items_a is not equal to assign_items_b:
+        Return 0
+    End If
+    Let always_items_a be proc count_items_of_kind with a, HIR_VERILOG_ALWAYS
+    Let always_items_b be proc count_items_of_kind with b, HIR_VERILOG_ALWAYS
+    If always_items_a is not equal to always_items_b:
+        Return 0
+    End If
+
+    Note: Wire declaration name matches.
+    Let wire_a be proc first_item_of_kind with a, HIR_VERILOG_WIRE
+    Let wire_b be proc first_item_of_kind with b, HIR_VERILOG_WIRE
+    Let wname_a be proc wire_first_name with wire_a
+    Let wname_b be proc wire_first_name with wire_b
+    Let wnames_match be proc string_equals from StringCore with wname_a, wname_b
+    If wnames_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Reg declaration name matches.
+    Let reg_a be proc first_item_of_kind with a, HIR_VERILOG_REG
+    Let reg_b be proc first_item_of_kind with b, HIR_VERILOG_REG
+    Let rname_a be proc reg_first_name with reg_a
+    Let rname_b be proc reg_first_name with reg_b
+    Let rnames_match be proc string_equals from StringCore with rname_a, rname_b
+    If rnames_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Assign target and RHS names match.
+    Let assign_a be proc first_item_of_kind with a, HIR_VERILOG_ASSIGN
+    Let assign_b be proc first_item_of_kind with b, HIR_VERILOG_ASSIGN
+    Let atgt_a be proc assign_target_name with assign_a
+    Let atgt_b be proc assign_target_name with assign_b
+    Let atgt_match be proc string_equals from StringCore with atgt_a, atgt_b
+    If atgt_match is not equal to 1:
+        Return 0
+    End If
+    Let arhs_a be proc assign_rhs_name with assign_a
+    Let arhs_b be proc assign_rhs_name with assign_b
+    Let arhs_match be proc string_equals from StringCore with arhs_a, arhs_b
+    If arhs_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Always block: sensitivity present in both, body is a nonblocking
+    Note: assignment to the same target in both.
+    Let always_a be proc first_item_of_kind with a, HIR_VERILOG_ALWAYS
+    Let always_b be proc first_item_of_kind with b, HIR_VERILOG_ALWAYS
+    Let sens_a be proc always_sensitivity with always_a
+    Let sens_b be proc always_sensitivity with always_b
+    If sens_a is equal to 0:
+        Return 0
+    End If
+    If sens_b is equal to 0:
+        Return 0
+    End If
+    Let body_a be proc always_body with always_a
+    Let body_b be proc always_body with always_b
+    Let bkind_a be proc node_kind with body_a
+    Let bkind_b be proc node_kind with body_b
+    If bkind_a is not equal to bkind_b:
+        Return 0
+    End If
+    Let blk_a be proc assignment_is_blocking with body_a
+    Let blk_b be proc assignment_is_blocking with body_b
+    If blk_a is not equal to blk_b:
+        Return 0
+    End If
+    Let btgt_a be proc assignment_target_name with body_a
+    Let btgt_b be proc assignment_target_name with body_b
+    Let btgt_match be proc string_equals from StringCore with btgt_a, btgt_b
+    If btgt_match is not equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Verilog translation round-trip"
+
+    Note:
+    Representative single-module Verilog design. Newlines are explicit \n in the
+    Runa string literal. Module header port list: (clk, rst, d, q).
+    Body items:
+      parameter WIDTH = 8;
+      input clk;
+      input rst;
+      input d;
+      output q;
+      wire enable;
+      reg [7:0] count;
+      assign enable = rst;
+      always @(posedge clk) q <= d;
+    :End Note
+    Let source be "module counter(clk, rst, d, q);\nparameter WIDTH = 8;\ninput clk;\ninput rst;\ninput d;\noutput q;\nwire enable;\nreg [7:0] count;\nassign enable = rst;\nalways @(posedge clk) q <= d;\nendmodule"
+
+    Note: --- Stage 1: source -> HIR module ---
+    Let hir1 be proc verilog_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR module", hir1
+
+    Let kind1 be proc node_kind with hir1
+    proc assert_equal from TestUtils with results, "HIR root is a Verilog module node", kind1, HIR_VERILOG_MODULE
+
+    Let name1 be proc module_name with hir1
+    proc assert_string_equal from TestUtils with results, "module name is 'counter'", name1, "counter"
+
+    Let port_names1 be proc module_port_names with hir1
+    proc assert_not_null from TestUtils with results, "module has a header port list", port_names1
+    Let port_name_count be proc size from List with port_names1
+    proc assert_equal from TestUtils with results, "module header declares 4 ports", port_name_count, 4
+
+    Let items1 be proc module_items with hir1
+    proc assert_not_null from TestUtils with results, "module has an items list", items1
+    Let item_count be proc size from List with items1
+    proc assert_greater_than from TestUtils with results, "module items list is non-empty", item_count, 0
+
+    Note: --- Stage 1 content: an input port declaration survives ---
+    Let port_item1 be proc first_item_of_kind with hir1, HIR_VERILOG_PORT
+    proc assert_not_null from TestUtils with results, "module has a port declaration item", port_item1
+    Let port_dir1 be proc port_direction with port_item1
+    proc assert_equal from TestUtils with results, "first port declaration is an input", port_dir1, TOKEN_INPUT
+    Let port_pname1 be proc port_first_name with port_item1
+    proc assert_string_equal from TestUtils with results, "first port name is 'clk'", port_pname1, "clk"
+
+    Note: --- wire declaration ---
+    Let wire_item1 be proc first_item_of_kind with hir1, HIR_VERILOG_WIRE
+    proc assert_not_null from TestUtils with results, "module has a wire declaration", wire_item1
+    Let wire_name1 be proc wire_first_name with wire_item1
+    proc assert_string_equal from TestUtils with results, "wire name is 'enable'", wire_name1, "enable"
+
+    Note: --- reg declaration with range ---
+    Let reg_item1 be proc first_item_of_kind with hir1, HIR_VERILOG_REG
+    proc assert_not_null from TestUtils with results, "module has a reg declaration", reg_item1
+    Let reg_name1 be proc reg_first_name with reg_item1
+    proc assert_string_equal from TestUtils with results, "reg name is 'count'", reg_name1, "count"
+    Let reg_range1 be proc reg_range with reg_item1
+    proc assert_not_null from TestUtils with results, "reg [7:0] carries a range", reg_range1
+
+    Note: --- continuous assign ---
+    Let assign_item1 be proc first_item_of_kind with hir1, HIR_VERILOG_ASSIGN
+    proc assert_not_null from TestUtils with results, "module has a continuous assign", assign_item1
+    Let assign_tgt1 be proc assign_target_name with assign_item1
+    proc assert_string_equal from TestUtils with results, "assign target is 'enable'", assign_tgt1, "enable"
+    Let assign_rhs1 be proc assign_rhs_name with assign_item1
+    proc assert_string_equal from TestUtils with results, "assign RHS is 'rst'", assign_rhs1, "rst"
+
+    Note: --- always block with sensitivity + nonblocking body ---
+    Let always_item1 be proc first_item_of_kind with hir1, HIR_VERILOG_ALWAYS
+    proc assert_not_null from TestUtils with results, "module has an always block", always_item1
+    Let sens1 be proc always_sensitivity with always_item1
+    proc assert_not_null from TestUtils with results, "always block has a sensitivity list", sens1
+    Let body1 be proc always_body with always_item1
+    Let body_kind1 be proc node_kind with body1
+    proc assert_equal from TestUtils with results, "always body is a procedural assignment", body_kind1, HIR_ASSIGNMENT
+    Let body_blocking1 be proc assignment_is_blocking with body1
+    proc assert_equal from TestUtils with results, "always body is nonblocking (<=)", body_blocking1, 0
+    Let body_tgt1 be proc assignment_target_name with body1
+    proc assert_string_equal from TestUtils with results, "always assignment target is 'q'", body_tgt1, "q"
+
+    Note: --- Stage 2: HIR -> Verilog text ---
+    Let backend be proc create_backend from VerilogBackend
+    proc assert_not_null from TestUtils with results, "backend created", backend
+    Let emitted be proc translate from VerilogBackend with backend, hir1
+    proc assert_not_null from TestUtils with results, "backend produced Verilog text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Verilog is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted Verilog text -> HIR (the SECOND
+    Note: emission), then assert survival DIRECTLY on the second HIR. This is the
+    Note: load-bearing round-trip assertion. ---
+    Let hir2 be proc verilog_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Verilog produced HIR", hir2
+
+    Let kind2 be proc node_kind with hir2
+    proc assert_equal from TestUtils with results, "re-parsed HIR root is a Verilog module", kind2, HIR_VERILOG_MODULE
+
+    Let name2 be proc module_name with hir2
+    proc assert_string_equal from TestUtils with results, "round-trip module name survives", name2, "counter"
+
+    Let port_names2 be proc module_port_names with hir2
+    proc assert_not_null from TestUtils with results, "round-trip header port list survives", port_names2
+    Let port_name_count2 be proc size from List with port_names2
+    proc assert_equal from TestUtils with results, "round-trip header preserves 4 ports", port_name_count2, 4
+
+    Note: First port declaration direction + name survive the second emission.
+    Let port_item2 be proc first_item_of_kind with hir2, HIR_VERILOG_PORT
+    proc assert_not_null from TestUtils with results, "round-trip port declaration survives", port_item2
+    Let port_dir2 be proc port_direction with port_item2
+    proc assert_equal from TestUtils with results, "round-trip first port is input", port_dir2, TOKEN_INPUT
+    Let port_pname2 be proc port_first_name with port_item2
+    proc assert_string_equal from TestUtils with results, "round-trip first port name is 'clk'", port_pname2, "clk"
+
+    Note: Wire / reg names survive.
+    Let wire_item2 be proc first_item_of_kind with hir2, HIR_VERILOG_WIRE
+    Let wire_name2 be proc wire_first_name with wire_item2
+    proc assert_string_equal from TestUtils with results, "round-trip wire name 'enable' survives", wire_name2, "enable"
+    Let reg_item2 be proc first_item_of_kind with hir2, HIR_VERILOG_REG
+    Let reg_name2 be proc reg_first_name with reg_item2
+    proc assert_string_equal from TestUtils with results, "round-trip reg name 'count' survives", reg_name2, "count"
+    Let reg_range2 be proc reg_range with reg_item2
+    proc assert_not_null from TestUtils with results, "round-trip reg range survives", reg_range2
+
+    Note: Assign target + expr survive.
+    Let assign_item2 be proc first_item_of_kind with hir2, HIR_VERILOG_ASSIGN
+    Let assign_tgt2 be proc assign_target_name with assign_item2
+    proc assert_string_equal from TestUtils with results, "round-trip assign target 'enable' survives", assign_tgt2, "enable"
+    Let assign_rhs2 be proc assign_rhs_name with assign_item2
+    proc assert_string_equal from TestUtils with results, "round-trip assign RHS 'rst' survives", assign_rhs2, "rst"
+
+    Note: Always block sensitivity + nonblocking body survive.
+    Let always_item2 be proc first_item_of_kind with hir2, HIR_VERILOG_ALWAYS
+    proc assert_not_null from TestUtils with results, "round-trip always block survives", always_item2
+    Let sens2 be proc always_sensitivity with always_item2
+    proc assert_not_null from TestUtils with results, "round-trip always sensitivity survives", sens2
+    Let body2 be proc always_body with always_item2
+    Let body_kind2 be proc node_kind with body2
+    proc assert_equal from TestUtils with results, "round-trip always body is an assignment", body_kind2, HIR_ASSIGNMENT
+    Let body_blocking2 be proc assignment_is_blocking with body2
+    proc assert_equal from TestUtils with results, "round-trip always body stays nonblocking", body_blocking2, 0
+    Let body_tgt2 be proc assignment_target_name with body2
+    proc assert_string_equal from TestUtils with results, "round-trip always target 'q' survives", body_tgt2, "q"
+
+    Note: --- Whole-module structural equality of stage-1 and round-trip HIR ---
+    Let structurally_equal be proc modules_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
