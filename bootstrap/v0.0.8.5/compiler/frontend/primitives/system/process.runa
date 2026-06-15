@@ -1,0 +1,470 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+=============================================================================
+SUBPROCESS EXECUTION PRIMITIVES
+=============================================================================
+Real subprocess execution built directly on the OS process-control syscalls
+(fork, execve, wait4, nanosleep) through the platform-aware syscall router at
+compiler/frontend/primitives/assembly/syscall.runa.
+
+This module is the system-level process primitive used by the import system
+(remote.runa) to run external tooling such as `git clone` for remote/registry
+imports. It exposes three operations:
+
+  - process_spawn(path, argv) -> pid
+        fork the current process and execve `path` in the child with the
+        supplied argv vector and a controlled environment. Returns the child
+        PID in the parent, or a negative value on fork failure.
+
+  - process_wait(pid) -> exit_code
+        wait for a child to terminate and decode its exit status. Returns the
+        child's exit code (WEXITSTATUS) on normal exit, 128 + signal number
+        if the child was killed by a signal, or a negative value on error.
+
+  - execute_command(command_string, timeout) -> exit_code
+        run a full shell command line through /bin/sh -c, wait for it, and
+        return its exit code. This matches the contract consumed by
+        remote.runa::perform_git_clone, which treats a non-zero return as
+        failure. `timeout` is honored: a positive value bounds the wait (in
+        seconds) using a non-blocking poll/sleep loop; 0 means wait
+        indefinitely.
+
+  - sleep_milliseconds(ms)
+        suspend the calling process for `ms` milliseconds via nanosleep.
+
+PLATFORM SCOPE
+The syscall NUMBERS encoded here (fork=57, execve=59, wait4=61,
+nanosleep=35, exit=60) are the Linux x86_64 ABI numbers. They are issued
+through the generic syscall_N dispatchers in the assembly router, which
+default to the linux_x86_64 backend and resolve to the correct platform
+syscall instruction at compile time. On non-Linux / non-x86_64 targets the
+numeric ABI differs; those targets must route through their own process
+syscall numbers (see runtime/integration/system_interface/platform_implementations).
+The current production host and the bootstrap toolchain are Linux x86_64,
+which is what these numbers target.
+
+Strings in this dialect are pointers to NUL-terminated byte buffers, so a
+String value is directly usable as a C string argument to a syscall.
+:End Note
+
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Note: ============================================================================
+Note: LINUX x86_64 PROCESS-CONTROL SYSCALL NUMBERS
+Note: ============================================================================
+
+Constant SYS_FORK as Integer is 57
+Constant SYS_EXECVE as Integer is 59
+Constant SYS_EXIT as Integer is 60
+Constant SYS_WAIT4 as Integer is 61
+Constant SYS_NANOSLEEP as Integer is 35
+
+Note: errno returned (negated) by wait4 when interrupted by a signal.
+Constant ERRNO_EINTR as Integer is 4
+
+Note: wait4 flag: return immediately if no child has exited yet.
+Constant WAIT_WNOHANG as Integer is 1
+
+Note: execve failure exit code, mirroring the POSIX shell convention for
+Note: "command found but could not be executed".
+Constant EXEC_FAILURE_CODE as Integer is 127
+
+Note: Number of nanoseconds in one millisecond, used to build the nanosleep
+Note: timespec for sub-second sleeps and for the timeout poll cadence.
+Constant NANOS_PER_MILLI as Integer is 1000000
+
+Note: Poll cadence (milliseconds) used while bounding a timed wait. Short
+Note: enough to react promptly, long enough to avoid a busy spin.
+Constant POLL_INTERVAL_MS as Integer is 10
+
+Note: Milliseconds in one second, for converting a second-granularity timeout
+Note: into the millisecond poll budget.
+Constant MILLIS_PER_SECOND as Integer is 1000
+
+Note: ============================================================================
+Note: RAW SYSCALL HELPERS
+Note: ============================================================================
+Note: Thin dispatch wrappers over the platform-aware router. Kept as named
+Note: helpers so the call sites read as the named operation rather than as a
+Note: bare numeric syscall, and so the argument arity is fixed per syscall.
+
+Process called "proc_syscall0" takes syscall_num as Integer returns Integer:
+    Note: Zero-argument syscall (fork). The router issues the syscall
+    Note: instruction and returns RAX. For fork that is 0 in the child, the
+    Note: child PID in the parent, or a negative errno on failure.
+    Return syscall_0 from Syscall with syscall_num
+End Process
+
+Process called "proc_syscall2" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer returns Integer:
+    Note: Two-argument syscall (nanosleep(req, rem)).
+    Return syscall_2 from Syscall with syscall_num, arg1, arg2
+End Process
+
+Process called "proc_syscall3" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
+    Note: Three-argument syscall (execve(path, argv, envp)).
+    Return syscall_3 from Syscall with syscall_num, arg1, arg2, arg3
+End Process
+
+Process called "proc_syscall4" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer returns Integer:
+    Note: Four-argument syscall (wait4(pid, status, options, rusage)).
+    Return syscall_4 from Syscall with syscall_num, arg1, arg2, arg3, arg4
+End Process
+
+Process called "proc_syscall1" takes syscall_num as Integer, arg1 as Integer returns Integer:
+    Note: One-argument syscall (exit(status)) used on the child failure path.
+    Return syscall_1 from Syscall with syscall_num, arg1
+End Process
+
+Note: ============================================================================
+Note: ENVIRONMENT VECTOR
+Note: ============================================================================
+
+Process called "build_default_envp" returns Integer:
+    Note: Build a minimal but functional environment vector for the child.
+    Note: The child runs external tooling (e.g. git, and the /bin/sh that
+    Note: execute_command invokes) which performs PATH-based lookup of further
+    Note: programs. A bare empty environment would leave PATH unset, so any
+    Note: program the shell tries to resolve by name would fail. We therefore
+    Note: provide a conventional system PATH covering the standard binary
+    Note: locations. The vector is a NULL-terminated array of C-string
+    Note: pointers, laid out exactly as execve(2) expects envp.
+    Note: Returns a pointer to the envp array, or 0 on allocation failure.
+    Note: The array holds one entry plus the NULL terminator: 16 bytes.
+
+    Let envp be proc allocate from Layout with 16
+    If envp is equal to 0:
+        Return 0
+    End If
+
+    Let path_entry be "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    proc memory_set_integer from MemoryCore with envp, 0, path_entry
+    proc memory_set_integer from MemoryCore with envp, 8, 0
+
+    Return envp
+End Process
+
+Note: ============================================================================
+Note: PROCESS SPAWN
+Note: ============================================================================
+
+Process called "process_spawn" takes path as Integer, argv as Integer returns Integer:
+    Note: Fork the current process and execve `path` in the child.
+    Note: path  : pointer to a NUL-terminated absolute program path.
+    Note: argv  : pointer to a NUL-terminated array of C-string pointers. By
+    Note:         convention argv[0] is the program name; argv must already be
+    Note:         fully marshaled by the caller (see execute_command).
+    Note: Returns the child PID (> 0) in the parent on success, or a negative
+    Note: value if fork itself failed. The envp is built BEFORE the fork so the
+    Note: child path performs no allocation between fork and execve - it only
+    Note: issues execve and, if that returns (meaning it failed), exit. This
+    Note: keeps the child's post-fork code path free of any operation that
+    Note: could touch shared runtime state in an unsafe way.
+
+    If path is equal to 0:
+        Return -1
+    End If
+    If argv is equal to 0:
+        Return -1
+    End If
+
+    Let envp be proc build_default_envp
+    If envp is equal to 0:
+        Return -1
+    End If
+
+    Let pid be proc proc_syscall0 with SYS_FORK
+
+    If pid is less than 0:
+        Note: fork failed in the parent; report the negative errno upward.
+        proc deallocate from Layout with envp
+        Return pid
+    End If
+
+    If pid is equal to 0:
+        Note: ---- Child process ----
+        Note: Replace the process image. On success execve never returns. If
+        Note: it returns at all, the exec failed; terminate the child with the
+        Note: conventional 127 status so the parent's wait observes the failure
+        Note: rather than the child falling back into parent control flow.
+        Let exec_result be proc proc_syscall3 with SYS_EXECVE, path, argv, envp
+        proc proc_syscall1 with SYS_EXIT, EXEC_FAILURE_CODE
+        Note: Unreachable: exit does not return. Present for total definition.
+        Return -1
+    End If
+
+    Note: ---- Parent process ----
+    proc deallocate from Layout with envp
+    Return pid
+End Process
+
+Note: ============================================================================
+Note: STATUS DECODING
+Note: ============================================================================
+
+Process called "decode_wait_status" takes status as Integer returns Integer:
+    Note: Decode a wait4 status word into a single integer exit code.
+    Note: POSIX encodes child termination in the low 16 bits of the status:
+    Note:   - WIFEXITED  : (status & 0x7F) == 0  -> normal exit
+    Note:                  WEXITSTATUS = (status >> 8) & 0xFF
+    Note:   - otherwise  : terminated by a signal; the signal number is
+    Note:                  (status & 0x7F). We surface that as 128 + signal,
+    Note:                  matching the shell convention so callers that only
+    Note:                  test "non-zero == failure" behave correctly.
+
+    Let term_signal be status bitwise_and 127
+    If term_signal is equal to 0:
+        Let code be (status shifted right by 8) bitwise_and 255
+        Return code
+    End If
+
+    Return 128 plus term_signal
+End Process
+
+Note: ============================================================================
+Note: PROCESS WAIT
+Note: ============================================================================
+
+Process called "process_wait" takes pid as Integer returns Integer:
+    Note: Block until the child `pid` terminates, then return its decoded exit
+    Note: code. Retries automatically if wait4 is interrupted by a signal
+    Note: (EINTR). Returns a negative value if pid is invalid or wait4 fails
+    Note: for a non-EINTR reason.
+
+    If pid is less than or equal to 0:
+        Return -1
+    End If
+
+    Let status_buf be proc allocate from Layout with 8
+    If status_buf is equal to 0:
+        Return -1
+    End If
+    proc memory_set_integer from MemoryCore with status_buf, 0, 0
+
+    Let waiting be 1
+    Let result be 0
+    While waiting is equal to 1:
+        Set result to proc proc_syscall4 with SYS_WAIT4, pid, status_buf, 0, 0
+        If result is less than 0:
+            If result is equal to 0 minus ERRNO_EINTR:
+                Note: Interrupted by a signal before the child changed state;
+                Note: reissue the wait. No other state has changed.
+                Set waiting to 1
+            Otherwise:
+                proc deallocate from Layout with status_buf
+                Return result
+            End If
+        Otherwise:
+            Set waiting to 0
+        End If
+    End While
+
+    Let status be proc memory_get_integer from MemoryCore with status_buf, 0
+    proc deallocate from Layout with status_buf
+
+    Let exit_code be proc decode_wait_status with status
+    Return exit_code
+End Process
+
+Note: ============================================================================
+Note: TIMED WAIT (bounded poll)
+Note: ============================================================================
+
+Process called "process_wait_timed" takes pid as Integer, timeout_seconds as Integer returns Integer:
+    Note: Wait for `pid` but give up after `timeout_seconds` if the child has
+    Note: not terminated. A zero or negative timeout means "wait indefinitely"
+    Note: and delegates to the plain blocking process_wait.
+    Note: For a positive timeout we poll with wait4(WNOHANG): each iteration
+    Note: reaps the child if it has exited, otherwise sleeps POLL_INTERVAL_MS
+    Note: and decrements the remaining budget. This bounds total work to
+    Note: roughly timeout_seconds and never blocks indefinitely. If the budget
+    Note: is exhausted while the child is still running, the child is killed is
+    Note: not attempted here (the caller owns lifecycle policy); we return a
+    Note: negative timeout indicator so the caller treats it as failure.
+    Note: Returns the decoded exit code on normal completion, or -2 if the
+    Note: timeout elapsed first, or a negative errno on wait4 failure.
+
+    If pid is less than or equal to 0:
+        Return -1
+    End If
+
+    If timeout_seconds is less than or equal to 0:
+        Return proc process_wait with pid
+    End If
+
+    Let status_buf be proc allocate from Layout with 8
+    If status_buf is equal to 0:
+        Return -1
+    End If
+    proc memory_set_integer from MemoryCore with status_buf, 0, 0
+
+    Note: Total poll budget expressed in POLL_INTERVAL_MS ticks.
+    Let budget_ms be timeout_seconds multiplied by MILLIS_PER_SECOND
+    Let ticks_remaining be budget_ms divided by POLL_INTERVAL_MS
+    If ticks_remaining is less than 1:
+        Set ticks_remaining to 1
+    End If
+
+    Let polling be 1
+    Let outcome be 0 minus 2
+    While polling is equal to 1:
+        Let result be proc proc_syscall4 with SYS_WAIT4, pid, status_buf, WAIT_WNOHANG, 0
+
+        If result is less than 0:
+            If result is equal to 0 minus ERRNO_EINTR:
+                Note: Interrupted; retry without consuming budget.
+                Set polling to 1
+            Otherwise:
+                proc deallocate from Layout with status_buf
+                Return result
+            End If
+        Otherwise:
+            If result is greater than 0:
+                Note: Child changed state and was reaped: result is its PID.
+                Let status be proc memory_get_integer from MemoryCore with status_buf, 0
+                Set outcome to proc decode_wait_status with status
+                Set polling to 0
+            Otherwise:
+                Note: result == 0 -> child still running. Spend one tick.
+                If ticks_remaining is less than or equal to 0:
+                    Set outcome to 0 minus 2
+                    Set polling to 0
+                Otherwise:
+                    proc sleep_milliseconds with POLL_INTERVAL_MS
+                    Set ticks_remaining to ticks_remaining minus 1
+                End If
+            End If
+        End If
+    End While
+
+    proc deallocate from Layout with status_buf
+    Return outcome
+End Process
+
+Note: ============================================================================
+Note: SLEEP
+Note: ============================================================================
+
+Process called "sleep_milliseconds" takes ms as Integer returns Integer:
+    Note: Suspend the calling process for `ms` milliseconds using nanosleep.
+    Note: nanosleep takes a `struct timespec { time_t tv_sec; long tv_nsec; }`
+    Note: which on x86_64 is two 8-byte fields. We split `ms` into whole
+    Note: seconds and the leftover nanoseconds. A non-positive `ms` returns
+    Note: immediately. Returns 0 on success or the negative errno from
+    Note: nanosleep on failure (e.g. EINTR if a signal arrives mid-sleep).
+
+    If ms is less than or equal to 0:
+        Return 0
+    End If
+
+    Let req be proc allocate from Layout with 16
+    If req is equal to 0:
+        Return -1
+    End If
+
+    Let seconds be ms divided by MILLIS_PER_SECOND
+    Let remainder_ms be ms modulo by MILLIS_PER_SECOND
+    Let nanos be remainder_ms multiplied by NANOS_PER_MILLI
+
+    proc memory_set_integer from MemoryCore with req, 0, seconds
+    proc memory_set_integer from MemoryCore with req, 8, nanos
+
+    Let result be proc proc_syscall2 with SYS_NANOSLEEP, req, 0
+
+    proc deallocate from Layout with req
+    Return result
+End Process
+
+Note: ============================================================================
+Note: EXECUTE COMMAND (shell command line)
+Note: ============================================================================
+
+Process called "build_shell_argv" takes command_string as Integer returns Integer:
+    Note: Marshal the argv vector for `/bin/sh -c <command_string>`.
+    Note: Layout (NUL-terminated array of C-string pointers):
+    Note:   argv[0] = "/bin/sh"
+    Note:   argv[1] = "-c"
+    Note:   argv[2] = command_string
+    Note:   argv[3] = 0
+    Note: That is four 8-byte slots = 32 bytes. Returns the array pointer, or 0
+    Note: on allocation failure. The string literals are stable NUL-terminated
+    Note: buffers and command_string is supplied by the caller already
+    Note: NUL-terminated, so no copying is required.
+
+    If command_string is equal to 0:
+        Return 0
+    End If
+
+    Let argv be proc allocate from Layout with 32
+    If argv is equal to 0:
+        Return 0
+    End If
+
+    Let sh_path be "/bin/sh"
+    Let dash_c be "-c"
+
+    proc memory_set_integer from MemoryCore with argv, 0, sh_path
+    proc memory_set_integer from MemoryCore with argv, 8, dash_c
+    proc memory_set_integer from MemoryCore with argv, 16, command_string
+    proc memory_set_integer from MemoryCore with argv, 24, 0
+
+    Return argv
+End Process
+
+Process called "execute_command" takes command_string as Integer, timeout as Integer returns Integer:
+    Note: Run a full shell command line and return its exit code.
+    Note: command_string : pointer to a NUL-terminated shell command, e.g.
+    Note:                   "git clone --depth 1 <url> <dir>".
+    Note: timeout         : maximum seconds to wait for completion. 0 (or
+    Note:                   negative) means wait indefinitely.
+    Note: The command is executed via `/bin/sh -c <command_string>` so that
+    Note: shell features (argument splitting, PATH lookup of `git`, etc.) work
+    Note: exactly as a shell user would expect - which is what the import
+    Note: system relies on. Returns the child's exit code (0 == success,
+    Note: non-zero == failure), or a negative value on spawn/wait failure.
+    Note: This matches the contract consumed by remote.runa::perform_git_clone,
+    Note: which only inspects whether the returned exit code is non-zero. The
+    Note: clone command already redirects/produces its output to the target
+    Note: directory on disk, so no stdout capture is required by that caller;
+    Note: this returns the exit code, fully.
+
+    If command_string is equal to 0:
+        Return -1
+    End If
+
+    Let sh_path be "/bin/sh"
+
+    Let argv be proc build_shell_argv with command_string
+    If argv is equal to 0:
+        Return -1
+    End If
+
+    Let pid be proc process_spawn with sh_path, argv
+
+    proc deallocate from Layout with argv
+
+    If pid is less than 0:
+        Note: fork failed; propagate the failure as a negative result.
+        Return pid
+    End If
+
+    Let exit_code be proc process_wait_timed with pid, timeout
+    Return exit_code
+End Process
