@@ -46,6 +46,7 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as String
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 
 Note: ═══════════════════════════════════════════════════════════════════════════
 Note: Bifrost Graph Structure
@@ -129,7 +130,7 @@ will be freed together when the graph is freed. No capability requirements.
 
 Process called "create_graph" that takes nothing returns Integer:
     Note: Allocate 72 bytes for BifrostGraph on OWNED HEAP
-    Let graph be Layout.memory_allocate(72)
+    Let graph be Layout.allocate(72)
 
     Note: Set discriminant to 0 (struct type)
     Layout.memory_set_int64(graph, 0, 0)
@@ -279,7 +280,7 @@ Process called "remove_node" that takes graph as Integer, node as Integer return
     Let node_outputs be Layout.memory_get_int64(graph, 32)
 
     Note: Remove all incoming edges
-    If Dict.has_key(node_inputs, node):
+    If Dict.contains(node_inputs, node):
         Let incoming be Dict.get(node_inputs, node)
         Let inc_len be List.length(incoming)
         Let i be 0
@@ -291,7 +292,7 @@ Process called "remove_node" that takes graph as Integer, node as Integer return
     End If
 
     Note: Remove all outgoing edges
-    If Dict.has_key(node_outputs, node):
+    If Dict.contains(node_outputs, node):
         Let outgoing be Dict.get(node_outputs, node)
         Let out_len be List.length(outgoing)
         Set i to 0
@@ -302,9 +303,12 @@ Process called "remove_node" that takes graph as Integer, node as Integer return
         End While
     End If
 
-    Note: Remove node from nodes list
+    Note: Remove node from nodes list (find by value, then remove at index)
     Let nodes be Layout.memory_get_int64(graph, 8)
-    List.remove(nodes, node)
+    Let node_index be List.list_index_of(nodes, node)
+    If node_index is greater than or equal to 0:
+        List.remove_at(nodes, node_index)
+    End If
 
     Note: Remove node from node_id_map
     Let node_id_map be Layout.memory_get_int64(graph, 40)
@@ -450,21 +454,30 @@ Process called "remove_edge" that takes graph as Integer, edge as Integer return
 
     Note: Remove edge from source node's output edges
     Let node_outputs be Layout.memory_get_int64(graph, 32)
-    If Dict.has_key(node_outputs, source):
+    If Dict.contains(node_outputs, source):
         Let source_outputs be Dict.get(node_outputs, source)
-        List.remove(source_outputs, edge)
+        Let source_edge_index be List.list_index_of(source_outputs, edge)
+        If source_edge_index is greater than or equal to 0:
+            List.remove_at(source_outputs, source_edge_index)
+        End If
     End If
 
     Note: Remove edge from destination node's input edges
     Let node_inputs be Layout.memory_get_int64(graph, 24)
-    If Dict.has_key(node_inputs, dest):
+    If Dict.contains(node_inputs, dest):
         Let dest_inputs be Dict.get(node_inputs, dest)
-        List.remove(dest_inputs, edge)
+        Let dest_edge_index be List.list_index_of(dest_inputs, edge)
+        If dest_edge_index is greater than or equal to 0:
+            List.remove_at(dest_inputs, dest_edge_index)
+        End If
     End If
 
     Note: Remove edge from edges list
     Let edges be Layout.memory_get_int64(graph, 16)
-    List.remove(edges, edge)
+    Let edge_list_index be List.list_index_of(edges, edge)
+    If edge_list_index is greater than or equal to 0:
+        List.remove_at(edges, edge_list_index)
+    End If
 
     Note: Remove edge from edge_id_map
     Let edge_id_map be Layout.memory_get_int64(graph, 48)
@@ -510,6 +523,69 @@ Process called "get_node_count" that takes graph as Integer returns Integer:
     Let nodes be Layout.memory_get_int64(graph, 8)
     Let count be List.length(nodes)
     Return count
+End Process
+
+@Reasoning:
+Whole-graph node enumeration accessor. Analysis passes (parallelism,
+verifier) iterate every node to build dependency, reduction and memory-safety
+information; returning the canonical nodes List from offset 8 keeps that
+layout detail private to the graph module instead of duplicating the offset
+read across the analysis files.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null graph. Otherwise loads and returns the nodes List
+pointer stored at offset 8 by add_node. The returned list is borrowed: the
+graph retains ownership, so callers must not destroy it.
+@End Implementation
+
+@Performance_Hints:
+O(1) — single aligned int64 read.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. The returned List is owned by the graph; mutating it bypasses the
+node_id_map and edge bookkeeping maintained by add_node/remove_node, so
+callers treat it as read-only.
+@End Security_Scope
+
+Process called "get_all_nodes" that takes graph as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Return Layout.memory_get_int64(graph, 8)
+End Process
+
+@Reasoning:
+Whole-graph edge enumeration accessor, the edge-list counterpart to
+get_all_nodes. The verifier walks every edge to check endpoint validity and
+type compatibility; returning the canonical edges List from offset 16 keeps
+that layout detail private to the graph module.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null graph. Otherwise loads and returns the edges List pointer
+stored at offset 16 by add_edge. The returned list is borrowed: the graph
+retains ownership, so callers must not destroy it.
+@End Implementation
+
+@Performance_Hints:
+O(1) — single aligned int64 read.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. The returned List is owned by the graph; mutating it bypasses the
+edge_id_map and adjacency bookkeeping maintained by add_edge/remove_edge, so
+callers treat it as read-only.
+@End Security_Scope
+
+Process called "get_all_edges" that takes graph as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Return Layout.memory_get_int64(graph, 16)
 End Process
 
 @Reasoning:
@@ -631,7 +707,7 @@ in lockstep by add_node and remove_node.
 @End Reasoning
 
 @Implementation:
-Returns 0 for null graph. Reads node_id_map at offset 40, tests Dict.has_key,
+Returns 0 for null graph. Reads node_id_map at offset 40, tests Dict.contains,
 and returns Dict.get on hit; returns 0 on miss.
 @End Implementation
 
@@ -649,7 +725,7 @@ Process called "get_node" that takes graph as Integer, node_id as Integer return
     End If
 
     Let node_id_map be Layout.memory_get_int64(graph, 40)
-    If Dict.has_key(node_id_map, node_id):
+    If Dict.contains(node_id_map, node_id):
         Let node be Dict.get(node_id_map, node_id)
         Return node
     End If
@@ -663,7 +739,7 @@ dependencies by id (e.g. metadata side-tables) instead of pointer.
 @End Reasoning
 
 @Implementation:
-Returns 0 for null graph. Reads edge_id_map at offset 48, tests Dict.has_key,
+Returns 0 for null graph. Reads edge_id_map at offset 48, tests Dict.contains,
 returns Dict.get on hit; returns 0 on miss.
 @End Implementation
 
@@ -681,7 +757,7 @@ Process called "get_edge" that takes graph as Integer, edge_id as Integer return
     End If
 
     Let edge_id_map be Layout.memory_get_int64(graph, 48)
-    If Dict.has_key(edge_id_map, edge_id):
+    If Dict.contains(edge_id_map, edge_id):
         Let edge be Dict.get(edge_id_map, edge_id)
         Return edge
     End If
@@ -720,7 +796,7 @@ Process called "get_node_inputs" that takes graph as Integer, node as Integer re
     End If
 
     Let node_inputs be Layout.memory_get_int64(graph, 24)
-    If Dict.has_key(node_inputs, node):
+    If Dict.contains(node_inputs, node):
         Let inputs be Dict.get(node_inputs, node)
         Return inputs
     End If
@@ -756,7 +832,7 @@ Process called "get_node_outputs" that takes graph as Integer, node as Integer r
     End If
 
     Let node_outputs be Layout.memory_get_int64(graph, 32)
-    If Dict.has_key(node_outputs, node):
+    If Dict.contains(node_outputs, node):
         Let outputs be Dict.get(node_outputs, node)
         Return outputs
     End If
@@ -2205,6 +2281,157 @@ Process called "find_critical_path" that takes graph as Integer returns Integer:
     Return reversed_path
 End Process
 
+@Reasoning:
+compute_dominators models dominator sets as element-Lists (each list holds the
+node pointers that dominate a given node). The fixed-point iteration needs
+three set-style operations over those Lists: a defensive copy of a stored set
+before mutation, intersection of two sets, and structural equality. They live
+here as module-local helpers because the dominator representation is private to
+this file - the collections Set type uses a different layout and cannot be
+applied to these plain element lists.
+@End Reasoning
+
+@Implementation:
+list_set_copy allocates a fresh List and appends every element of the source,
+producing an independent set the caller may mutate without disturbing the
+stored dominator list. Returns an empty list for a null source.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the source length; single allocation plus n appends.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of the source; the returned List is freshly owned by the caller.
+@End Security_Scope
+
+Process called "list_set_copy" that takes source as Integer returns Integer:
+    Let result be List.create()
+    If source is equal to 0:
+        Return result
+    End If
+
+    Let len be List.length(source)
+    Let i be 0
+    While i is less than len:
+        List.append(result, List.get(source, i))
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+set_intersection produces the elements common to both list-sets. Dominator
+intersection is the core of the Cooper-Harvey-Kennedy meet operation, so this
+must produce a brand-new list rather than mutating either operand.
+@End Reasoning
+
+@Implementation:
+Allocates a result List. For each element of set_a, scans set_b for an equal
+pointer; on a match the element is appended to the result. Operands are
+duplicate-free dominator sets, so membership testing yields the exact
+intersection. Returns an empty list when either operand is null.
+@End Implementation
+
+@Performance_Hints:
+O(len_a * len_b). Dominator sets are small in practice; for very large graphs a
+hash-set membership test would lower this to O(len_a + len_b).
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of both operands; the returned List is freshly owned by the caller.
+@End Security_Scope
+
+Process called "set_intersection" that takes set_a as Integer, set_b as Integer returns Integer:
+    Let result be List.create()
+    If set_a is equal to 0:
+        Return result
+    End If
+    If set_b is equal to 0:
+        Return result
+    End If
+
+    Let len_a be List.length(set_a)
+    Let len_b be List.length(set_b)
+    Let i be 0
+    While i is less than len_a:
+        Let elem be List.get(set_a, i)
+        Let found be false
+        Let j be 0
+        While j is less than len_b:
+            If List.get(set_b, j) is equal to elem:
+                Set found to true
+            End If
+            Set j to j plus 1
+        End While
+        If found is equal to true:
+            List.append(result, elem)
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+set_equal decides whether the dominator set changed between iterations; when no
+node's set changes the fixed point is reached and the loop terminates. Equality
+is structural over the element pointers, independent of order.
+@End Reasoning
+
+@Implementation:
+Returns true only when both lists have equal length and every element of the
+first is present in the second. Because dominator sets are duplicate-free,
+equal length plus one-directional containment implies set equality. Treats two
+null operands as equal and a single null operand as unequal.
+@End Implementation
+
+@Performance_Hints:
+O(len_a * len_b) worst case; short-circuits on a length mismatch.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of both operands; mutates nothing.
+@End Security_Scope
+
+Process called "set_equal" that takes set_a as Integer, set_b as Integer returns Integer:
+    If set_a is equal to 0:
+        If set_b is equal to 0:
+            Return true
+        End If
+        Return false
+    End If
+    If set_b is equal to 0:
+        Return false
+    End If
+
+    Let len_a be List.length(set_a)
+    Let len_b be List.length(set_b)
+    If len_a is not equal to len_b:
+        Return false
+    End If
+
+    Let i be 0
+    While i is less than len_a:
+        Let elem be List.get(set_a, i)
+        Let found be false
+        Let j be 0
+        While j is less than len_b:
+            If List.get(set_b, j) is equal to elem:
+                Set found to true
+            End If
+            Set j to j plus 1
+        End While
+        If found is equal to false:
+            Return false
+        End If
+        Set i to i plus 1
+    End While
+
+    Return true
+End Process
+
 @Implementation:
 Computes the dominator tree for the graph using Cooper-Harvey-Kennedy algorithm.
 Node d dominates node n if every path from entry to n must go through d.
@@ -2312,7 +2539,7 @@ Process called "compute_dominators" that takes graph as Integer returns Integer:
                 If pred_count is greater than 0:
                     Note: Start with first predecessor's dominators
                     Let first_pred be List.get(predecessors, 0)
-                    Let intersection be List.copy(Dict.get(dominators, first_pred))
+                    Let intersection be list_set_copy(Dict.get(dominators, first_pred))
 
                     Note: Intersect with remaining predecessors' dominators
                     Let p be 1
@@ -2392,7 +2619,7 @@ Process called "find_strongly_connected_components" that takes graph as Integer 
     Let i be 0
     While i is less than node_count:
         Let node be List.get(nodes, i)
-        Let has_index be Dict.has_key(index_map, node)
+        Let has_index be Dict.contains(index_map, node)
         If has_index is equal to false:
             Set current_index to tarjan_strongconnect(
                 graph, node, sccs, stack,
@@ -2457,7 +2684,7 @@ Process called "tarjan_strongconnect" that takes
     Let s be 0
     While s is less than succ_count:
         Let successor be List.get(successors, s)
-        Let has_index be Dict.has_key(index_map, successor)
+        Let has_index be Dict.contains(index_map, successor)
 
         If has_index is equal to false:
             Note: Successor not visited, recurse
@@ -2816,17 +3043,17 @@ Process called "graph_statistics" that takes graph as Integer returns Integer:
     Note: Node and edge counts
     Let node_count be get_node_count(graph)
     Let edge_count be get_edge_count(graph)
-    Dict.set(stats, String.from_string("node_count"), node_count)
-    Dict.set(stats, String.from_string("edge_count"), edge_count)
+    Dict.set(stats, "node_count", node_count)
+    Dict.set(stats, "edge_count", edge_count)
 
     Note: Root and leaf counts
     Let roots be find_roots(graph)
     Let root_count be List.length(roots)
-    Dict.set(stats, String.from_string("root_count"), root_count)
+    Dict.set(stats, "root_count", root_count)
 
     Let leaves be find_leaves(graph)
     Let leaf_count be List.length(leaves)
-    Dict.set(stats, String.from_string("leaf_count"), leaf_count)
+    Dict.set(stats, "leaf_count", leaf_count)
 
     Note: Depth and height analysis
     Let depths be compute_depths(graph)
@@ -2849,13 +3076,13 @@ Process called "graph_statistics" that takes graph as Integer returns Integer:
         Set i to i plus 1
     End While
 
-    Dict.set(stats, String.from_string("max_depth"), max_depth)
-    Dict.set(stats, String.from_string("max_height"), max_height)
+    Dict.set(stats, "max_depth", max_depth)
+    Dict.set(stats, "max_height", max_height)
 
     Note: Average degrees
     If node_count is greater than 0:
         Let avg_degree be edge_count divided by node_count
-        Dict.set(stats, String.from_string("avg_degree"), avg_degree)
+        Dict.set(stats, "avg_degree", avg_degree)
     End If
 
     Note: Check if DAG
@@ -2864,7 +3091,7 @@ Process called "graph_statistics" that takes graph as Integer returns Integer:
     If is_acyclic is equal to true:
         Set acyclic_val to 1
     End If
-    Dict.set(stats, String.from_string("is_dag"), acyclic_val)
+    Dict.set(stats, "is_dag", acyclic_val)
 
     Return stats
 End Process
@@ -3045,6 +3272,476 @@ Process called "inline_subgraph" that takes
     remove_node(graph, target_node)
 End Process
 
+Note: ═══════════════════════════════════════════════════════════════════════════
+Note: Optimisation Helper Routines (fusion, splitting, scheduling, partitioning)
+Note: ═══════════════════════════════════════════════════════════════════════════
+
+@Reasoning:
+Element-wise producer/consumer pairs are the only safe fusion candidates in
+Bifrost: their per-lane independence means the fused kernel can compute both
+operations on the same data resident in registers without an intermediate
+materialisation. Restricting fusibility to the basic arithmetic kinds (Add,
+Subtract, Multiply, Divide) keeps the legality test conservative - matrix,
+reduction, and stateful ops have data-dependence patterns that forbid naive
+lane-wise fusion.
+@End Reasoning
+
+@Implementation:
+The op kinds passed here are the raw OpKind discriminants stored at offset 8
+of an Operation node (written as an integer by create_operation_node), not
+OpKind struct pointers, so the test is a direct discriminant range check
+rather than a call into opkind_is_arithmetic (which dereferences an OpKind
+pointer). Element-wise arithmetic occupies discriminants 0..3 in the OpKind
+enum: Add(0), Subtract(1), MulOp(2), DivOp(3). Both operands must be in this
+range for the pair to be fusible. Returns 1 (true) when both are element-wise
+arithmetic, 0 (false) otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(1) - two range comparisons. Called on every fusion candidate pair, so the
+constant-time check is critical to keeping the fusion pass at O(E).
+@End Performance_Hints
+
+@Security_Scope:
+Pure value test - reads no memory, mutates nothing.
+@End Security_Scope
+
+Process called "check_operations_fusible" that takes op1 as Integer, op2 as Integer returns Integer:
+    Let op1_elementwise be 0
+    If op1 is greater than or equal to 0:
+        If op1 is less than or equal to 3:
+            Set op1_elementwise to 1
+        End If
+    End If
+
+    Let op2_elementwise be 0
+    If op2 is greater than or equal to 0:
+        If op2 is less than or equal to 3:
+            Set op2_elementwise to 1
+        End If
+    End If
+
+    If op1_elementwise is equal to 1:
+        If op2_elementwise is equal to 1:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Fusion is only legal when the two operands form a direct producer/consumer
+pair - src must feed dst through an actual edge. Without this check the
+fusion pass could collapse two ops that merely happen to be element-wise but
+operate on unrelated data, corrupting the graph. Scanning src's successor set
+is the cheapest correct test because get_node_successors already de-duplicates
+and dereferences edge destinations.
+@End Reasoning
+
+@Implementation:
+Null-guards graph, src, and dst. Computes src's unique successor node set via
+get_node_successors (which walks src's outgoing edge list and resolves each
+edge's destination). Linearly scans that set; if any successor equals dst a
+direct src->dst edge exists and 1 is returned. Returns 0 when no such edge is
+found or any input is null.
+@End Implementation
+
+@Performance_Hints:
+O(out-degree(src)). Out-degree is typically small (1..4) in Bifrost graphs,
+so this is effectively constant. get_node_successors allocates a fresh list;
+the scan over it is linear.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of graph adjacency state. The successor list is a fresh allocation
+owned locally; no graph mutation occurs.
+@End Security_Scope
+
+Process called "check_edge_exists" that takes graph as Integer, src as Integer, dst as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 0
+    End If
+    If dst is equal to 0:
+        Return 0
+    End If
+
+    Let successors be get_node_successors(graph, src)
+    Let succ_count be List.length(successors)
+    Let i be 0
+    While i is less than succ_count:
+        Let succ be List.get(successors, i)
+        If succ is equal to dst:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+When two nodes fuse into a composite, the composite's inputs must be the union
+of both originals' inputs MINUS the producer reference that node2 carried for
+node1's output (that intermediate value is now internal to the fused kernel
+and no longer an external input). Building a fresh list rather than mutating
+either source preserves the originals for the rest of the fusion bookkeeping.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh result List. If inputs1 is non-null, copies every element
+in order. If inputs2 is non-null, copies each element except those equal to
+exclude_node (the producer reference being absorbed). Both lists are
+independently null-guarded so a null input list contributes nothing. Returns
+the new list pointer.
+@End Implementation
+
+@Performance_Hints:
+O(len(inputs1) + len(inputs2)). One fresh List allocation plus appends; the
+exclude comparison is a single integer compare per element of inputs2.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates and returns a new List owned by the caller. Element values are
+copied by reference (borrowed); the source lists are not mutated.
+@End Security_Scope
+
+Process called "merge_input_lists" that takes inputs1 as Integer, inputs2 as Integer, exclude_node as Integer returns Integer:
+    Let result be List.create()
+
+    If inputs1 is not equal to 0:
+        Let count1 be List.length(inputs1)
+        Let i be 0
+        While i is less than count1:
+            Let item be List.get(inputs1, i)
+            List.append(result, item)
+            Set i to i plus 1
+        End While
+    End If
+
+    If inputs2 is not equal to 0:
+        Let count2 be List.length(inputs2)
+        Let j be 0
+        While j is less than count2:
+            Let item2 be List.get(inputs2, j)
+            If item2 is not equal to exclude_node:
+                List.append(result, item2)
+            End If
+            Set j to j plus 1
+        End While
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+After fusion the composite node takes node1's place in the graph for all
+upstream traffic, so every edge that fed node1 must now terminate at the
+composite. Repointing the existing edge objects (rather than rebuilding the
+adjacency) keeps the edge_id_map and the rest of the graph's bookkeeping
+intact while atomically transferring node1's fan-in.
+@End Reasoning
+
+@Implementation:
+Null-guards graph, old_node, and new_node. Fetches old_node's incoming edge
+list directly from the node_inputs adjacency Dict (graph offset 24) via
+get_node_inputs. For each incoming edge, calls set_edge_dest to repoint its
+destination from old_node to new_node. Returns 1 unconditionally on success
+(including the vacuous case of zero incoming edges).
+@End Implementation
+
+@Performance_Hints:
+O(in-degree(old_node)). Each edge is touched once; set_edge_dest is O(1).
+@End Performance_Hints
+
+@Security_Scope:
+Mutates edge objects in place (their destination field). The graph's
+node_inputs/node_outputs adjacency for new_node is the caller's
+responsibility to reconcile; this routine only rewrites edge endpoints.
+@End Security_Scope
+
+Process called "redirect_incoming_edges" that takes graph as Integer, old_node as Integer, new_node as Integer returns Integer:
+    If graph is equal to 0:
+        Return 1
+    End If
+    If old_node is equal to 0:
+        Return 1
+    End If
+    If new_node is equal to 0:
+        Return 1
+    End If
+
+    Let incoming_edges be get_node_inputs(graph, old_node)
+    Let edge_count be List.length(incoming_edges)
+    Let i be 0
+    While i is less than edge_count:
+        Let edge be List.get(incoming_edges, i)
+        If edge is not equal to 0:
+            set_edge_dest(edge, new_node)
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Symmetric to redirect_incoming_edges: after fusion the composite must emit
+everything node2 emitted, so every edge leaving node2 has to originate from
+the composite instead. Rewriting the edge source in place transfers node2's
+fan-out without disturbing downstream consumers' input lists.
+@End Reasoning
+
+@Implementation:
+Null-guards graph, old_node, and new_node. Fetches old_node's outgoing edge
+list from the node_outputs adjacency Dict (graph offset 32) via
+get_node_outputs. For each outgoing edge, calls set_edge_source to repoint its
+source from old_node to new_node. Returns 1 on success (including the vacuous
+zero-edge case).
+@End Implementation
+
+@Performance_Hints:
+O(out-degree(old_node)). Each edge touched once; set_edge_source is O(1).
+@End Performance_Hints
+
+@Security_Scope:
+Mutates edge objects in place (their source field). Adjacency reconciliation
+for new_node is the caller's responsibility.
+@End Security_Scope
+
+Process called "redirect_outgoing_edges" that takes graph as Integer, old_node as Integer, new_node as Integer returns Integer:
+    If graph is equal to 0:
+        Return 1
+    End If
+    If old_node is equal to 0:
+        Return 1
+    End If
+    If new_node is equal to 0:
+        Return 1
+    End If
+
+    Let outgoing_edges be get_node_outputs(graph, old_node)
+    Let edge_count be List.length(outgoing_edges)
+    Let i be 0
+    While i is less than edge_count:
+        Let edge be List.get(outgoing_edges, i)
+        If edge is not equal to 0:
+            set_edge_source(edge, new_node)
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Only composite operations that the split_node switch knows how to lower into
+primitive sequences are decomposable. Gating on this set prevents split_node
+from attempting to decompose primitive or unsupported ops (which would either
+no-op or, worse, emit malformed primitive chains). The decomposable set must
+stay in lockstep with split_node's dispatch arms.
+@End Reasoning
+
+@Implementation:
+split_node dispatches on exactly two composite op kinds: FullyConnected (the
+op-kind value 42 the file matches, lowered to MatrixMultiply + Add) and
+BatchNorm (op-kind value 38, lowered to Subtract, Divide, Multiply, Add).
+Returns 1 (true) when op_kind is 42 or 38, 0 (false) for every other op kind.
+This mirrors split_node's `If op_kind is equal to 42` / `is equal to 38` arms
+exactly so the gate never admits an op the switch cannot handle.
+@End Implementation
+
+@Performance_Hints:
+O(1) - two integer comparisons.
+@End Performance_Hints
+
+@Security_Scope:
+Pure value test; no memory access, no mutation.
+@End Security_Scope
+
+Process called "check_operation_decomposable" that takes op_kind as Integer returns Integer:
+    If op_kind is equal to 42:
+        Return 1
+    End If
+    If op_kind is equal to 38:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Locality-aware scheduling picks, among the currently-ready nodes, the one
+whose producers were most recently scheduled (and are therefore still resident
+in cache). Scoring a candidate by how many of its predecessors live in the hot
+window approximates "this node reuses freshly-produced data", which is exactly
+what minimises memory traffic on cache-backed targets. Earliest-position
+tie-breaking keeps the schedule deterministic and stable.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately if the ready_queue is empty. Iterates the ready_queue in
+order; for each candidate, computes its predecessor set via
+get_node_predecessors and counts how many of those predecessors appear in the
+hot_nodes window (a linear membership scan). Tracks the highest score seen and
+the candidate that achieved it; because the iteration runs front-to-back and a
+new best is adopted only on a STRICTLY greater score, the earliest-positioned
+candidate wins ties. Returns the best candidate node pointer.
+@End Implementation
+
+@Performance_Hints:
+O(|ready_queue| * (in-degree + |hot_nodes|)). hot_nodes is bounded by the
+cache window constant (8), and in-degree is small, so this is effectively
+linear in the ready-queue size per scheduling step.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of graph adjacency and the two caller-owned lists. Allocates a fresh
+predecessor list per candidate (owned locally); no mutation of inputs.
+@End Security_Scope
+
+Process called "select_best_node_for_locality" that takes ready_queue as Integer, hot_nodes as Integer, graph as Integer returns Integer:
+    Let queue_count be List.length(ready_queue)
+    If queue_count is equal to 0:
+        Return 0
+    End If
+
+    Let best_node be List.get(ready_queue, 0)
+    Let best_score be -1
+
+    Let i be 0
+    While i is less than queue_count:
+        Let candidate be List.get(ready_queue, i)
+
+        Note: Score = number of predecessors that are still in the hot window
+        Let score be 0
+        Let preds be get_node_predecessors(graph, candidate)
+        Let pred_count be List.length(preds)
+        Let p be 0
+        While p is less than pred_count:
+            Let pred be List.get(preds, p)
+            Let hot_count be List.length(hot_nodes)
+            Let h be 0
+            While h is less than hot_count:
+                Let hot be List.get(hot_nodes, h)
+                If hot is equal to pred:
+                    Set score to score plus 1
+                End If
+                Set h to h plus 1
+            End While
+            Set p to p plus 1
+        End While
+
+        If score is greater than best_score:
+            Set best_score to score
+            Set best_node to candidate
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return best_node
+End Process
+
+@Reasoning:
+Graph partitioning for multi-device execution minimises cross-device data
+transfer. The edge-cut cost of placing a node in a given partition is the
+number of its already-assigned neighbours that sit in a DIFFERENT partition -
+each such neighbour represents an edge that would cross the device boundary.
+Counting both predecessors and successors captures cuts in either direction.
+Unassigned neighbours contribute nothing because their placement is still
+undecided.
+@End Reasoning
+
+@Implementation:
+Initialises cost to 0. Builds the node's neighbour set by walking its
+predecessors (get_node_predecessors) and successors (get_node_successors). For
+each neighbour, checks node_to_partition for an existing assignment via
+Dict.contains; if assigned and the assigned partition is not equal to the
+candidate partition, increments cost. Neighbours absent from the Dict (not yet
+placed) are skipped. Returns the accumulated integer edge-cut cost.
+@End Implementation
+
+@Performance_Hints:
+O(degree(node)) Dict lookups, each O(1) hashed. Called k times per node in the
+greedy assignment loop, giving O(V * k * degree) overall for the partitioner.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of graph adjacency and the node_to_partition Dict. Allocates fresh
+predecessor/successor lists owned locally; no mutation.
+@End Security_Scope
+
+Process called "compute_edge_cut_cost" that takes graph as Integer, node as Integer, partition as Integer, node_to_partition as Integer returns Integer:
+    Let cost be 0
+
+    Let preds be get_node_predecessors(graph, node)
+    Let pred_count be List.length(preds)
+    Let i be 0
+    While i is less than pred_count:
+        Let pred be List.get(preds, i)
+        If Dict.contains(node_to_partition, pred):
+            Let pred_partition be Dict.get(node_to_partition, pred)
+            If pred_partition is not equal to partition:
+                Set cost to cost plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let succs be get_node_successors(graph, node)
+    Let succ_count be List.length(succs)
+    Let j be 0
+    While j is less than succ_count:
+        Let succ be List.get(succs, j)
+        If Dict.contains(node_to_partition, succ):
+            Let succ_partition be Dict.get(node_to_partition, succ)
+            If succ_partition is not equal to partition:
+                Set cost to cost plus 1
+            End If
+        End If
+        Set j to j plus 1
+    End While
+
+    Return cost
+End Process
+
+@Reasoning:
+The List primitive offers index-based removal (remove_at) but no
+remove-by-value, yet the scheduler needs to pull a specific node out of the
+ready_queue once it is scheduled. Looking up the value's index first and then
+deleting at that index is the canonical composition of the two primitives,
+matching how the rest of this module removes values from lists.
+@End Reasoning
+
+@Implementation:
+Finds the index of value within list via List.list_index_of (which returns -1
+when the value is absent). If the returned index is >= 0 the element exists, so
+List.remove_at deletes it at that position. Removes only the first occurrence,
+which is sufficient because ready_queue holds each node at most once. Returns 1
+unconditionally (a no-op when the value is not present).
+@End Implementation
+
+@Performance_Hints:
+O(n) for the index search plus O(n) for the shift on removal, where n is the
+list length. Acceptable for the small ready_queue sizes seen in scheduling.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the list in place (removes one element). Borrows the value for
+comparison only; does not free the removed element's storage.
+@End Security_Scope
+
+Process called "remove_from_list" that takes list as Integer, value as Integer returns Integer:
+    Let index be List.list_index_of(list, value)
+    If index is greater than or equal to 0:
+        List.remove_at(list, index)
+    End If
+    Return 1
+End Process
+
 @Reasoning:
 Node fusion is the most important Bifrost optimisation - it collapses
 element-wise producer/consumer pairs into a single composite kernel,
@@ -3140,7 +3837,7 @@ Process called "fuse_nodes" that takes
     )
 
     Note: Allocate composite node
-    Let composite be Layout.memory_allocate(48)
+    Let composite be Layout.allocate(48)
     Layout.memory_set_int64(composite, 0, 3)
     Layout.memory_set_int64(composite, 8, op1)
     Layout.memory_set_int64(composite, 16, composite_inputs)
@@ -3235,6 +3932,9 @@ Process called "split_node" that takes graph as Integer, node as Integer returns
     Note: Perform decomposition based on operation
     Let decomposed be List.create()
 
+    Note: Decomposed primitives inherit the original node's parallelism (offset 32)
+    Let node_parallelism be Layout.memory_get_int64(node, 32)
+
     Note: FullyConnected decomposition: y = Wx + b
     If op_kind is equal to 42:
         Note: Extract inputs: weights (W), input (x), bias (b)
@@ -3243,7 +3943,7 @@ Process called "split_node" that takes graph as Integer, node as Integer returns
 
         Note: Create MatrixMultiply node: Wx
         Let matmul_node be create_operation_node(
-            15, inputs, output_type
+            15, inputs, output_type, node_parallelism
         )
         List.append(decomposed, matmul_node)
 
@@ -3251,7 +3951,7 @@ Process called "split_node" that takes graph as Integer, node as Integer returns
         Let matmul_output_list be List.create()
         List.append(matmul_output_list, matmul_node)
         Let add_node be create_operation_node(
-            0, matmul_output_list, output_type
+            0, matmul_output_list, output_type, node_parallelism
         )
         List.append(decomposed, add_node)
 
@@ -3264,25 +3964,25 @@ Process called "split_node" that takes graph as Integer, node as Integer returns
         Set output_type to Layout.memory_get_int64(node, 24)
 
         Note: Create Subtract node: x - mean
-        Let sub_node be create_operation_node(1, inputs, output_type)
+        Let sub_node be create_operation_node(1, inputs, output_type, node_parallelism)
         List.append(decomposed, sub_node)
 
         Note: Create Divide node: (x - mean) / sqrt(var + eps)
         Let sub_output be List.create()
         List.append(sub_output, sub_node)
-        Let div_node be create_operation_node(3, sub_output, output_type)
+        Let div_node be create_operation_node(3, sub_output, output_type, node_parallelism)
         List.append(decomposed, div_node)
 
         Note: Create Multiply node: normalized * gamma
         Let div_output be List.create()
         List.append(div_output, div_node)
-        Let mul_node be create_operation_node(2, div_output, output_type)
+        Let mul_node be create_operation_node(2, div_output, output_type, node_parallelism)
         List.append(decomposed, mul_node)
 
         Note: Create Add node: (normalized * gamma) + beta
         Let mul_output be List.create()
         List.append(mul_output, mul_node)
-        Set add_node to create_operation_node(0, mul_output, output_type)
+        Set add_node to create_operation_node(0, mul_output, output_type, node_parallelism)
         List.append(decomposed, add_node)
 
         Return decomposed
@@ -3378,7 +4078,7 @@ Process called "reorder_for_locality" that takes graph as Integer returns Intege
         End If
 
         Note: Remove from ready queue
-        let_remove_from_list(ready_queue, best_node)
+        remove_from_list(ready_queue, best_node)
 
         Note: Update successors and add newly ready nodes
         Let successors be get_node_successors(graph, best_node)
@@ -3550,8 +4250,8 @@ re-parsing the body.
 
 @Implementation:
 Returns "[NULL GRAPH]" for null graph. Builds the header string with
-"BifrostGraph {" then "  Nodes: <n>" and "  Edges: <m>" via String.concatenate
-of String.from_int(get_node_count) / get_edge_count. Walks the nodes list
+"BifrostGraph {" then "  Nodes: <n>" and "  Edges: <m>" via StringPrim.string_concat
+of StringPrim.integer_to_string(get_node_count) / get_edge_count. Walks the nodes list
 appending each node's description, then walks the edges list appending each
 edge's description (using edge_to_string).
 @End Implementation
@@ -3579,39 +4279,39 @@ Process called "graph_to_string" that takes graph as Integer returns String:
     Let node_count be get_node_count(graph)
     Let edge_count be get_edge_count(graph)
 
-    Set result to String.concatenate(result, "  Nodes: ")
-    Set result to String.concatenate(result, String.from_int(node_count))
-    Set result to String.concatenate(result, "\n  Edges: ")
-    Set result to String.concatenate(result, String.from_int(edge_count))
-    Set result to String.concatenate(result, "\n")
+    Set result to StringPrim.string_concat(result, "  Nodes: ")
+    Set result to StringPrim.string_concat(result, StringPrim.integer_to_string(node_count))
+    Set result to StringPrim.string_concat(result, "\n  Edges: ")
+    Set result to StringPrim.string_concat(result, StringPrim.integer_to_string(edge_count))
+    Set result to StringPrim.string_concat(result, "\n")
 
     Note: List all nodes
-    Set result to String.concatenate(result, "  Nodes:\n")
+    Set result to StringPrim.string_concat(result, "  Nodes:\n")
     Let nodes be Layout.memory_get_int64(graph, 8)
     Let i be 0
     While i is less than node_count:
         Let node be List.get(nodes, i)
         Let node_str be node_to_string(node)
-        Set result to String.concatenate(result, "    ")
-        Set result to String.concatenate(result, node_str)
-        Set result to String.concatenate(result, "\n")
+        Set result to StringPrim.string_concat(result, "    ")
+        Set result to StringPrim.string_concat(result, node_str)
+        Set result to StringPrim.string_concat(result, "\n")
         Set i to i plus 1
     End While
 
     Note: List all edges
-    Set result to String.concatenate(result, "  Edges:\n")
+    Set result to StringPrim.string_concat(result, "  Edges:\n")
     Let edges be Layout.memory_get_int64(graph, 16)
     Let j be 0
     While j is less than edge_count:
         Let edge be List.get(edges, j)
         Let edge_str be edge_to_string(edge)
-        Set result to String.concatenate(result, "    ")
-        Set result to String.concatenate(result, edge_str)
-        Set result to String.concatenate(result, "\n")
+        Set result to StringPrim.string_concat(result, "    ")
+        Set result to StringPrim.string_concat(result, edge_str)
+        Set result to StringPrim.string_concat(result, "\n")
         Set j to j plus 1
     End While
 
-    Set result to String.concatenate(result, "}")
+    Set result to StringPrim.string_concat(result, "}")
     Return result
 End Process
 

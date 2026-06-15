@@ -122,7 +122,7 @@ owned by the builder - lifetime ends when the builder is freed.
 
 Process called "create_builder" that takes mir_function as Integer returns Integer:
     Note: Allocate 40 bytes for BifrostBuilder on OWNED HEAP
-    Let builder be proc memory_allocate from Layout with 40
+    Let builder be proc allocate from Layout with 40
 
     Note: Set discriminant to 0 (struct type)
     proc memory_set_int64 from Layout with builder, 0, 0
@@ -197,6 +197,2439 @@ Process called "set_current_graph" that takes builder as Integer, graph as Integ
     End If
 
     proc memory_set_int64 from Layout with builder, 8, graph
+End Process
+
+Note: ═══════════════════════════════════════════════════════════════════════════
+Note: Internal Helpers - MIR Structural Analysis and Type/Instruction Lowering
+Note: ═══════════════════════════════════════════════════════════════════════════
+Note: These helpers are the structural primitives the pattern matchers and type
+Note: translators above are built on. They read the MIR model directly through the
+Note: same Layout offset convention the rest of this file uses:
+Note:   MIRNode (72 bytes): opcode@0, value_id@8, operand1@16, operand2@24,
+Note:                       operand3@32, type_info@40, next@48, parent_block@56,
+Note:                       metadata@64.
+Note: MIR is flat three-address SSA: there is no loop AST, so loop nesting is
+Note: recovered from backward control-transfer terminators (MIR_BRANCH 20301,
+Note: MIR_JUMP 20302, MIR_SWITCH 20306) appearing in the instruction sequence.
+Note: Each instruction sequence argument is a List of MIRNode pointers.
+Note: MIR opcode constants used below (from compiler/middle/gungnir/mir/mir.runa):
+Note:   MIR_ADD 20002, MIR_SUB 20003, MIR_MUL 20004, MIR_DIV 20005, MIR_MAX/MIN
+Note:   are expressed via comparison+select; MIR_LOAD 20200, MIR_STORE 20201,
+Note:   MIR_LOAD_FIELD 20203, MIR_BRANCH 20301, MIR_JUMP 20302, MIR_RETURN 20303,
+Note:   MIR_CALL 20304, MIR_CALL_INDIRECT 20305, MIR_SWITCH 20306,
+Note:   MIR_VECTOR_BROADCAST 20615, MIR_VECTOR_REDUCE_ADD 20616.
+
+@Reasoning:
+count_nested_loops recovers the loop-nesting depth of a flat MIR instruction
+sequence. Because MIR is three-address SSA with no structured loop nodes, each
+loop is realised as a backward control transfer (a conditional branch or
+unconditional jump closing the loop back to its header). Counting those
+control-transfer terminators yields the number of loop levels present in the
+sequence, which the matrix-multiply and convolution recognisers use to gate on
+loop depth.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Walks the List of MIRNode pointers, reading each
+node's opcode at offset 0, and increments the count for every MIR_BRANCH
+(20301), MIR_JUMP (20302), or MIR_SWITCH (20306) - the three opcodes that close
+or redirect a loop body. Returns the accumulated count.
+@End Implementation
+
+@Performance_Hints:
+O(n) over the instruction sequence with a single integer load and up to three
+compares per instruction. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read over the MIR instruction list; no mutation, no allocation, no
+syscalls. Returns 0 on null input so callers gate safely.
+@End Security_Scope
+
+Process called "count_nested_loops" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let count be 0
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set count to count plus 1
+            End If
+            If opcode is equal to 20302:
+                Set count to count plus 1
+            End If
+            If opcode is equal to 20306:
+                Set count to count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return count
+End Process
+
+@Reasoning:
+check_triple_nested_loops gates matrix-multiply recognition on the canonical
+three-loop GEMM structure (i, j, k). It delegates loop counting to
+count_nested_loops and confirms at least three loop levels are present.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Computes the loop count via count_nested_loops
+and returns 1 when the count is greater than or equal to 3, 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) - one pass via count_nested_loops plus one compare.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 on null or shallow nesting forces literal lowering.
+@End Security_Scope
+
+Process called "check_triple_nested_loops" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is greater than or equal to 3:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_multiply_accumulate_pattern recognises the fused multiply-add core
+(acc = acc + a*b) that defines matrix multiply, dot product, and convolution
+inner loops. The signature in three-address SSA is a MIR_MUL instruction whose
+result value-id is consumed as an operand of a later MIR_ADD instruction.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Walks the sequence; for each MIR_MUL (20004)
+node it records the produced value-id (offset 8). Then it scans for a MIR_ADD
+(20002) node whose operand1/operand2/operand3 (offsets 16/24/32) equals a
+recorded MUL value-id. Returns 1 on the first such add-consumes-mul match, 0 if
+none is found.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case (mul scan times add scan) but n is the innermost-loop body
+length, typically a handful of instructions. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read over MIR; conservative 0 when no multiply-accumulate chain is found.
+@End Security_Scope
+
+Process called "check_multiply_accumulate_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let mul_node be proc get from List with mir_instr_seq, i
+        If mul_node is not equal to 0:
+            Let mul_op be proc memory_get_int64 from Layout with mul_node, 0
+            If mul_op is equal to 20004:
+                Let mul_value be proc memory_get_int64 from Layout with mul_node, 8
+                If mul_value is not equal to 0:
+                    Let j be 0
+                    While j is less than n:
+                        Let add_node be proc get from List with mir_instr_seq, j
+                        If add_node is not equal to 0:
+                            Let add_op be proc memory_get_int64 from Layout with add_node, 0
+                            If add_op is equal to 20002:
+                                Let a1 be proc memory_get_int64 from Layout with add_node, 16
+                                Let a2 be proc memory_get_int64 from Layout with add_node, 24
+                                Let a3 be proc memory_get_int64 from Layout with add_node, 32
+                                If a1 is equal to mul_value:
+                                    Return 1
+                                End If
+                                If a2 is equal to mul_value:
+                                    Return 1
+                                End If
+                                If a3 is equal to mul_value:
+                                    Return 1
+                                End If
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_matrix_indexing_pattern confirms the two-input indexed-load shape of GEMM:
+two distinct memory loads (A[i][k] and B[k][j]) feeding the multiply, which
+distinguishes a true matrix product from a scalar accumulate. It requires at
+least two load-class instructions (MIR_LOAD 20200 or MIR_LOAD_FIELD 20203) whose
+results feed a MIR_MUL.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Scans for a MIR_MUL (20004) node, then counts how
+many of its operand value-ids (offsets 16/24/32) are produced by a load-class
+instruction (MIR_LOAD 20200 or MIR_LOAD_FIELD 20203) elsewhere in the sequence.
+Returns 1 when at least two of the multiply's operands are load-produced, 0
+otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) over the (short) inner-loop body; one operand-to-producer scan per
+multiply operand. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the indexed two-load shape is absent.
+@End Security_Scope
+
+Process called "check_matrix_indexing_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let mul_node be proc get from List with mir_instr_seq, i
+        If mul_node is not equal to 0:
+            Let mul_op be proc memory_get_int64 from Layout with mul_node, 0
+            If mul_op is equal to 20004:
+                Let op1 be proc memory_get_int64 from Layout with mul_node, 16
+                Let op2 be proc memory_get_int64 from Layout with mul_node, 24
+                Let load_feeds be 0
+
+                Let j be 0
+                While j is less than n:
+                    Let prod be proc get from List with mir_instr_seq, j
+                    If prod is not equal to 0:
+                        Let prod_op be proc memory_get_int64 from Layout with prod, 0
+                        Let prod_val be proc memory_get_int64 from Layout with prod, 8
+                        Let is_load be 0
+                        If prod_op is equal to 20200:
+                            Set is_load to 1
+                        End If
+                        If prod_op is equal to 20203:
+                            Set is_load to 1
+                        End If
+                        If is_load is equal to 1:
+                            If prod_val is not equal to 0:
+                                If prod_val is equal to op1:
+                                    Set load_feeds to load_feeds plus 1
+                                End If
+                                If prod_val is equal to op2:
+                                    Set load_feeds to load_feeds plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+
+                If load_feeds is greater than or equal to 2:
+                    Return 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+count_load_class_instructions and the sliding-window check below recognise
+convolution's distinctive access shape: many overlapping loads driven by loop
+induction. A sliding window appears in MIR as repeated load-class instructions
+under a loop nest, where the loaded addresses are computed from induction
+variables (ADD/MUL on indices). The presence of loop terminators plus multiple
+indexed loads is the conservative signature.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Confirms the sequence contains at least one loop
+terminator (MIR_BRANCH 20301 or MIR_JUMP 20302) and counts load-class
+instructions (MIR_LOAD 20200, MIR_LOAD_FIELD 20203). Returns 1 when there is at
+least one loop and at least two indexed loads (the overlapping window reads), 0
+otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass collecting loop and load counts. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the windowed-load shape is absent.
+@End Security_Scope
+
+Process called "check_sliding_window_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let loop_terms be 0
+    Let load_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20302:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20200:
+                Set load_count to load_count plus 1
+            End If
+            If opcode is equal to 20203:
+                Set load_count to load_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If loop_terms is greater than or equal to 1:
+        If load_count is greater than or equal to 2:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_kernel_multiply_accumulate verifies the convolution kernel core: a
+multiply-accumulate (like GEMM) where one multiply operand is a constant kernel
+weight loaded from memory. It reuses the multiply-accumulate recogniser and
+additionally requires that a constant (MIR_CONST 20001) or a load feed the
+multiply, which is what distinguishes a weighted kernel tap from a plain product.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires check_multiply_accumulate_pattern to
+hold, then scans for a MIR_MUL (20004) one of whose operands (offsets 16/24/32)
+is produced by a MIR_CONST (20001) or load-class instruction (MIR_LOAD 20200,
+MIR_LOAD_FIELD 20203) found elsewhere in the sequence - the kernel weight tap.
+Returns 1 when both conditions hold, 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) over the short kernel inner body. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the weighted-MAC shape is absent.
+@End Security_Scope
+
+Process called "check_kernel_multiply_accumulate" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let has_mac be check_multiply_accumulate_pattern(mir_instr_seq)
+    If has_mac is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let mul_node be proc get from List with mir_instr_seq, i
+        If mul_node is not equal to 0:
+            Let mul_op be proc memory_get_int64 from Layout with mul_node, 0
+            If mul_op is equal to 20004:
+                Let op1 be proc memory_get_int64 from Layout with mul_node, 16
+                Let op2 be proc memory_get_int64 from Layout with mul_node, 24
+
+                Let j be 0
+                While j is less than n:
+                    Let prod be proc get from List with mir_instr_seq, j
+                    If prod is not equal to 0:
+                        Let prod_op be proc memory_get_int64 from Layout with prod, 0
+                        Let prod_val be proc memory_get_int64 from Layout with prod, 8
+                        Let is_weight be 0
+                        If prod_op is equal to 20001:
+                            Set is_weight to 1
+                        End If
+                        If prod_op is equal to 20200:
+                            Set is_weight to 1
+                        End If
+                        If prod_op is equal to 20203:
+                            Set is_weight to 1
+                        End If
+                        If is_weight is equal to 1:
+                            If prod_val is not equal to 0:
+                                If prod_val is equal to op1:
+                                    Return 1
+                                End If
+                                If prod_val is equal to op2:
+                                    Return 1
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_reduction_loop_pattern recognises the single-accumulator reduction loop
+shape: one loop level whose body folds array elements into a running
+accumulator via a single associative binary op. The conservative signature is
+exactly one loop terminator plus at least one reduction-capable binary
+instruction in the body.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Counts loop terminators (MIR_BRANCH 20301,
+MIR_JUMP 20302) and reduction-capable binary ops (MIR_ADD 20002, MIR_MUL 20004,
+MIR_AND 20010, MIR_OR 20011, MIR_XOR 20012; min/max are realised as
+comparison MIR_LT 20102 / MIR_GT 20104 plus select but the comparison alone is
+the recognisable marker). Returns 1 when there is exactly one loop level and at
+least one reduction op, 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the single-accumulator loop shape is absent.
+@End Security_Scope
+
+Process called "check_reduction_loop_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let loop_terms be 0
+    Let reduce_ops be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20302:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20002:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20004:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20010:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20011:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20012:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20102:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+            If opcode is equal to 20104:
+                Set reduce_ops to reduce_ops plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If loop_terms is equal to 1:
+        If reduce_ops is greater than or equal to 1:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_accumulator_initialization verifies the reduction accumulator is seeded
+before the loop - a constant or copy that establishes the identity element
+(0 for sum, 1 for product). In SSA, this appears as a MIR_CONST (20001) or
+MIR_COPY (20008) instruction positioned before the first loop terminator.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Walks the sequence tracking whether a loop
+terminator (MIR_BRANCH 20301 / MIR_JUMP 20302) has been seen yet. Returns 1 the
+first time it sees a MIR_CONST (20001) or MIR_COPY (20008) that appears before
+any loop terminator (the pre-loop accumulator seed), 0 if no such pre-loop
+initialiser exists.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass with early exit on the first qualifying initialiser. No
+allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when no pre-loop accumulator seed is present.
+@End Security_Scope
+
+Process called "check_accumulator_initialization" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let seen_loop be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If seen_loop is equal to 0:
+                If opcode is equal to 20001:
+                    Return 1
+                End If
+                If opcode is equal to 20008:
+                    Return 1
+                End If
+            End If
+            If opcode is equal to 20301:
+                Set seen_loop to 1
+            End If
+            If opcode is equal to 20302:
+                Set seen_loop to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+detect_reduction_operation identifies which associative reduction operator
+folds the accumulator, returning the MIR opcode of that operator so callers can
+emit the matching OpKind.Reduce variant. Returning the opcode (non-zero) doubles
+as the boolean "a reduction op was found"; 0 means none was detected.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Scans the body for the first reduction-capable
+binary op and returns its MIR opcode: MIR_ADD (20002, sum), MIR_MUL (20004,
+product), MIR_AND/OR/XOR (20010/20011/20012, bitwise reductions), or
+MIR_LT/MIR_GT (20102/20104, min/max comparisons). Returns 0 when none is present.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass, early return on first reduction op. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; returns 0 (no reduction) when the body contains no fold operator.
+@End Security_Scope
+
+Process called "detect_reduction_operation" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20002:
+                Return 20002
+            End If
+            If opcode is equal to 20004:
+                Return 20004
+            End If
+            If opcode is equal to 20010:
+                Return 20010
+            End If
+            If opcode is equal to 20011:
+                Return 20011
+            End If
+            If opcode is equal to 20012:
+                Return 20012
+            End If
+            If opcode is equal to 20102:
+                Return 20102
+            End If
+            If opcode is equal to 20104:
+                Return 20104
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_scalar_broadcast_source confirms a broadcast has a single scalar producer
+- a value defined once and consumed across array positions. The scalar source
+in MIR is a value-producing non-memory instruction (constant, copy, or scalar
+arithmetic) whose result feeds a vector broadcast or repeated array stores.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Returns 1 when the sequence contains an explicit
+MIR_VECTOR_BROADCAST (20615), or, failing that, contains a MIR_CONST (20001) or
+MIR_COPY (20008) scalar producer whose value-id is consumed by two or more later
+instructions (a scalar fanned out across array elements). Returns 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case for the fan-out count; n is the (short) candidate body. No
+allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when no scalar broadcast source is present.
+@End Security_Scope
+
+Process called "check_scalar_broadcast_source" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20615:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than n:
+        Let src be proc get from List with mir_instr_seq, i
+        If src is not equal to 0:
+            Let src_op be proc memory_get_int64 from Layout with src, 0
+            Let is_scalar be 0
+            If src_op is equal to 20001:
+                Set is_scalar to 1
+            End If
+            If src_op is equal to 20008:
+                Set is_scalar to 1
+            End If
+            If is_scalar is equal to 1:
+                Let src_val be proc memory_get_int64 from Layout with src, 8
+                If src_val is not equal to 0:
+                    Let uses be 0
+                    Let j be 0
+                    While j is less than n:
+                        Let consumer be proc get from List with mir_instr_seq, j
+                        If consumer is not equal to 0:
+                            Let c1 be proc memory_get_int64 from Layout with consumer, 16
+                            Let c2 be proc memory_get_int64 from Layout with consumer, 24
+                            Let c3 be proc memory_get_int64 from Layout with consumer, 32
+                            If c1 is equal to src_val:
+                                Set uses to uses plus 1
+                            End If
+                            If c2 is equal to src_val:
+                                Set uses to uses plus 1
+                            End If
+                            If c3 is equal to src_val:
+                                Set uses to uses plus 1
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+                    If uses is greater than or equal to 2:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_broadcast_replication_pattern confirms the broadcast actually writes the
+scalar across multiple array positions - either via an explicit
+MIR_VECTOR_BROADCAST or via a loop that stores the same value repeatedly. This
+is the write-side counterpart to check_scalar_broadcast_source.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Returns 1 when the sequence contains a
+MIR_VECTOR_BROADCAST (20615), or when it contains a loop terminator (MIR_BRANCH
+20301 / MIR_JUMP 20302) together with at least one store-class instruction
+(MIR_STORE 20201 / MIR_STORE_FIELD 20204) - a replication loop. Returns 0
+otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass collecting the broadcast/loop/store markers. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when no replication is present.
+@End Security_Scope
+
+Process called "check_broadcast_replication_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let loop_terms be 0
+    Let store_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20615:
+                Return 1
+            End If
+            If opcode is equal to 20301:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20302:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20201:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20204:
+                Set store_count to store_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If loop_terms is greater than or equal to 1:
+        If store_count is greater than or equal to 1:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_relu_pattern recognises ReLU = max(0, x). In MIR with no native max, this
+is a compare of x against zero (MIR_GT 20104 or MIR_LT 20102 against a
+MIR_CONST 20001 zero) followed by a select/branch that picks x or 0. The
+conservative marker is a comparison consuming a constant together with a
+branch in a short body.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Returns 1 when the sequence contains a constant
+(MIR_CONST 20001), a comparison against zero (MIR_GT 20104 or MIR_LT 20102), and
+a branch (MIR_BRANCH 20301) - the max(0,x) clamp shape - and contains no
+exponential/division marker that would indicate sigmoid/tanh/softmax. Returns 0
+otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the clamp shape is absent.
+@End Security_Scope
+
+Process called "check_relu_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_const be 0
+    Let has_cmp be 0
+    Let has_branch be 0
+    Let has_div be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20001:
+                Set has_const to 1
+            End If
+            If opcode is equal to 20104:
+                Set has_cmp to 1
+            End If
+            If opcode is equal to 20102:
+                Set has_cmp to 1
+            End If
+            If opcode is equal to 20301:
+                Set has_branch to 1
+            End If
+            If opcode is equal to 20005:
+                Set has_div to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_div is equal to 1:
+        Return 0
+    End If
+    If has_const is equal to 1:
+        If has_cmp is equal to 1:
+            If has_branch is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_sigmoid_pattern recognises sigmoid = 1 / (1 + exp(-x)). Its distinctive
+MIR markers are a transcendental exp call (a MIR_CALL 20304 to an exp intrinsic)
+combined with a division (MIR_DIV 20005) and an addition (MIR_ADD 20002) of a
+constant one - a single exp feeding a single reciprocal.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Counts call instructions (MIR_CALL 20304) and
+checks for the presence of a division (MIR_DIV 20005) and an addition
+(MIR_ADD 20002). Returns 1 when there is exactly one call (one exp) together
+with both a division and an addition; 0 otherwise. The single-call requirement
+distinguishes sigmoid from softmax, which sums many exp results.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the single-exp reciprocal shape is absent.
+@End Security_Scope
+
+Process called "check_sigmoid_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let call_count be 0
+    Let has_div be 0
+    Let has_add be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20304:
+                Set call_count to call_count plus 1
+            End If
+            If opcode is equal to 20005:
+                Set has_div to 1
+            End If
+            If opcode is equal to 20002:
+                Set has_add to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If call_count is equal to 1:
+        If has_div is equal to 1:
+            If has_add is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_tanh_pattern recognises tanh activation. Its MIR marker is a single
+transcendental call (MIR_CALL 20304 to a tanh/exp intrinsic) combined with a
+subtraction and a division (the (e^x - e^-x)/(e^x + e^-x) form reduces to one
+call plus sub plus div), with no constant-one addition that would mark sigmoid.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Checks for a call (MIR_CALL 20304), a subtraction
+(MIR_SUB 20003), and a division (MIR_DIV 20005). Returns 1 when all three are
+present; 0 otherwise. The subtraction requirement distinguishes tanh from
+sigmoid (which uses an addition of one).
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the tanh shape is absent.
+@End Security_Scope
+
+Process called "check_tanh_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_call be 0
+    Let has_sub be 0
+    Let has_div be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20304:
+                Set has_call to 1
+            End If
+            If opcode is equal to 20003:
+                Set has_sub to 1
+            End If
+            If opcode is equal to 20005:
+                Set has_div to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_call is equal to 1:
+        If has_sub is equal to 1:
+            If has_div is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_softmax_pattern recognises softmax = exp(x_i) / sum_j(exp(x_j)). Its
+distinctive MIR markers are multiple exponential calls (or one exp call inside a
+loop) feeding an accumulating sum, followed by a division of each exp by that
+sum - so the signature is a loop plus a call plus an accumulating add plus a
+division.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Detects a loop terminator (MIR_BRANCH 20301 /
+MIR_JUMP 20302), at least one call (MIR_CALL 20304, the exp), an addition
+(MIR_ADD 20002, the running sum) and a division (MIR_DIV 20005, the
+normalisation). Returns 1 when all four markers are present; 0 otherwise. The
+loop-plus-sum requirement distinguishes softmax from the single-element sigmoid.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the normalised-exponential shape is absent.
+@End Security_Scope
+
+Process called "check_softmax_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_loop be 0
+    Let has_call be 0
+    Let has_add be 0
+    Let has_div be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20302:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20304:
+                Set has_call to 1
+            End If
+            If opcode is equal to 20002:
+                Set has_add to 1
+            End If
+            If opcode is equal to 20005:
+                Set has_div to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_loop is equal to 1:
+        If has_call is equal to 1:
+            If has_add is equal to 1:
+                If has_div is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_dot_product_pattern recognises dot = sum_i(a[i] * b[i]). It is the
+one-loop specialisation of multiply-accumulate over two indexed arrays, so it
+requires exactly one loop level, a multiply-accumulate chain, and two
+load-produced multiply operands.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires count_nested_loops to equal 1, then
+requires check_multiply_accumulate_pattern and check_matrix_indexing_pattern
+(two load-fed multiply operands) to both hold. Returns 1 only when all three
+conditions are satisfied; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) dominated by the multiply-accumulate scan over a short loop body.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the single-loop two-array MAC shape is absent.
+@End Security_Scope
+
+Process called "check_dot_product_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is not equal to 1:
+        Return 0
+    End If
+
+    Let has_mac be check_multiply_accumulate_pattern(mir_instr_seq)
+    If has_mac is equal to 0:
+        Return 0
+    End If
+
+    Let has_indexing be check_matrix_indexing_pattern(mir_instr_seq)
+    If has_indexing is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+check_cross_product_pattern recognises the 3D vector cross product, which has a
+fixed straight-line shape (no loop): six multiplies and three subtractions
+computing (a2*b3-a3*b2, a3*b1-a1*b3, a1*b2-a2*b1). The conservative marker is a
+loop-free body with at least six multiplies and three subtractions.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Counts loop terminators, multiplies (MIR_MUL
+20004), and subtractions (MIR_SUB 20003). Returns 1 when there are no loop
+terminators and at least six multiplies and at least three subtractions; 0
+otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the fixed cross-product shape is absent.
+@End Security_Scope
+
+Process called "check_cross_product_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let loop_terms be 0
+    Let mul_count be 0
+    Let sub_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20302:
+                Set loop_terms to loop_terms plus 1
+            End If
+            If opcode is equal to 20004:
+                Set mul_count to mul_count plus 1
+            End If
+            If opcode is equal to 20003:
+                Set sub_count to sub_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If loop_terms is equal to 0:
+        If mul_count is greater than or equal to 6:
+            If sub_count is greater than or equal to 3:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_norm_pattern recognises a vector norm = sqrt(sum(x^2)). Its markers are a
+reduction loop accumulating squares (a self-multiply x*x feeding an add) plus a
+square-root after the loop. The square root appears as a MIR_VECTOR_SQRT (20609)
+or a MIR_CALL (20304) to a sqrt intrinsic.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires check_reduction_loop_pattern (the
+sum-of-squares fold) to hold and additionally requires a square-root marker -
+MIR_VECTOR_SQRT (20609) or a call (MIR_CALL 20304) - somewhere in the sequence.
+Returns 1 when both hold; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) for the sqrt scan plus the reduction-loop check. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the sum-of-squares-then-sqrt shape is absent.
+@End Security_Scope
+
+Process called "check_norm_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let has_reduction be check_reduction_loop_pattern(mir_instr_seq)
+    If has_reduction is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_sqrt be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20609:
+                Set has_sqrt to 1
+            End If
+            If opcode is equal to 20304:
+                Set has_sqrt to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_sqrt is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_transpose_pattern recognises a matrix transpose: a doubly-nested loop that
+loads from [i][j] and stores to [j][i] with the index roles swapped. The
+conservative marker is two loop levels carrying both a load-class and a
+store-class instruction (a pure index-permuting copy with no arithmetic).
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires count_nested_loops to equal 2, at least
+one load-class instruction (MIR_LOAD 20200 / MIR_LOAD_FIELD 20203), at least one
+store-class instruction (MIR_STORE 20201 / MIR_STORE_FIELD 20204), and no
+multiply or add arithmetic in the body (transpose only permutes, it does not
+compute). Returns 1 when all conditions hold; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass plus the loop count. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the index-swap copy shape is absent.
+@End Security_Scope
+
+Process called "check_transpose_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is not equal to 2:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let load_count be 0
+    Let store_count be 0
+    Let arith_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20200:
+                Set load_count to load_count plus 1
+            End If
+            If opcode is equal to 20203:
+                Set load_count to load_count plus 1
+            End If
+            If opcode is equal to 20201:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20204:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20004:
+                Set arith_count to arith_count plus 1
+            End If
+            If opcode is equal to 20002:
+                Set arith_count to arith_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If load_count is greater than or equal to 1:
+        If store_count is greater than or equal to 1:
+            If arith_count is equal to 0:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_fft_pattern recognises the FFT butterfly: a loop body that combines two
+inputs with a complex twiddle multiply and an add/sub pair (the butterfly), with
+the characteristic both-add-and-subtract of the same operands. The conservative
+marker is a loop carrying at least one multiply plus both an add and a subtract.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires a loop terminator (MIR_BRANCH 20301 /
+MIR_JUMP 20302), at least one multiply (MIR_MUL 20004, the twiddle), an addition
+(MIR_ADD 20002) and a subtraction (MIR_SUB 20003) - the butterfly's
+add/sub pair. Returns 1 when all four markers are present; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the butterfly shape is absent.
+@End Security_Scope
+
+Process called "check_fft_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_loop be 0
+    Let has_mul be 0
+    Let has_add be 0
+    Let has_sub be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20302:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20004:
+                Set has_mul to 1
+            End If
+            If opcode is equal to 20002:
+                Set has_add to 1
+            End If
+            If opcode is equal to 20003:
+                Set has_sub to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_loop is equal to 1:
+        If has_mul is equal to 1:
+            If has_add is equal to 1:
+                If has_sub is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_filter_pattern recognises FIR/IIR filters: a sliding dot product of input
+samples against filter coefficients - structurally a single-loop
+multiply-accumulate over a coefficient array loaded from memory. It is the
+filtering specialisation of the windowed MAC.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires exactly one loop level
+(count_nested_loops equals 1), a multiply-accumulate chain
+(check_multiply_accumulate_pattern), and at least one load-class instruction
+(MIR_LOAD 20200 / MIR_LOAD_FIELD 20203) supplying coefficients. Returns 1 when
+all hold; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) dominated by the multiply-accumulate scan over the short tap loop.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the tapped-MAC shape is absent.
+@End Security_Scope
+
+Process called "check_filter_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is not equal to 1:
+        Return 0
+    End If
+
+    Let has_mac be check_multiply_accumulate_pattern(mir_instr_seq)
+    If has_mac is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_load be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20200:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20203:
+                Set has_load to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_load is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_resample_pattern recognises resampling (up/down-sampling): a loop whose
+output index advances at a different rate than the input index, realised in MIR
+as an index scaling (a multiply or divide on the induction variable) feeding a
+load address inside a single loop. The conservative marker is a single loop
+containing both an index-scaling arithmetic (MIR_MUL or MIR_DIV) and a
+load-class instruction.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires exactly one loop level
+(count_nested_loops equals 1), the presence of an index-scaling op (MIR_MUL
+20004 or MIR_DIV 20005), and a load-class instruction (MIR_LOAD 20200 /
+MIR_LOAD_FIELD 20203). Returns 1 when all hold; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass plus the loop count. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the rate-changing-load shape is absent.
+@End Security_Scope
+
+Process called "check_resample_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is not equal to 1:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_scale be 0
+    Let has_load be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20004:
+                Set has_scale to 1
+            End If
+            If opcode is equal to 20005:
+                Set has_scale to 1
+            End If
+            If opcode is equal to 20200:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20203:
+                Set has_load to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_scale is equal to 1:
+        If has_load is equal to 1:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_tensor_contraction_pattern recognises an Einstein-summation contraction
+(generalised matmul): three or more loop levels accumulating products over one
+or more shared (contracted) indices. It generalises the matrix-multiply
+recogniser to higher rank, so it requires deep nesting plus a multiply-accumulate
+chain.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires at least three loop levels
+(count_nested_loops greater than or equal to 3) and a multiply-accumulate chain
+(check_multiply_accumulate_pattern). Returns 1 when both hold; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) dominated by the multiply-accumulate scan; the loop-count check
+short-circuits shallow nests first.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the deep-nest contraction shape is absent.
+@End Security_Scope
+
+Process called "check_tensor_contraction_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let loops be count_nested_loops(mir_instr_seq)
+    If loops is less than 3:
+        Return 0
+    End If
+
+    Let has_mac be check_multiply_accumulate_pattern(mir_instr_seq)
+    If has_mac is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+check_reshape_pattern recognises a tensor reshape: a pure copy that reinterprets
+element layout without arithmetic. In MIR a reshape is a sequence of loads and
+stores (or a single bitcast) with no arithmetic operators and no reduction -
+just a structured move of elements.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Returns 1 when the sequence contains a MIR_BITCAST
+(20401) reinterpretation, or contains load-class and store-class instructions
+(MIR_LOAD 20200 / MIR_LOAD_FIELD 20203 and MIR_STORE 20201 / MIR_STORE_FIELD
+20204) with no arithmetic ops (no MIR_ADD 20002, MIR_SUB 20003, MIR_MUL 20004,
+MIR_DIV 20005). Returns 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the arithmetic-free move shape is absent.
+@End Security_Scope
+
+Process called "check_reshape_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_load be 0
+    Let has_store be 0
+    Let has_arith be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20401:
+                Return 1
+            End If
+            If opcode is equal to 20200:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20203:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20201:
+                Set has_store to 1
+            End If
+            If opcode is equal to 20204:
+                Set has_store to 1
+            End If
+            If opcode is equal to 20002:
+                Set has_arith to 1
+            End If
+            If opcode is equal to 20003:
+                Set has_arith to 1
+            End If
+            If opcode is equal to 20004:
+                Set has_arith to 1
+            End If
+            If opcode is equal to 20005:
+                Set has_arith to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_arith is equal to 0:
+        If has_load is equal to 1:
+            If has_store is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_tensor_slice_pattern recognises a tensor slice/gather: a loop reading a
+sub-range of a tensor with a non-zero base offset added to the induction
+variable before the load. The conservative marker is a loop carrying an
+address-computing add (MIR_ADD) feeding a load, without the multiply-accumulate
+fold that would mark a contraction.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Requires a loop terminator (MIR_BRANCH 20301 /
+MIR_JUMP 20302), an addition (MIR_ADD 20002, the slice base-offset), and a
+load-class instruction (MIR_LOAD 20200 / MIR_LOAD_FIELD 20203), while rejecting
+sequences that contain a multiply-accumulate chain (so contractions do not match
+here). Returns 1 when the markers hold and no MAC is present; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case because of the multiply-accumulate exclusion check; n is short.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the offset-load slice shape is absent.
+@End Security_Scope
+
+Process called "check_tensor_slice_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let mac be check_multiply_accumulate_pattern(mir_instr_seq)
+    If mac is equal to 1:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let has_loop be 0
+    Let has_add be 0
+    Let has_load be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20302:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20002:
+                Set has_add to 1
+            End If
+            If opcode is equal to 20200:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20203:
+                Set has_load to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_loop is equal to 1:
+        If has_add is equal to 1:
+            If has_load is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_tensor_concat_pattern recognises tensor concatenation: two or more source
+regions copied into adjacent ranges of one destination, appearing in MIR as
+multiple store-class instructions writing the same destination base at different
+offsets, typically across more than one loop. The conservative marker is at
+least two store-class instructions together with at least one loop.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null sequence. Counts store-class instructions (MIR_STORE 20201
+/ MIR_STORE_FIELD 20204) and loop terminators (MIR_BRANCH 20301 / MIR_JUMP
+20302). Returns 1 when there are at least two stores and at least one loop (the
+multi-source copy into one buffer); 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the multi-store concat shape is absent.
+@End Security_Scope
+
+Process called "check_tensor_concat_pattern" that takes mir_instr_seq as Integer returns Integer:
+    If mir_instr_seq is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_instr_seq
+    Let store_count be 0
+    Let loop_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_instr_seq, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20201:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20204:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20301:
+                Set loop_count to loop_count plus 1
+            End If
+            If opcode is equal to 20302:
+                Set loop_count to loop_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If store_count is greater than or equal to 2:
+        If loop_count is greater than or equal to 1:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+analyze_loop_dependencies decides whether a loop carries cross-iteration
+dependencies that would make it unsafe to run iterations in parallel or to
+vectorise. The conservative test: a loop body has a loop-carried dependency when
+a value stored in one iteration is loaded back in a later iteration. In flat SSA
+this manifests as a store-class instruction followed by a load-class instruction
+within the same loop body, so the presence of both store and load inside a loop
+is treated as a potential carried dependency.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop instruction sequence (a List of MIRNode pointers for the loop
+body). Returns 0 for a null sequence. Walks the body counting store-class
+instructions (MIR_STORE 20201 / MIR_STORE_FIELD 20204) and load-class
+instructions (MIR_LOAD 20200 / MIR_LOAD_FIELD 20203). Returns 1 (has
+dependencies) when the body contains both at least one store and at least one
+load (a read-after-write hazard candidate); returns 0 (independent) when the
+body has no stores - a pure map has no carried dependency.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation. This is the conservative dependency test; it
+errs toward reporting dependencies, which only costs performance, never
+correctness.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 1 (dependent) is the safe default - it forces sequential
+lowering. A false 0 would be unsafe, so the test is intentionally conservative
+(any store plus any load is treated as dependent).
+@End Security_Scope
+
+Process called "analyze_loop_dependencies" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let store_count be 0
+    Let load_count be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_loop, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20201:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20204:
+                Set store_count to store_count plus 1
+            End If
+            If opcode is equal to 20200:
+                Set load_count to load_count plus 1
+            End If
+            If opcode is equal to 20203:
+                Set load_count to load_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If store_count is greater than or equal to 1:
+        If load_count is greater than or equal to 1:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_map_pattern recognises a map-style loop: each iteration applies the same
+computation to one input element and writes one output element, with no
+accumulator. The marker is a loop carrying balanced load and store activity and
+no reduction fold (no value carried across iterations).
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null. Requires a loop terminator
+(MIR_BRANCH 20301 / MIR_JUMP 20302), at least one load-class instruction
+(MIR_LOAD 20200 / MIR_LOAD_FIELD 20203), and at least one store-class
+instruction (MIR_STORE 20201 / MIR_STORE_FIELD 20204), while requiring that no
+multiply-accumulate fold is present (check_multiply_accumulate_pattern must be
+0). Returns 1 when the per-element load-compute-store shape holds; 0 otherwise.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case from the MAC-exclusion check; n is the short loop body.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative 0 when the per-element map shape is absent.
+@End Security_Scope
+
+Process called "check_map_pattern" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let mac be check_multiply_accumulate_pattern(mir_loop)
+    If mac is equal to 1:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let has_loop be 0
+    Let has_load be 0
+    Let has_store be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_loop, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20302:
+                Set has_loop to 1
+            End If
+            If opcode is equal to 20200:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20203:
+                Set has_load to 1
+            End If
+            If opcode is equal to 20201:
+                Set has_store to 1
+            End If
+            If opcode is equal to 20204:
+                Set has_store to 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If has_loop is equal to 1:
+        If has_load is equal to 1:
+            If has_store is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+check_elementwise_access verifies all array references use simple, affine
+induction-based addressing with no indirect (gather/scatter) indexing. Indirect
+indexing in MIR appears as a load whose address operand is itself produced by
+another load (a pointer chase). Absence of any load-feeding-a-load chain means
+the access is element-wise and safe to parallelise.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null. Builds the set of value-ids
+produced by load-class instructions, then checks every load-class instruction's
+address operand (operand1 at offset 16) - if any load's address operand is the
+value produced by another load, the access is indirect and the routine returns 0.
+Returns 1 when no load consumes another load's result as its address (purely
+element-wise). An empty/load-free body is element-wise and returns 1.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case for the producer cross-check; n is the short loop body. No
+allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 0 (indirect) on any pointer-chase is the safe default - it
+prevents parallel emission for gather/scatter loops that may alias.
+@End Security_Scope
+
+Process called "check_elementwise_access" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let i be 0
+    While i is less than n:
+        Let ld be proc get from List with mir_loop, i
+        If ld is not equal to 0:
+            Let ld_op be proc memory_get_int64 from Layout with ld, 0
+            Let is_load be 0
+            If ld_op is equal to 20200:
+                Set is_load to 1
+            End If
+            If ld_op is equal to 20203:
+                Set is_load to 1
+            End If
+            If is_load is equal to 1:
+                Let addr be proc memory_get_int64 from Layout with ld, 16
+                If addr is not equal to 0:
+                    Let j be 0
+                    While j is less than n:
+                        Let prod be proc get from List with mir_loop, j
+                        If prod is not equal to 0:
+                            Let prod_op be proc memory_get_int64 from Layout with prod, 0
+                            Let prod_is_load be 0
+                            If prod_op is equal to 20200:
+                                Set prod_is_load to 1
+                            End If
+                            If prod_op is equal to 20203:
+                                Set prod_is_load to 1
+                            End If
+                            If prod_is_load is equal to 1:
+                                Let prod_val be proc memory_get_int64 from Layout with prod, 8
+                                If prod_val is not equal to 0:
+                                    If prod_val is equal to addr:
+                                        Return 0
+                                    End If
+                                End If
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+check_loop_bounds_known verifies the loop has a statically determinable trip
+count, a precondition for vectorisation. A known bound appears in MIR as the
+loop's exit comparison testing the induction variable against a constant
+(MIR_CONST), as opposed to a data-dependent value. The marker is a comparison
+one of whose operands is produced by a MIR_CONST.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null. Builds awareness of which
+value-ids are produced by MIR_CONST (20001) instructions, then scans for a
+comparison (MIR_LT 20102, MIR_LE 20103, MIR_GT 20104, MIR_GE 20105, MIR_NE
+20101, MIR_EQ 20100) one of whose operands (offsets 16/24/32) is a constant
+value-id. Returns 1 on the first such constant-bounded comparison; 0 if the loop
+test is not against a constant.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case for the operand-producer cross-check; n is short. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 0 (unknown bounds) is the safe default - it disables
+vectorisation rather than risking an out-of-range vector remainder.
+@End Security_Scope
+
+Process called "check_loop_bounds_known" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let i be 0
+    While i is less than n:
+        Let cmp be proc get from List with mir_loop, i
+        If cmp is not equal to 0:
+            Let cmp_op be proc memory_get_int64 from Layout with cmp, 0
+            Let is_cmp be 0
+            If cmp_op is equal to 20100:
+                Set is_cmp to 1
+            End If
+            If cmp_op is equal to 20101:
+                Set is_cmp to 1
+            End If
+            If cmp_op is equal to 20102:
+                Set is_cmp to 1
+            End If
+            If cmp_op is equal to 20103:
+                Set is_cmp to 1
+            End If
+            If cmp_op is equal to 20104:
+                Set is_cmp to 1
+            End If
+            If cmp_op is equal to 20105:
+                Set is_cmp to 1
+            End If
+            If is_cmp is equal to 1:
+                Let b1 be proc memory_get_int64 from Layout with cmp, 16
+                Let b2 be proc memory_get_int64 from Layout with cmp, 24
+                Let j be 0
+                While j is less than n:
+                    Let prod be proc get from List with mir_loop, j
+                    If prod is not equal to 0:
+                        Let prod_op be proc memory_get_int64 from Layout with prod, 0
+                        If prod_op is equal to 20001:
+                            Let prod_val be proc memory_get_int64 from Layout with prod, 8
+                            If prod_val is not equal to 0:
+                                If prod_val is equal to b1:
+                                    Return 1
+                                End If
+                                If prod_val is equal to b2:
+                                    Return 1
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_contiguous_memory_access verifies array accesses stride by one element
+(unit stride), the layout vectorisation needs for packed loads/stores. A
+non-unit stride in MIR appears as a multiply on the induction variable before an
+address add (index*stride with stride != 1). The conservative marker for
+contiguity is the absence of a multiply feeding a load/store address.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null. Determines whether any
+multiply (MIR_MUL 20004) result is used as an operand of a load-class or
+store-class address. If a multiply feeds a memory address, the access may be
+strided and the routine returns 0; otherwise (no multiply feeding memory) it
+returns 1 (contiguous). A body with memory ops but no address-scaling multiply
+is treated as unit-stride.
+@End Implementation
+
+@Performance_Hints:
+O(n^2) worst case for the multiply-feeds-memory cross-check; n is short. No
+allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 0 (non-contiguous) is the safe default - it disables packed
+vector memory ops when stride cannot be proven unit.
+@End Security_Scope
+
+Process called "check_contiguous_memory_access" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let i be 0
+    While i is less than n:
+        Let mem be proc get from List with mir_loop, i
+        If mem is not equal to 0:
+            Let mem_op be proc memory_get_int64 from Layout with mem, 0
+            Let is_mem be 0
+            If mem_op is equal to 20200:
+                Set is_mem to 1
+            End If
+            If mem_op is equal to 20203:
+                Set is_mem to 1
+            End If
+            If mem_op is equal to 20201:
+                Set is_mem to 1
+            End If
+            If mem_op is equal to 20204:
+                Set is_mem to 1
+            End If
+            If is_mem is equal to 1:
+                Let addr be proc memory_get_int64 from Layout with mem, 16
+                If addr is not equal to 0:
+                    Let j be 0
+                    While j is less than n:
+                        Let prod be proc get from List with mir_loop, j
+                        If prod is not equal to 0:
+                            Let prod_op be proc memory_get_int64 from Layout with prod, 0
+                            If prod_op is equal to 20004:
+                                Let prod_val be proc memory_get_int64 from Layout with prod, 8
+                                If prod_val is not equal to 0:
+                                    If prod_val is equal to addr:
+                                        Return 0
+                                    End If
+                                End If
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+check_for_non_vectorizable_calls detects function calls in the loop body that
+are not vectorisable intrinsics and therefore block SIMD lowering. Any direct or
+indirect call (MIR_CALL / MIR_CALL_INDIRECT) is conservatively treated as
+non-vectorisable because the builder has no intrinsic whitelist at this layer.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null (no calls present in an empty
+body). Scans the body and returns 1 the first time it encounters a MIR_CALL
+(20304) or MIR_CALL_INDIRECT (20305); returns 0 if the body contains no calls.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass with early exit on the first call. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 1 (has non-vectorisable call) on any call is the safe
+default - it forces scalar lowering for loops that invoke opaque functions.
+@End Security_Scope
+
+Process called "check_for_non_vectorizable_calls" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_loop, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20304:
+                Return 1
+            End If
+            If opcode is equal to 20305:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+check_complex_control_flow detects branching inside the loop body beyond the
+single back-edge that closes the loop. Internal branches (if/else, early exits)
+create divergent control that inhibits straight-line vectorisation. More than one
+control-transfer terminator in the body indicates such complex control flow.
+@End Reasoning
+
+@Implementation:
+Takes a mir_loop body sequence. Returns 0 for null. Counts control-transfer
+terminators (MIR_BRANCH 20301, MIR_JUMP 20302, MIR_SWITCH 20306). The loop's own
+closing back-edge accounts for one; the routine returns 1 (complex control flow)
+when the count exceeds 1, and 0 when there is at most the single closing
+transfer.
+@End Implementation
+
+@Performance_Hints:
+O(n) single pass. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returning 1 (complex) when extra branches exist is the safe default -
+it disables vectorisation for divergent loops.
+@End Security_Scope
+
+Process called "check_complex_control_flow" that takes mir_loop as Integer returns Integer:
+    If mir_loop is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with mir_loop
+    Let transfers be 0
+    Let i be 0
+    While i is less than n:
+        Let node be proc get from List with mir_loop, i
+        If node is not equal to 0:
+            Let opcode be proc memory_get_int64 from Layout with node, 0
+            If opcode is equal to 20301:
+                Set transfers to transfers plus 1
+            End If
+            If opcode is equal to 20302:
+                Set transfers to transfers plus 1
+            End If
+            If opcode is equal to 20306:
+                Set transfers to transfers plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If transfers is greater than 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+get_exit_block returns the exit basic block of a MIR function so the top-level
+translator can lower the function's terminating return. The exit block is owned
+by the function's CFG, which the MIRFunction holds at field offset 8 (cfg) and
+the CFG holds its exit_block at field offset 8.
+@End Reasoning
+
+@Implementation:
+Returns 0 for a null function. Reads the CFG pointer from MIRFunction offset 8
+(the cfg field), returns 0 if the CFG is null, then reads and returns the
+exit_block pointer from MIRCFG offset 8 (the exit_block field). These offsets
+match the MIRFunction and MIRCFG type definitions in mir.runa.
+@End Implementation
+
+@Performance_Hints:
+O(1) - two pointer loads. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returns 0 on null function or null CFG so the caller skips return
+lowering safely.
+@End Security_Scope
+
+Process called "get_exit_block" that takes mir_function as Integer returns Integer:
+    If mir_function is equal to 0:
+        Return 0
+    End If
+
+    Let cfg be proc memory_get_int64 from Layout with mir_function, 8
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let exit_block be proc memory_get_int64 from Layout with cfg, 8
+    Return exit_block
+End Process
+
+@Reasoning:
+translate_pointer_type maps a MIR pointer type to its Bifrost representation.
+Bifrost has no dedicated pointer type variant; a pointer is a 64-bit machine
+address, so it lowers to the Bifrost INT64 primitive. This keeps the lowering
+total and well-typed for address arithmetic in generated kernels.
+@End Reasoning
+
+@Implementation:
+Returns create_primitive_type(BIFROST_INT64) for both null and non-null inputs,
+because a pointer is uniformly a 64-bit address regardless of pointee type. The
+pointee type carried at MIR offset 8 does not affect the machine representation
+of the pointer value itself, so it is not read here.
+@End Implementation
+
+@Performance_Hints:
+O(1) - one primitive-type construction. No recursion.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction; no I/O. INT64 is the architecturally correct width for
+the targeted 64-bit address space.
+@End Security_Scope
+
+Process called "translate_pointer_type" that takes mir_ptr_type as Integer returns Integer:
+    Return create_primitive_type(BIFROST_INT64)
+End Process
+
+@Reasoning:
+translate_array_type maps a MIR fixed-length array type to a Bifrost rank-1
+tensor: a contiguous block of element_type with a single dimension equal to the
+array length. Tensor is the general contiguous-storage Bifrost type, and a 1-D
+tensor is the faithful representation of a linear array, preserving both element
+type and length for downstream codegen and bandwidth analysis.
+@End Reasoning
+
+@Implementation:
+Returns create_primitive_type(BIFROST_INT32) for null input (matching the master
+dispatcher's fallback). Reads the element type at MIR offset 8 and the array
+length at offset 16 (the array layout convention used by the matrix/tensor
+translators above), recursively lowers the element type via
+mir_type_to_bifrost_type, builds a one-element shape List holding the length,
+and constructs the type via create_tensor_type(element, shape). If the length is
+non-positive (so create_tensor_type would reject it), it falls back to a Bifrost
+vector of length 1, and on any remaining failure to the INT32 primitive.
+@End Implementation
+
+@Performance_Hints:
+O(1) plus one recursive element-type lowering and one List allocation. Off the
+hot path.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. The shape List is freshly allocated and owned by the
+returned tensor type; the element type is borrowed from the recursive lowering.
+@End Security_Scope
+
+Process called "translate_array_type" that takes mir_array_type as Integer returns Integer:
+    If mir_array_type is equal to 0:
+        Return create_primitive_type(BIFROST_INT32)
+    End If
+
+    Let mir_element_type be proc memory_get_int64 from Layout with mir_array_type, 8
+    Let length be proc memory_get_int64 from Layout with mir_array_type, 16
+
+    Let bifrost_element_type be mir_type_to_bifrost_type(mir_element_type)
+
+    If length is greater than 0:
+        Let shape be proc create from List
+        proc append from List with shape, length
+        Let tensor_type be create_tensor_type(bifrost_element_type, shape)
+        If tensor_type is not equal to 0:
+            Return tensor_type
+        End If
+    End If
+
+    Return create_primitive_type(BIFROST_INT32)
+End Process
+
+@Reasoning:
+translate_struct_type maps a MIR aggregate (struct/record) type to a Bifrost
+representation. Bifrost has no composite/struct type variant, so a struct is
+lowered as an opaque byte blob: a rank-1 tensor of INT8 whose single dimension is
+the struct's total size in bytes. This preserves the struct's storage footprint
+for allocation and copy lowering even though Bifrost cannot model per-field
+types. This is a defensible interpretation given the absence of a Bifrost
+composite type; the per-field type detail is not representable here.
+@End Reasoning
+
+@Implementation:
+Returns create_primitive_type(BIFROST_INT32) for null input (the dispatcher
+fallback). Reads the struct's total size in bytes from MIR offset 8 (the struct
+layout's size field). When the size is positive it builds a one-element shape
+List holding the byte size and constructs a tensor of INT8 elements
+(create_primitive_type(BIFROST_INT8) then create_tensor_type) - an opaque byte
+blob of exactly the struct's footprint. On non-positive size or construction
+failure it falls back to the INT64 primitive (a single machine word) so lowering
+stays total.
+@End Implementation
+
+@Performance_Hints:
+O(1) plus one List allocation and two type constructions. Off the hot path -
+struct types are lowered once per distinct type.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. The shape List is freshly allocated and owned by the
+returned tensor type. The byte-blob representation loses per-field type fidelity
+- callers needing field-level types must consult the MIR type directly.
+@End Security_Scope
+
+Process called "translate_struct_type" that takes mir_struct_type as Integer returns Integer:
+    If mir_struct_type is equal to 0:
+        Return create_primitive_type(BIFROST_INT32)
+    End If
+
+    Let size_bytes be proc memory_get_int64 from Layout with mir_struct_type, 8
+
+    If size_bytes is greater than 0:
+        Let byte_element be create_primitive_type(BIFROST_INT8)
+        Let shape be proc create from List
+        proc append from List with shape, size_bytes
+        Let blob_type be create_tensor_type(byte_element, shape)
+        If blob_type is not equal to 0:
+            Return blob_type
+        End If
+    End If
+
+    Return create_primitive_type(BIFROST_INT64)
+End Process
+
+@Reasoning:
+translate_function_type maps a MIR function type to its Bifrost representation. A
+function value at runtime is a code pointer - a 64-bit machine address - and
+Bifrost has no first-class function type, so the function type lowers to the
+Bifrost INT64 primitive, identical to a data pointer. This keeps indirect-call
+target values well-typed in generated graphs.
+@End Reasoning
+
+@Implementation:
+Returns create_primitive_type(BIFROST_INT64) for both null and non-null inputs.
+The MIR function type's parameter and return type detail does not change the
+machine representation of a function pointer value, so those fields are not read
+here; the value is uniformly a 64-bit code address.
+@End Implementation
+
+@Performance_Hints:
+O(1) - one primitive-type construction. No recursion.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction; no I/O. INT64 is the correct width for code addresses on
+the targeted 64-bit address space.
+@End Security_Scope
+
+Process called "translate_function_type" that takes mir_func_type as Integer returns Integer:
+    Return create_primitive_type(BIFROST_INT64)
+End Process
+
+@Reasoning:
+translate_return_instruction lowers a MIR return terminator into the Bifrost
+graph's output node. The returned SSA value is the graph's data sink: the
+producer node already lives in the value_map, so this routine resolves it and
+materialises an Output node fed by a data-flow edge from that producer, giving
+optimisation passes a clean root to trace data dependencies from.
+@End Reasoning
+
+@Implementation:
+Null-guards builder and mir_return. Reads the returned value's SSA id from the
+return instruction's operand1 (MIRNode offset 16). When that operand is non-zero,
+it resolves the producer Bifrost node via lookup_value_node; if found, it creates
+an Output node (via build_output_node, which materialises a Global-memory output)
+and connects the producer to it with add_data_flow_edge, returning the output
+node. A void return (operand1 == 0) or an unresolved producer yields 0 - no
+output node is emitted, which is correct for functions that return nothing.
+@End Implementation
+
+@Performance_Hints:
+O(1) - one value-map lookup, one output-node construction, and one edge
+construction. Runs once per function return.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation via build_output_node and add_data_flow_edge. The producer
+pointer is borrowed from the value_map and captured by the edge, so it must
+remain live until the graph is freed. The mir_return pointer is borrowed.
+@End Security_Scope
+
+Process called "translate_return_instruction" that takes
+    builder as Integer,
+    mir_return as Integer
+    returns Integer:
+
+    If builder is equal to 0:
+        Return 0
+    End If
+    If mir_return is equal to 0:
+        Return 0
+    End If
+
+    Note: Read the returned SSA value id from operand1 (MIRNode offset 16)
+    Let return_value_id be proc memory_get_int64 from Layout with mir_return, 16
+    If return_value_id is equal to 0:
+        Return 0
+    End If
+
+    Note: Resolve the producer Bifrost node for the returned value
+    Let producer be lookup_value_node(builder, return_value_id)
+    If producer is equal to 0:
+        Return 0
+    End If
+
+    Note: Materialise the graph output sink and connect the producer to it
+    Let output_node be build_output_node(builder, mir_return)
+    If output_node is equal to 0:
+        Return 0
+    End If
+
+    add_data_flow_edge(builder, producer, output_node)
+    Return output_node
 End Process
 
 Note: ═══════════════════════════════════════════════════════════════════════════
@@ -832,7 +3265,7 @@ can distinguish forward references from missing definitions.
 
 @Implementation:
 Returns 0 for null builder. Loads the value_map at offset 16, calls
-Dictionary.has_key to test membership; on hit returns Dictionary.get of the
+Dictionary.contains to test membership; on hit returns Dictionary.get of the
 mir_value_id, otherwise returns 0.
 @End Implementation
 
@@ -856,7 +3289,7 @@ Process called "lookup_value_node" that takes
     End If
 
     Let value_map be proc memory_get_int64 from Layout with builder, 16
-    If proc has_key from Dict with value_map, mir_value_id:
+    If proc contains from Dict with value_map, mir_value_id:
         Let node be proc get from Dict with value_map, mir_value_id
         Return node
     End If
