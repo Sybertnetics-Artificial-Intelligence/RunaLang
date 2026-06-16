@@ -1,13 +1,14 @@
 # Runa Domain-Specific Formats
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Canonical
-**Last Updated:** 2024-10-18
+**Last Updated:** 2026-06-15
 
 ---
 
 ## Table of Contents
 
+0. [File-Type System: One Language, Every Format](#file-type-system-one-language-every-format)
 1. [Data and Configuration Formats](#data-and-configuration-formats)
 2. [Database Schema](#database-schema)
 3. [Documentation Format](#documentation-format)
@@ -16,6 +17,205 @@
 6. [GraphQL Schema](#graphql-schema)
 7. [Web Markup](#web-markup)
 8. [Web Styling](#web-styling)
+9. [Query Language (RQL)](#query-language-rql)
+10. [Project & Build Manifest](#project--build-manifest)
+11. [Dependency Lock Files](#dependency-lock-files)
+12. [CI/CD Pipeline](#cicd-pipeline)
+13. [Container & Infrastructure](#container--infrastructure)
+14. [Data Interchange & Serialization](#data-interchange--serialization)
+
+---
+
+# File-Type System: One Language, Every Format
+
+---
+
+## Subtable of Contents
+
+1. [The Universal-Substrate Principle](#the-universal-substrate-principle)
+2. [The `.type.runa` File-Type Convention](#the-typerunaa-file-type-convention)
+3. [The Two Tiers: Substrates vs. Role Profiles](#the-two-tiers-substrates-vs-role-profiles)
+4. [Complete Format Inventory](#complete-format-inventory)
+5. [How Tooling Uses the File-Type](#how-tooling-uses-the-file-type)
+
+---
+
+## The Universal-Substrate Principle
+
+Runa is designed to be **the single language for every technical artifact** — not just
+program logic, but configuration, data, documentation, queries, schemas, build manifests,
+CI/CD pipelines, infrastructure declarations, styling, and markup. The guiding rule:
+
+> **If it is a technical artifact a developer or a system produces, it is expressible in
+> Runa.** There is no "out of scope" format. Anything currently written in JSON, YAML,
+> TOML, XML, Markdown, SQL, HTML, CSS, Dockerfiles, `package.json`, GitHub Actions YAML,
+> Terraform HCL, Protobuf IDL, or any other special-purpose format has a first-class Runa
+> representation.
+
+This is not interop or "good enough" emulation — it is **replacement**. The benefits
+(stated once here, assumed throughout this document):
+
+1. **One syntax to learn** instead of a dozen mutually-incompatible mini-languages.
+2. **Compile-time validation** of artifacts that are normally validated late or never.
+3. **Executable artifacts** — computed values, imports, conditional logic, and reuse,
+   without templating layers (Helm, Jinja, ERB) bolted on top of dead formats.
+4. **Unified tooling** — one parser, one LSP, one formatter, one linter, one Viewer
+   projection serve every format.
+5. **AI-first** — an AI agent masters ONE language and can then author every artifact in a
+   software system.
+
+---
+
+## The `.type.runa` File-Type Convention
+
+Every Runa artifact — regardless of which format role it fills — keeps the **`.runa`
+suffix**. The Runa toolchain owns the file. To signal a file's *role*, an optional
+**type infix** is inserted before the suffix:
+
+```
+<name>.<type>.runa
+```
+
+Examples:
+
+```
+app.config.runa          Note: configuration (replaces config.json / config.yaml)
+home.rml.runa            Note: markup (replaces index.html)
+users.rql.runa           Note: query (replaces a .sql file)
+api.schema.runa          Note: schema / IDL (replaces openapi.yaml / schema.proto)
+project.manifest.runa    Note: build manifest (replaces package.json / Cargo.toml)
+deps.lock.runa           Note: dependency lock (replaces package-lock.json / Cargo.lock)
+guide.docs.runa          Note: documentation (replaces README.md)
+theme.style.runa         Note: styling (replaces theme.css)
+release.pipeline.runa    Note: CI/CD (replaces .github/workflows/release.yml)
+prod.infra.runa          Note: infrastructure (replaces Dockerfile / main.tf)
+main.runa                Note: ordinary program code — no infix
+```
+
+**Why keep `.runa` rather than inventing `.rml` / `.rql` / `.rcfg`?** Because the type infix
+is a *role hint, not a different language* — precisely the model of `.d.ts`, `.test.ts`,
+and `.stories.tsx` in the TypeScript ecosystem. The compiler, LSP, formatter, and Viewer
+treat every `*.runa` file as Runa; the infix simply selects the grammar profile and the
+tooling behavior. A `.rml.runa` file is still parsed, type-checked, and projected by the
+same toolchain as `main.runa`.
+
+**Plain `.runa` is always valid.** The infix is never *required* — a trivial config can
+live in `settings.runa`. The infix exists for when tooling, humans, or the build system
+benefit from knowing a file's role at a glance.
+
+---
+
+## The Two Tiers: Substrates vs. Role Profiles
+
+Format roles fall into two tiers that differ in *how the file is parsed*:
+
+### Tier 1 — DSL Substrates (own grammar)
+
+A substrate has a **dedicated grammar** because its content is not naturally expressed as
+procedural Runa. Two substrates are built today:
+
+| Infix       | Substrate                       | Module                              | Replaces            |
+|-------------|---------------------------------|-------------------------------------|---------------------|
+| `.rml.runa` | **RML** — Runa Markup Language  | `primitives/markup/rml.runa`        | HTML, XML           |
+| `.rql.runa` | **RQL** — Runa Query Language   | `primitives/query/rql.runa`         | SQL, GraphQL queries|
+
+RML models nested elements with attributes and text; RQL models `Select / From / Where /
+Order By / Limit` queries against a shared query AST and can emit standard SQL for
+backward compatibility. Both use Runa's natural-language style:
+
+```runa
+Note: home.rml.runa
+Element called "section" with id as "intro":
+    Element called "h1":
+        Text "Welcome"
+    End Element
+End Element
+```
+
+```runa
+Note: users.rql.runa
+Query:
+    Select user_name, email
+    From users
+    Where age is greater than 21
+    Order By signup_date descending
+    Limit 100
+End Query
+```
+
+### Tier 2 — Role Profiles (plain Runa exporting a value)
+
+A role profile is **ordinary Runa code** that produces a structured value (a Dictionary,
+a typed record, a list). The infix is a semantic/tooling label, not a separate grammar.
+Configuration, data, schema, manifest, lock, docs, styling, pipeline, and infrastructure
+files are all role profiles:
+
+```runa
+Note: app.config.runa — plain Runa, exports a value
+Let CONFIG be a dictionary containing:
+    "port" as 8080,
+    "log_level" as "info"
+End Dictionary
+```
+
+Because role profiles are real Runa, they get computed values, imports, validation
+Processes, and conditionals for free — the "executable config" property.
+
+---
+
+## Complete Format Inventory
+
+This is the working inventory of format families. **Status** reflects what exists in the
+v0.0.8.5 tree today: ✅ built substrate/modules · ⚠️ partial · 📋 planned (convention
+reserved, implementation pending). The inventory is **extensible** — new technical formats
+are added here, never declared out of scope.
+
+| # | Format family              | File-type            | Replaces                                       | Substrate module(s)                                                | Tier | Status |
+|---|----------------------------|----------------------|------------------------------------------------|--------------------------------------------------------------------|------|--------|
+| 0 | Program code               | `*.runa`             | (native)                                       | the compiler itself                                                | —    | ✅ |
+| 1 | Configuration              | `*.config.runa`      | JSON, YAML, TOML, `.env`, `.properties`        | `primitives/config/`                                               | 2    | ✅ |
+| 2 | Data interchange           | `*.data.runa`        | JSON/CSV data, msgpack, CBOR                   | `primitives/format/`, `io/`, `streams/`                            | 2    | ⚠️ |
+| 3 | Markup                     | `*.rml.runa`         | HTML, XML                                      | `primitives/markup/{rml,element,attribute,selector}.runa`          | 1    | ✅ |
+| 4 | Documentation              | `*.docs.runa`        | Markdown                                       | `primitives/markup/markdown.runa`                                  | 1/2  | ✅ |
+| 5 | Styling                    | `*.style.runa`       | CSS, SCSS, Tailwind                            | `primitives/style/`                                                | 2    | ✅ |
+| 6 | Query                      | `*.rql.runa`         | SQL, GraphQL queries                           | `primitives/query/{rql,sql,graphql,query_ast,query_planner}.runa`  | 1    | ✅ |
+| 7 | Schema / IDL               | `*.schema.runa`      | JSON Schema, Protobuf, Thrift IDL              | `primitives/schema/{runa_schema,idl,json_schema,protobuf_descriptor}.runa` | 2 | ✅ |
+| 8 | API specification          | `*.api.runa`         | OpenAPI / Swagger                              | `primitives/schema/openapi.runa`                                   | 2    | ✅ |
+| 9 | Project / Build manifest   | `*.manifest.runa`    | package.json, Cargo.toml, pyproject.toml, pom  | `primitives/manifest/{manifest,package_manifest,build_script,build_target,dependency_spec,version_constraint}.runa` | 2 | ✅ |
+| 10| Dependency lock            | `*.lock.runa`        | package-lock.json, Cargo.lock, poetry.lock     | `primitives/manifest/lockfile.runa`                                | 2    | ✅ |
+| 11| CI/CD pipeline             | `*.pipeline.runa`    | GitHub Actions, GitLab CI, Jenkinsfile         | (planned)                                                          | 2    | 📋 |
+| 12| Container / Infrastructure | `*.infra.runa`       | Dockerfile, docker-compose, k8s YAML, Terraform| (planned)                                                          | 2    | 📋 |
+
+**Foreign-format interop** (importing existing files) is provided where it already exists —
+`primitives/manifest/{cargo_toml_interop,package_json_interop,pyproject_toml_interop}.runa`
+read those legacy formats so projects can migrate incrementally.
+
+**Open inventory question (for the owner):** the families above cover data/config, markup,
+docs, styling, query, schema/API, manifest/lock, CI/CD, and infra. Candidate additions not
+yet placed: a **log format** (`*.log.runa` structured logging schema), a **test-spec
+format** (`*.spec.runa` — though tests are arguably plain `.runa`), an **i18n/locale
+format** (`*.locale.runa`), and a **shell/task-runner format** (`*.task.runa`, replacing
+Makefile/justfile/npm-scripts). These are reserved but not yet adopted pending an
+owner decision on whether they warrant a distinct role profile or are better expressed as
+ordinary `.runa` libraries.
+
+---
+
+## How Tooling Uses the File-Type
+
+The infix drives behavior across the toolchain:
+
+- **Parser / grammar profile** — Tier-1 substrates (`.rml`, `.rql`) select their dedicated
+  grammar; Tier-2 profiles parse as ordinary Runa.
+- **Formatter** — applies role-appropriate layout (e.g. attribute alignment in `.rml.runa`,
+  clause alignment in `.rql.runa`, key alignment in `.config.runa`).
+- **Viewer projection** — generates the read-only plain-English projection per role, so a
+  non-technical stakeholder can validate a `.config.runa` or `.pipeline.runa` without
+  reading code.
+- **Linter / validator** — enforces role-specific rules (e.g. a `.lock.runa` must be
+  fully pinned; a `.schema.runa` must be self-consistent).
+- **Build system** — discovers `.manifest.runa` / `.lock.runa` / `.pipeline.runa` /
+  `.infra.runa` by role without configuration.
 
 ---
 
@@ -3061,6 +3261,109 @@ End Process
 **Stop using:** HTML, JSX, Vue templates
 **Start using:** Aether Framework (`.runa`)
 
+---
+
+## RML — The Declarative Markup Substrate (`.rml.runa`)
+
+The Aether examples above are the **programmatic** route: Runa *code* that builds a
+markup tree at runtime. **RML (Runa Markup Language)** is the complementary **declarative**
+route — a static markup *document* that is parsed, validated, and serialized as data,
+exactly the role HTML and XML files fill today. RML is the Tier-1 DSL substrate behind the
+`.rml.runa` file-type, implemented in `compiler/frontend/primitives/markup/rml.runa`.
+
+Use RML when the artifact is *content* (a page, a document, a configuration of UI
+structure) rather than logic; use Aether when the markup is *computed* by a program.
+
+### Grammar
+
+RML mirrors Runa's natural-language block style. A document is one or more elements; each
+element has an optional attribute list and a body of child nodes:
+
+```
+document   := element+
+element    := 'Element' 'called' STRING [ 'with' attr-pair (',' attr-pair)* ] ':'
+                  children
+              'End' 'Element'
+attr-pair  := IDENT 'as' STRING
+children   := ( element | text | comment | cdata )*
+text       := 'Text' STRING
+comment    := 'Comment' STRING
+cdata      := 'CData' STRING
+```
+
+### Example
+
+```runa
+Note: home.rml.runa — declarative markup (replaces index.html)
+Element called "section" with id as "intro", class as "hero":
+    Element called "h1":
+        Text "Welcome to Runa"
+    End Element
+    Element called "p" with class as "lede":
+        Text "One language for every technical artifact."
+    End Element
+    Comment "navigation goes here"
+    Element called "pre":
+        CData "literal <markup> not re-parsed"
+    End Element
+End Element
+```
+
+The equivalent HTML:
+
+```html
+<section id="intro" class="hero">
+    <h1>Welcome to Runa</h1>
+    <p class="lede">One language for every technical artifact.</p>
+    <!-- navigation goes here -->
+    <pre><![CDATA[literal <markup> not re-parsed]]></pre>
+</section>
+```
+
+### Node types
+
+| RML keyword         | Node          | HTML/XML analogue     |
+|---------------------|---------------|-----------------------|
+| `Element called …`  | element       | `<tag>…</tag>`        |
+| `with attr as "…"`  | attribute     | `attr="…"`            |
+| `Text "…"`          | text node     | text content          |
+| `Comment "…"`       | comment       | `<!-- … -->`          |
+| `CData "…"`         | CDATA         | `<![CDATA[ … ]]>`     |
+
+### API
+
+The RML substrate exposes a complete parse → validate → serialize round-trip
+(`primitives/markup/rml.runa`):
+
+| Process                             | Purpose                                                                 |
+|-------------------------------------|-------------------------------------------------------------------------|
+| `rml_parse(source)`                 | Parse an RML source string to a markup element tree (0 on error).       |
+| `rml_parse_with_status(source, s)`  | As above, writing a status code into slot `s` for precise diagnostics.  |
+| `rml_load_from_file(path)`          | Read and parse an `.rml.runa` file from disk.                           |
+| `rml_serialize(root)`               | Pretty-print a markup tree back to canonical, indented RML source.      |
+| `rml_validate_well_formed(root)`    | Return a list of well-formedness issues (empty = valid).                |
+| `rml_issues_destroy(issues)`        | Release a validation-issue list.                                        |
+
+The element tree itself is the shared markup model in
+`primitives/markup/{element,attribute,selector}.runa`, so RML documents interoperate with
+selector queries and the same tree Aether produces at runtime.
+
+### Status & validation codes
+
+Parsing and validation report precise, line/column-tagged codes rather than failing
+silently:
+
+| Code                  | Meaning                                             |
+|-----------------------|-----------------------------------------------------|
+| `RML_OK`              | Success.                                            |
+| `RML_ERR_UNCLOSED`    | An element body reached EOF without `End Element`.  |
+| `RML_ERR_ORPHAN_CLOSE`| `End` not followed by `Element` / no open element.  |
+| `RML_ERR_SYNTAX`      | Unexpected token where a child node was expected.   |
+| `RML_ERR_OOM`         | Allocation failure during parsing.                  |
+
+Each validation issue produced by `rml_validate_well_formed` carries a code, a line, a
+column, and a human-readable message — feeding the same diagnostics and Viewer-projection
+tooling as ordinary Runa source.
 
 ---
 
@@ -3406,6 +3709,174 @@ End Process
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2024-10-18
+# Query Language (RQL)
+
+---
+
+## Subtable of Contents
+
+1. [Overview](#overview-8)
+2. [The `.rql.runa` File-Type](#the-rqlrunaa-file-type)
+3. [Grammar](#grammar-1)
+4. [Comparison Operators](#comparison-operators)
+5. [Example & SQL Comparison](#example--sql-comparison)
+6. [API](#api-1)
+7. [SQL Emission & Interop](#sql-emission--interop)
+8. [Validation](#validation)
+9. [Summary](#summary-8)
+
+---
+
+## Overview
+
+**RQL (Runa Query Language) replaces SQL.** It is the Tier-1 DSL substrate behind the
+`.rql.runa` file-type, implemented in `compiler/frontend/primitives/query/rql.runa`. RQL
+targets the shared query AST in `primitives/query/query_ast.runa` and **emits standard SQL**
+for backward compatibility with PostgreSQL, MySQL, and SQLite — so existing databases need
+no changes while queries are authored, type-checked, and validated in Runa.
+
+**Replaces:**
+- ❌ Hand-written SQL strings (injection-prone, unchecked)
+- ❌ ORM query DSLs (ActiveRecord, SQLAlchemy, Prisma, Sequelize)
+- ❌ String-concatenated query builders
+
+**Why?**
+1. **Natural-language clauses** read like the question being asked.
+2. **Compile-time validation** against a schema (`rql_validate`) before a query ever runs.
+3. **Injection-safe by construction** — values are AST nodes, not interpolated text.
+4. **Portable** — one query emits dialect-correct SQL for multiple engines.
+
+---
+
+## The `.rql.runa` File-Type
+
+A `.rql.runa` file holds one or more `Query: … End Query` blocks. Like all `.type.runa`
+files it remains Runa — the same toolchain parses, validates, and projects it — but the
+`.rql` infix selects the RQL grammar profile.
+
+---
+
+## Grammar
+
+```
+query      := 'Query' ':'
+                  'Select' column (',' column)*
+                  'From'   table  ('Join' table 'On' predicate)*
+                  [ 'Where'    predicate ]
+                  [ 'Group' 'By' column (',' column)* ]
+                  [ 'Having'   predicate ]
+                  [ 'Order' 'By' order-col (',' order-col)* ]
+                  [ 'Limit'  INTEGER ]
+                  [ 'Offset' INTEGER ]
+              'End' 'Query'
+order-col  := column [ 'ascending' | 'descending' ]
+predicate  := comparison ( ('and' | 'or') comparison )* | 'not' predicate
+```
+
+---
+
+## Comparison Operators
+
+RQL uses keyword-form operators that read as English and map to SQL:
+
+| RQL keyword form                | SQL          |
+|---------------------------------|--------------|
+| `is equal to`                   | `=`          |
+| `is not equal to`               | `<>`         |
+| `is less than`                  | `<`          |
+| `is less than or equal to`      | `<=`         |
+| `is greater than`               | `>`          |
+| `is greater than or equal to`   | `>=`         |
+| `is like`                       | `LIKE`       |
+| `is null`                       | `IS NULL`    |
+| `is not null`                   | `IS NOT NULL`|
+
+Boolean composition uses `and`, `or`, `not`.
+
+---
+
+## Example & SQL Comparison
+
+```runa
+Note: active_users.rql.runa
+Query:
+    Select user_name, email
+    From users
+    Where age is greater than 21 and is not null
+    Order By signup_date descending
+    Limit 100
+End Query
+```
+
+Emitted SQL (via `rql_to_sql`):
+
+```sql
+SELECT user_name, email
+FROM users
+WHERE age > 21 AND age IS NOT NULL
+ORDER BY signup_date DESC
+LIMIT 100;
+```
+
+---
+
+## API
+
+The RQL substrate provides a full parse → serialize → emit → validate pipeline
+(`primitives/query/rql.runa`):
+
+| Process                       | Purpose                                                                  |
+|-------------------------------|--------------------------------------------------------------------------|
+| `rql_parse(source)`           | Parse RQL source into a query AST node (shared with `query_ast.runa`).   |
+| `rql_serialize(root)`         | Pretty-print a query AST back to canonical RQL source.                   |
+| `rql_to_sql(root)`            | Emit standard SQL from the query AST (PostgreSQL/MySQL/SQLite-compatible).|
+| `rql_validate(root, schema)`  | Validate a query against a schema (columns, tables, types).              |
+
+Parsing is a full recursive-descent pipeline: `rql_parse_select_list`, `rql_parse_from`
+(with `Join … On`), `rql_parse_where`, `rql_parse_group_by`, `rql_parse_having`,
+`rql_parse_order_by`, `rql_parse_limit`, `rql_parse_offset`, over a boolean-expression
+grammar (`rql_parse_bool_expr` → `rql_parse_comparison` → `rql_parse_primary`).
+
+---
+
+## SQL Emission & Interop
+
+Because RQL targets the shared query AST, the same parsed query can be:
+
+- **Serialized back to RQL** (`rql_serialize`) — canonical formatting / round-trip.
+- **Emitted as SQL** (`rql_to_sql`) — for execution against existing PostgreSQL, MySQL, or
+  SQLite databases.
+- **Planned** via `primitives/query/query_planner.runa`.
+
+The sibling modules `primitives/query/{sql,graphql}.runa` provide the inbound direction —
+reading existing SQL and GraphQL — so projects migrate to RQL incrementally without
+rewriting their data layer.
+
+---
+
+## Validation
+
+`rql_validate(root, schema)` checks a query against a schema definition: referenced tables
+and columns must exist, comparisons must be type-compatible, and aggregates must agree with
+`Group By`. Validation runs at compile time, so a malformed or schema-violating query is a
+build error — not a runtime exception or a silent empty result.
+
+---
+
+## Summary
+
+- ✅ Natural-language, injection-safe queries
+- ✅ Compile-time schema validation
+- ✅ Standard-SQL emission for PostgreSQL / MySQL / SQLite
+- ✅ Shared AST with SQL & GraphQL inbound readers
+- ✅ Round-trip serialization
+
+**Stop using:** raw SQL strings, ORM query DSLs
+**Start using:** RQL (`.rql.runa`)
+
+
+---
+
+**Document Version:** 1.1
+**Last Updated:** 2026-06-15
 **Status:** Canonical
