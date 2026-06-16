@@ -3877,6 +3877,158 @@ build error — not a runtime exception or a silent empty result.
 
 ---
 
+# Project & Build Manifest
+
+---
+
+## Subtable of Contents
+
+1. [Overview](#overview-9)
+2. [Canonical Filename](#canonical-filename)
+3. [The PackageManifest Record](#the-packagemanifest-record)
+4. [Semantic Versioning](#semantic-versioning)
+5. [API](#api-2)
+6. [Foreign-Manifest Interop](#foreign-manifest-interop)
+7. [Summary](#summary-9)
+
+---
+
+## Overview
+
+The **manifest substrate** is the Runa-native replacement for `Cargo.toml`, `package.json`,
+`pyproject.toml`, and `pom.xml` — the file that declares a package's identity,
+dependencies, features, and build targets. It is implemented in
+`compiler/frontend/primitives/manifest/` (`package_manifest.runa`, `dependency_spec.runa`,
+`build_target.runa`, `version_constraint.runa`, `version_spec.runa`), and the module
+headers cite the **Universal Substrate Plan (Tier 1, manifest section)** as their source of
+truth.
+
+## Canonical Filename
+
+Unlike user-authored typed files (which use the `.type.runa` infix), a project's **root
+manifest is a fixed, well-known filename**: `runa.runa-manifest` — exactly as `Cargo.toml`,
+`package.json`, and `Makefile` are fixed names a build tool discovers without
+configuration. Legacy `runa.toml` is supported through the `cargo_toml_interop` adapter.
+
+> **Convention note:** well-known project root files (manifest, lockfile) have fixed
+> conventional names; the `.type.runa` infix from the File-Type System applies to
+> *user-authored, freely-named* typed files (e.g. `app.config.runa`, `home.rml.runa`).
+
+## The PackageManifest Record
+
+`PackageManifest` (96-byte record) carries the full metadata set:
+
+| Field          | Type                                  | Purpose                                  |
+|----------------|---------------------------------------|------------------------------------------|
+| `name`         | String                                | Package name                             |
+| `version`      | Version                               | Semantic version                         |
+| `authors`      | List<String>                          | Author list                              |
+| `description`  | String                                | Short description                        |
+| `license`      | String                                | SPDX license identifier                  |
+| `repository`   | String                                | Source repository URL                    |
+| `dependencies` | List<DependencySpec>                  | Runtime dependencies                     |
+| `dev_deps`     | List<DependencySpec>                  | Development/test dependencies            |
+| `features`     | Dictionary<String, List<String>>      | Named feature flags → enabled deps       |
+| `targets`      | List<BuildTarget>                     | Build targets (bin/lib/test/…)           |
+| `homepage`     | String                                | Project homepage                         |
+| `keywords`     | List<String>                          | Discovery keywords                       |
+
+## Semantic Versioning
+
+`version_constraint.runa` implements full SemVer 2.0.0: `version_parse(text)` parses
+`major.minor.patch[-prerelease][+build]` (with identifier validation — no leading zeros in
+numeric identifiers), `version_compare(a, b)` orders versions per the SemVer precedence
+rules (prerelease < release), and `version_to_string` round-trips. Dependency version
+requirements (caret, tilde, ranges) live in `version_spec.runa`.
+
+## API
+
+`package_manifest.runa` exposes a complete builder and accessor surface:
+
+| Process                                   | Purpose                                        |
+|-------------------------------------------|------------------------------------------------|
+| `manifest_create(name, version)`          | Construct a manifest.                          |
+| `manifest_set_description/license/repository` | Set optional metadata.                     |
+| `manifest_add_dependency/dev_dependency`  | Append a `DependencySpec`.                      |
+| `manifest_add_target` / `manifest_add_author` | Append a build target / author.            |
+| `manifest_find_dependency(m, name)`       | Look up a dependency by name.                  |
+| `manifest_name/version/authors/dependencies/dev_dependencies/targets/features` | Accessors. |
+
+## Foreign-Manifest Interop
+
+Three adapters read existing ecosystems so projects migrate incrementally without rewriting
+their dependency graph: `cargo_toml_interop.runa` (Rust `Cargo.toml`),
+`package_json_interop.runa` (npm `package.json`), and `pyproject_toml_interop.runa`
+(PEP 621 `pyproject.toml`).
+
+## Summary
+
+- ✅ Single native manifest replacing Cargo/npm/PyPI/Maven formats
+- ✅ Full SemVer 2.0.0 parse / compare / serialize
+- ✅ Dependencies, dev-dependencies, features, build targets
+- ✅ Interop adapters for Cargo/npm/pyproject migration
+
+**Stop using:** Cargo.toml, package.json, pyproject.toml, pom.xml
+**Start using:** `runa.runa-manifest` (manifest substrate)
+
+
+---
+
+# Dependency Lock Files
+
+---
+
+## Overview
+
+The **lockfile substrate** (`compiler/frontend/primitives/manifest/lockfile.runa`) is the
+Runa-native replacement for `Cargo.lock`, `package-lock.json`, and `poetry.lock`: a sorted,
+deterministic list of exactly-resolved dependency versions with checksums, enabling
+**byte-identical reproducible builds** across machines.
+
+## Determinism Guarantee
+
+`lockfile_serialize` emits entries in **lexicographic order by `(name, version_string)`**,
+so two correct serializers produce identical output for the same resolved graph — the exact
+property package managers test to verify a clean install matches the recorded lockfile.
+
+## The LockEntry Record
+
+`LockEntry` (64-byte record) pins one resolved dependency:
+
+| Field          | Type                | Purpose                                              |
+|----------------|---------------------|------------------------------------------------------|
+| `name`         | String              | Dependency name                                      |
+| `version`      | Version             | Exact resolved version                               |
+| `source_kind`  | `DEP_*` constant    | Registry / git / path / etc.                         |
+| `source_url`   | String              | Source location                                      |
+| `checksum`     | String              | SHA-256 or BLAKE3 hex digest                         |
+| `checksum_alg` | `ALG_*` constant    | Which digest algorithm                               |
+| `dependencies` | List<String>        | Names of transitive dependencies                     |
+
+The enclosing `Lockfile` (32-byte record) records `format_version`, `root_manifest_name`,
+and `root_manifest_version`.
+
+## API
+
+| Process                                                                 | Purpose                                  |
+|-------------------------------------------------------------------------|------------------------------------------|
+| `lock_entry_create(name, version, source_kind, source_url, checksum, alg, deps)` | Build a pin.            |
+| `lockfile_create(root_name, root_version)`                              | New lockfile for a root package.         |
+| `lockfile_add_entry` / `lockfile_entries` / `lockfile_find_entry`       | Populate / read entries.                 |
+| `lockfile_serialize(lf)`                                                | Emit deterministic, sorted lock text.    |
+
+## Summary
+
+- ✅ Reproducible, checksum-pinned dependency resolution
+- ✅ Deterministic lexicographic serialization (verifiable clean install)
+- ✅ SHA-256 / BLAKE3 integrity per entry
+
+**Stop using:** Cargo.lock, package-lock.json, poetry.lock
+**Start using:** the lockfile substrate (`*.lock.runa`)
+
+
+---
+
 **Document Version:** 1.1
 **Last Updated:** 2026-06-15
 **Status:** Canonical
