@@ -1,0 +1,466 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file defines the top-level Program AST container and its construction API
+for the v0.0.8.5 modular compiler.
+
+A Program is the root node produced by parser_parse_program. It aggregates the
+four kinds of top-level declarations a Runa source file can contain:
+  - functions   (Process declarations)
+  - types       (Type declarations)
+  - imports      (Import statements)
+  - globals     (top-level Let / Constant declarations)
+
+Each of the four collections is stored as a dynamically grown array of pointers
+(Function*, TypeDefinition*, Import*, GlobalVariable*) accompanied by a count and
+a capacity field. The compiler driver (compiler/driver/compiler_driver.runa)
+reads these arrays directly by offset when merging imported programs into the
+main program, and calls the construction Processes defined here to append the
+merged declarations. The on-disk struct layout MUST therefore match exactly the
+layout established by the self-hosting monolith parser so that the driver's
+direct-offset reads and the codegen's traversal continue to operate unchanged.
+
+This file performs the following tasks:
+- Allocate and initialize the Program container (program_create)
+- Append functions, types, imports, and globals with amortized growth
+- Detect and propagate the __runa_no_mangle__ symbol-mangling sentinel
+- Release a Program container (program_destroy)
+
+This file is essential because of the following reasons:
+- The Program container is the single root the entire backend traverses
+- The construction API is the only sanctioned way to populate that root
+- Faithful offset preservation is what allows the modular driver to link
+
+This file consists of the following functions/features/operation types:
+- Program struct offset constants
+- Program lifecycle (create / destroy)
+- Program declaration accumulation (add_function / add_type / add_global / add_import)
+- No-mangle sentinel detection and flag propagation
+
+Dependencies:
+- Imports memory/layout.runa for raw allocation and release (allocate/deallocate)
+- Imports core/memory_core.runa for typed field access (int32/pointer get/set, copy)
+- Imports core/string_core.runa for sentinel name comparison (string_equals)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Program struct offset constants
+Note: ============================================================================
+Note: These offsets reproduce, byte-for-byte, the Program layout allocated by the
+Note: monolith parser (v0.0.8.4.5.3.5/src/parser.runa, program_create at ~4621).
+Note: The total allocation is 72 bytes:
+Note:   0  : Function**       functions          (pointer)
+Note:   8  : int32            function_count
+Note:   12 : int32            function_capacity
+Note:   16 : TypeDefinition** types              (pointer)
+Note:   24 : int32            type_count
+Note:   28 : int32            type_capacity
+Note:   32 : Import**         imports            (pointer)
+Note:   40 : int32            import_count
+Note:   44 : int32            import_capacity
+Note:   48 : GlobalVariable** globals            (pointer)
+Note:   56 : int32            global_count
+Note:   60 : int32            global_capacity
+Note:   64 : int32            main_global_count
+Note:   68 : int32            main_global_count_set
+Note: The function/global/import sentinel records all carry their name pointer at
+Note: field offset 0, matching the monolith's GlobalVariable and Import layouts.
+
+Constant PROGRAM_FUNCTIONS as Integer is 0
+Constant PROGRAM_FUNCTION_COUNT as Integer is 8
+Constant PROGRAM_FUNCTION_CAPACITY as Integer is 12
+Constant PROGRAM_TYPES as Integer is 16
+Constant PROGRAM_TYPE_COUNT as Integer is 24
+Constant PROGRAM_TYPE_CAPACITY as Integer is 28
+Constant PROGRAM_IMPORTS as Integer is 32
+Constant PROGRAM_IMPORT_COUNT as Integer is 40
+Constant PROGRAM_IMPORT_CAPACITY as Integer is 44
+Constant PROGRAM_GLOBAL_VARS as Integer is 48
+Constant PROGRAM_GLOBAL_COUNT as Integer is 56
+Constant PROGRAM_GLOBAL_CAPACITY as Integer is 60
+Constant PROGRAM_MAIN_GLOBAL_COUNT as Integer is 64
+Constant PROGRAM_MAIN_GLOBAL_COUNT_SET as Integer is 68
+Constant PROGRAM_SIZE as Integer is 72
+Constant PROGRAM_PTR_SIZE as Integer is 8
+
+Note: Function record's no_mangle flag field offset, matching the monolith's
+Note: FUNCTION_NO_MANGLE_OFFSET (v0.0.8.4.5.3.5/src/parser.runa line 4454).
+Constant FUNCTION_NO_MANGLE_OFFSET as Integer is 88
+
+Note: ============================================================================
+Note: program_create
+Note: ============================================================================
+
+Note:
+@Reasoning
+The Program container is allocated once per parsed translation unit. It must be
+fully zero-initialized so that the very first program_add_* call observes a NULL
+array pointer with a zero count/capacity and therefore takes the growth path,
+allocating the initial backing buffer. A 72-byte allocation reproduces the
+monolith layout exactly: 64 bytes for the eight (pointer,count,capacity) triples
+plus a trailing pair of int32 fields (main_global_count and its "set" flag) the
+codegen consults to emit only this file's own globals into the .data section,
+avoiding duplicate symbol definitions when multiple object files are linked.
+@End Reasoning
+
+@Implementation
+allocate returns raw, uninitialized heap memory, so every field is explicitly
+written. Pointer fields are zeroed with memory_set_pointer; the count, capacity,
+and boundary fields are zeroed with memory_set_int32. The dummy parameter exists
+solely to match the monolith's calling convention (the bootstrap compiler emitted
+program_create as a one-argument symbol); it is intentionally unused.
+@End Implementation
+:End Note
+Process called "program_create" takes dummy as Integer returns Integer:
+    Let program be proc allocate from Layout with PROGRAM_SIZE
+    If program is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_pointer from Memory with program, PROGRAM_FUNCTIONS, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_FUNCTION_COUNT, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_FUNCTION_CAPACITY, 0
+    proc memory_set_pointer from Memory with program, PROGRAM_TYPES, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_TYPE_COUNT, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_TYPE_CAPACITY, 0
+    proc memory_set_pointer from Memory with program, PROGRAM_IMPORTS, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_IMPORT_COUNT, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_IMPORT_CAPACITY, 0
+    proc memory_set_pointer from Memory with program, PROGRAM_GLOBAL_VARS, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_GLOBAL_COUNT, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_GLOBAL_CAPACITY, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_MAIN_GLOBAL_COUNT, 0
+    proc memory_set_int32 from Memory with program, PROGRAM_MAIN_GLOBAL_COUNT_SET, 0
+
+    Return program
+End Process
+
+Note: ============================================================================
+Note: program_grow_array (internal amortized-growth helper)
+Note: ============================================================================
+
+Note:
+@Reasoning
+All four append operations share an identical growth discipline: when the count
+reaches the capacity, the backing buffer doubles (with a configurable initial
+seed) so that appends remain amortized O(1). Factoring this into one helper keeps
+the four public Processes free of duplicated reallocation logic and guarantees
+they grow in lockstep with the monolith's semantics. The function array seeds at
+128 to accommodate large source files without early reallocation churn; types,
+imports, and globals seed at 4 because top-level counts of those are small.
+@End Reasoning
+
+@Implementation
+v0.0.8.5 exposes no memory_reallocate primitive, so reallocation is performed
+manually exactly as the monolith's function_add_parameter does: a new buffer of
+the doubled byte-size is allocated, the in-use bytes are copied across with
+memory_copy, and the old buffer is released with deallocate. The grown buffer
+pointer and the new capacity are written back into the program at the supplied
+field offsets. The current backing pointer (possibly NULL on first growth) is
+read fresh from the program rather than trusted from the caller. Returns the
+(possibly new) backing buffer pointer so the caller can append without re-reading.
+@End Implementation
+:End Note
+Process called "program_grow_array" takes program as Integer, ptr_offset as Integer, count_offset as Integer, capacity_offset as Integer, initial_capacity as Integer returns Integer:
+    Let count be proc memory_get_int32 from Memory with program, count_offset
+    Let capacity be proc memory_get_int32 from Memory with program, capacity_offset
+    Let buffer be proc memory_get_pointer from Memory with program, ptr_offset
+
+    If count is greater than or equal to capacity:
+        Let new_capacity be initial_capacity
+        If capacity is greater than 0:
+            Set new_capacity to capacity multiplied by 2
+        End If
+
+        Let new_size be new_capacity multiplied by PROGRAM_PTR_SIZE
+        Let new_buffer be proc allocate from Layout with new_size
+        If buffer is not equal to 0:
+            Let used_bytes be count multiplied by PROGRAM_PTR_SIZE
+            proc memory_copy from Memory with new_buffer, buffer, used_bytes
+            proc deallocate from Layout with buffer
+        End If
+
+        proc memory_set_pointer from Memory with program, ptr_offset, new_buffer
+        proc memory_set_int32 from Memory with program, capacity_offset, new_capacity
+        Set buffer to new_buffer
+    End If
+
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: program_add_function
+Note: ============================================================================
+
+Note:
+@Reasoning
+Appends a parsed Function record to the program's function table. The compiler
+driver invokes this once per function discovered in the main file and once per
+function lifted out of each imported module during import merging, so it must
+preserve insertion order and tolerate arbitrarily many calls.
+@End Reasoning
+
+@Implementation
+Delegates the capacity check and any doubling to program_grow_array (seed 128 to
+match the monolith's large-file initial capacity). After growth, the live buffer
+pointer is fetched and the function pointer is stored at slot index function_count
+(byte offset count * 8). The count is then incremented. Returns 0 to mirror the
+monolith's success convention.
+@End Implementation
+:End Note
+Process called "program_add_function" takes program as Integer, func as Integer returns Integer:
+    Let functions be program_grow_array(program, PROGRAM_FUNCTIONS, PROGRAM_FUNCTION_COUNT, PROGRAM_FUNCTION_CAPACITY, 128)
+    Let function_count be proc memory_get_int32 from Memory with program, PROGRAM_FUNCTION_COUNT
+    Let func_offset be function_count multiplied by PROGRAM_PTR_SIZE
+    Let func_slot be functions plus func_offset
+    proc memory_set_pointer from Memory with func_slot, 0, func
+    Let new_count be function_count plus 1
+    proc memory_set_int32 from Memory with program, PROGRAM_FUNCTION_COUNT, new_count
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: program_add_global
+Note: ============================================================================
+
+Note:
+@Reasoning
+Appends a top-level global (Let/Constant) declaration record to the program's
+global table. Globals lower to .data entries; their ordering and count drive the
+main_global_count boundary the codegen uses to suppress imported-global emission.
+@End Reasoning
+
+@Implementation
+Delegates capacity management to program_grow_array (seed 4, matching the
+monolith). Stores the global pointer at slot index global_count and increments
+the count. Returns 0 on success.
+@End Implementation
+:End Note
+Process called "program_add_global" takes program as Integer, global as Integer returns Integer:
+    Let globals be program_grow_array(program, PROGRAM_GLOBAL_VARS, PROGRAM_GLOBAL_COUNT, PROGRAM_GLOBAL_CAPACITY, 4)
+    Let global_count be proc memory_get_int32 from Memory with program, PROGRAM_GLOBAL_COUNT
+    Let global_offset be global_count multiplied by PROGRAM_PTR_SIZE
+    Let global_slot be globals plus global_offset
+    proc memory_set_pointer from Memory with global_slot, 0, global
+    Let new_count be global_count plus 1
+    proc memory_set_int32 from Memory with program, PROGRAM_GLOBAL_COUNT, new_count
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: program_add_type
+Note: ============================================================================
+
+Note:
+@Reasoning
+Appends a parsed TypeDefinition record to the program's type table. Like
+functions, types are merged in from imported modules, so the call count is
+unbounded and insertion order is significant for deterministic codegen.
+@End Reasoning
+
+@Implementation
+Delegates capacity management to program_grow_array (seed 4, matching the
+monolith). Stores the type pointer at slot index type_count and increments the
+count. Returns 0 on success.
+@End Implementation
+:End Note
+Process called "program_add_type" takes program as Integer, type as Integer returns Integer:
+    Let types be program_grow_array(program, PROGRAM_TYPES, PROGRAM_TYPE_COUNT, PROGRAM_TYPE_CAPACITY, 4)
+    Let type_count be proc memory_get_int32 from Memory with program, PROGRAM_TYPE_COUNT
+    Let type_offset be type_count multiplied by PROGRAM_PTR_SIZE
+    Let type_slot be types plus type_offset
+    proc memory_set_pointer from Memory with type_slot, 0, type
+    Let new_count be type_count plus 1
+    proc memory_set_int32 from Memory with program, PROGRAM_TYPE_COUNT, new_count
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: program_add_import
+Note: ============================================================================
+
+Note:
+@Reasoning
+Appends a parsed Import record to the program's import table. The driver iterates
+this table to discover transitive source files to load and merge before codegen.
+@End Reasoning
+
+@Implementation
+Delegates capacity management to program_grow_array (seed 4, matching the
+monolith). Stores the import pointer at slot index import_count and increments the
+count. Returns 0 on success. The parameter is named import_stmt rather than the
+monolith's reserved-looking "import" to avoid any keyword collision.
+@End Implementation
+:End Note
+Process called "program_add_import" takes program as Integer, import_stmt as Integer returns Integer:
+    Let imports be program_grow_array(program, PROGRAM_IMPORTS, PROGRAM_IMPORT_COUNT, PROGRAM_IMPORT_CAPACITY, 4)
+    Let import_count be proc memory_get_int32 from Memory with program, PROGRAM_IMPORT_COUNT
+    Let import_offset be import_count multiplied by PROGRAM_PTR_SIZE
+    Let import_slot be imports plus import_offset
+    proc memory_set_pointer from Memory with import_slot, 0, import_stmt
+    Let new_count be import_count plus 1
+    proc memory_set_int32 from Memory with program, PROGRAM_IMPORT_COUNT, new_count
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: program_has_no_mangle_sentinel
+Note: ============================================================================
+
+Note:
+@Reasoning
+A source file opts out of Runa's symbol-name mangling by declaring the magic
+global `Let __runa_no_mangle__ be 1` at top level. This is how runtime/FFI files
+expose unmangled C-ABI symbol names. The detector scans the program's global
+table for a global whose name is exactly "__runa_no_mangle__"; its presence (not
+its value) is the signal. Callers use the result to decide whether to tag every
+function in the program with no_mangle before handing the program to codegen.
+@End Reasoning
+
+@Implementation
+Reads global_count and the globals array directly by offset (mirroring the
+monolith). For each global it reads the GlobalVariable's name pointer at field
+offset 0 and compares it against the literal sentinel name with string_equals.
+A NULL program, NULL globals array, NULL global record, or NULL name is treated
+as "no sentinel" and skipped. Returns 1 on the first match, 0 if none is found.
+@End Implementation
+:End Note
+Process called "program_has_no_mangle_sentinel" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    Let globals_count be proc memory_get_int32 from Memory with program, PROGRAM_GLOBAL_COUNT
+    Let globals be proc memory_get_pointer from Memory with program, PROGRAM_GLOBAL_VARS
+    If globals is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than globals_count:
+        Let global_offset be i multiplied by PROGRAM_PTR_SIZE
+        Let global_slot be globals plus global_offset
+        Let global_record be proc memory_get_pointer from Memory with global_slot, 0
+        If global_record is not equal to 0:
+            Let global_name be proc memory_get_pointer from Memory with global_record, 0
+            If global_name is not equal to 0:
+                Let matched be proc string_equals from StringCore with global_name, "__runa_no_mangle__"
+                If matched is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: program_tag_no_mangle_flags
+Note: ============================================================================
+
+Note:
+@Reasoning
+When a program carries the __runa_no_mangle__ sentinel, every Function record in
+the program must be marked no_mangle so codegen emits each symbol under its raw
+declared name. This is invoked once per parsed file (main plus each import) so the
+codegen receives Function records that already carry their own mangling policy,
+independent of any later source-file tagging.
+@End Reasoning
+
+@Implementation
+Short-circuits to 0 when the sentinel is absent (program_has_no_mangle_sentinel
+returns 0), so the common case incurs only one global scan and no function writes.
+When present, it reads function_count and the functions array by offset and, for
+each non-NULL Function record, writes 1 into the Function's no_mangle slot.
+The Function record stores its no_mangle flag at field offset 88 (int32), matching
+the monolith's FUNCTION_NO_MANGLE_OFFSET / function_set_no_mangle layout. The
+write is idempotent. Returns 1 when tagging was applied, 0 when it was skipped.
+@End Implementation
+:End Note
+Process called "program_tag_no_mangle_flags" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    If program_has_no_mangle_sentinel(program) is equal to 0:
+        Return 0
+    End If
+
+    Let function_count be proc memory_get_int32 from Memory with program, PROGRAM_FUNCTION_COUNT
+    Let functions be proc memory_get_pointer from Memory with program, PROGRAM_FUNCTIONS
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than function_count:
+        Let func_offset be i multiplied by PROGRAM_PTR_SIZE
+        Let func_slot be functions plus func_offset
+        Let func be proc memory_get_pointer from Memory with func_slot, 0
+        If func is not equal to 0:
+            proc memory_set_int32 from Memory with func, FUNCTION_NO_MANGLE_OFFSET, 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: program_destroy
+Note: ============================================================================
+
+Note:
+@Reasoning
+Releases the heap memory owned exclusively by the Program container. The four
+declaration arrays may, after import merging, point at arena memory that is freed
+en masse by the arena allocator rather than slot-by-slot here; the monolith
+therefore deliberately does NOT deallocate the functions, types, or imports
+backing arrays (doing so would double-free arena chunks). The globals array is the
+one collection the monolith always frees, because globals are never relocated into
+arena storage during merging. The faithful port preserves exactly this ownership
+boundary so the modular driver's cleanup path behaves identically to the monolith.
+@End Reasoning
+
+@Implementation
+A NULL program is a no-op returning 0. The globals backing array is released with
+deallocate when non-NULL, then the 72-byte program struct itself is released.
+The functions/types/imports arrays are intentionally left untouched, matching the
+monolith's documented arena-safety contract. Per-AST-node destruction is owned by
+the arena lifecycle in v0.0.8.5 rather than by this container, so no per-node
+destructor is invoked here. Returns 0.
+@End Implementation
+:End Note
+Process called "program_destroy" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    Let globals be proc memory_get_pointer from Memory with program, PROGRAM_GLOBAL_VARS
+    If globals is not equal to 0:
+        proc deallocate from Layout with globals
+    End If
+
+    proc deallocate from Layout with program
+    Return 0
+End Process
