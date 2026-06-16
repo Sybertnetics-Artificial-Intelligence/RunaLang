@@ -1890,7 +1890,7 @@ End Process
 ```
 
 **Output (README.md):**
-```markdown
+````markdown
 # My Project
 ## A revolutionary application
 
@@ -1913,14 +1913,14 @@ runa build.runa
 
 ## Usage
 ...
-```
+````
 
 ---
 
 ## Markdown Comparison
 
 **Before (README.md):**
-```markdown
+````markdown
 # My Project
 
 A revolutionary application.
@@ -1937,7 +1937,7 @@ npm install my-project
 const project = require('my-project');
 project.run();
 ```
-```
+````
 
 **After (README.runa):**
 ```runa
