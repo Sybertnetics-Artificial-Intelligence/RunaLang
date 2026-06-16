@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,22 +17,182 @@ limitations under the License.
 Note:
 This file handles process management and process operations wrapper functionality for the Runa runtime system interface.
 
-This file performs the following tasks:
-- Process process management and process operations wrapper functionality
-- Handle process creation and process coordination
-- Manage process synchronization and process state
-- Process process error handling and process feedback
-
-This file is essential because of the following reasons:
-- process_manager enables comprehensive process management and process operations wrapper functionality
-- Proper process handling ensures correct process operations and user experience
-- process_manager support enables Runa compilation for process management workflows
+This file provides the subprocess primitives that back the compile-and-run
+driver ("runa run"): the fork/execve/wait4 trio plus the high-level run and
+spawn entry points. All syscalls go through the platform-agnostic system_call
+gateway and the SYS_* router accessors so the same source compiles for every
+supported POSIX target without hardcoded syscall numbers.
 
 This file consists of the following functions/features/operation types:
-- Process management and process operations wrapper functionality
-- Process creation and process coordination
-- Process synchronization and process state
-- Process error handling and process feedback
+- process_fork: raw fork that returns 0 in the child, child-pid in the parent
+- process_execve: replace the current image with a new program
+- process_wait: block on a child pid and decode its exit status
+- process_run: fork + exec + wait, returning the child's exit code
+- process_spawn: fork + exec, returning the child's pid without waiting
 :End Note
 
-Note: TODO - Implement process_manager functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "runtime/integration/system_interface/syscall_manager.runa" as SyscallMgr
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Process called "process_fork" returns Integer:
+    @Reasoning
+    process_fork is the lowest-level primitive in this module: it duplicates the
+    calling process via the platform fork syscall. The kernel returns the value
+    twice along two control paths — 0 to the freshly created child and the
+    child's pid to the parent — which is exactly the contract callers rely on to
+    branch between "I am the child" and "I am the parent". A negative return
+    signals that the kernel could not create the process (resource limits, out of
+    memory) and is propagated unchanged so callers can react.
+    @End Reasoning
+    @Implementation
+    fork takes no arguments, so every argument register is passed as 0. The
+    syscall number is resolved through the SYS_FORK router accessor, which selects
+    the correct per-platform constant at compile time, and dispatched through the
+    common system_call gateway (which routes to syscall_6 on the host). The raw
+    kernel return value is returned verbatim: 0 in the child, child-pid in the
+    parent, negative errno-encoded value on failure.
+    @End Implementation
+    Let fork_num be proc SYS_FORK from Syscall
+    Return proc system_call from SyscallMgr with fork_num, 0, 0, 0, 0, 0, 0
+End Process
+
+Process called "process_execve" takes path_cstr as Integer, argv as Integer, envp as Integer returns Integer:
+    @Reasoning
+    process_execve replaces the current process image with the program named by
+    path_cstr, using argv as the argument vector and envp as the environment
+    vector. On success the call NEVER returns — control transfers into the new
+    program — so any value this Process actually returns is by definition a
+    failure indication (a negative errno-encoded value). Callers in the child
+    branch of a fork therefore treat "execve returned at all" as "exec failed".
+    @End Reasoning
+    @Implementation
+    The three pointer arguments are already-marshalled C arrays supplied by the
+    caller: path_cstr is a NUL-terminated byte string, argv is a heap block of
+    8-byte C-string pointers terminated by a 0 entry, and envp has the same shape
+    (a pointer to a single 0 for an empty environment). They are passed straight
+    through as a1/a2/a3 with the remaining argument registers zeroed. The syscall
+    number is resolved via the SYS_EXECVE router accessor. Because execve must not
+    allocate or touch shared Runa heap state in the post-fork child, this Process
+    performs no allocation of its own — it is a pure syscall pass-through.
+    @End Implementation
+    Let execve_num be proc SYS_EXECVE from Syscall
+    Return proc system_call from SyscallMgr with execve_num, path_cstr, argv, envp, 0, 0, 0
+End Process
+
+Process called "process_wait" takes pid as Integer returns Integer:
+    @Reasoning
+    process_wait blocks the parent until the child identified by pid terminates,
+    then decodes the kernel's packed wait status into a conventional exit code.
+    The raw status word encodes two distinct termination modes — normal exit and
+    death by signal — and callers want a single integer that mirrors a shell's
+    $? convention, so this Process performs that decode rather than exposing the
+    raw word.
+    @End Reasoning
+    @Implementation
+    A small 8-byte status buffer is allocated on the owned heap to receive the
+    wait status (the kernel writes a 32-bit int; 8 bytes covers it with room to
+    spare and matches pointer-sized allocations). wait4 is invoked as
+    system_call(SYS_WAIT4, pid, status_buf, 0 options, 0 rusage, 0, 0). The status
+    int is read back with memory_get_integer.
+
+    Status decode follows the standard POSIX macros:
+    - WIFEXITED is true when (status bit_and 127) is equal to 0 (no signal in the
+      low 7 bits). In that case the exit code is (status shifted right by 8)
+      bit_and 255 — the WEXITSTATUS byte.
+    - Otherwise the child was killed by a signal; we return 128 plus the signal
+      number (status bit_and 127), matching shell convention for signal deaths.
+
+    The status buffer is always freed before returning so no allocation leaks
+    across the wait. (Runa precedence makes "shifted right by" weaker than
+    bit_and, so the WEXITSTATUS expression is parenthesized to force the shift
+    before the mask.)
+    @End Implementation
+    Let wait_num be proc SYS_WAIT4 from Syscall
+    Let status_buf be proc allocate from Layout with 8
+    proc memory_set_integer from Memory with status_buf, 0, 0
+    Let wait_result be proc system_call from SyscallMgr with wait_num, pid, status_buf, 0, 0, 0, 0
+    Let status be proc memory_get_integer from Memory with status_buf, 0
+    proc deallocate from Layout with status_buf
+    Let signal_bits be status bit_and 127
+    If signal_bits is equal to 0:
+        Let shifted be status shifted right by 8
+        Return shifted bit_and 255
+    End If
+    Return 128 plus signal_bits
+End Process
+
+Process called "process_run" takes path_cstr as Integer, argv as Integer, envp as Integer returns Integer:
+    @Reasoning
+    process_run is the high-level synchronous entry point for "runa run": it
+    forks a child, executes the requested program in that child, waits for it to
+    finish, and returns its exit code. This is the building block a compile-and-run
+    driver needs to launch the freshly built binary and surface its status to the
+    user.
+    @End Reasoning
+    @Implementation
+    FORK-SAFETY CONTRACT (critical): the caller marshals path_cstr / argv / envp
+    BEFORE invoking this Process — they are already-built C arrays (argv and envp
+    are heap blocks of 8-byte C-string pointers terminated by a 0 entry; path_cstr
+    is NUL-terminated bytes; envp may point at a single 0 for an empty
+    environment). Between the fork return and the execve, the child path does
+    NOTHING that allocates, prints, or mutates shared Runa heap state — it calls
+    only process_execve and, if that returns (meaning exec failed), terminates
+    immediately with the RAW SYS_EXIT syscall using code 127. We deliberately use
+    the raw kernel _exit-style syscall rather than any Runa exit that would run
+    finalizers, because finalizers running in a half-forked child would corrupt
+    shared heap state. 127 is the conventional "command not found / exec failed"
+    code.
+
+    Control flow:
+    - pid < 0: fork failed, return -1.
+    - pid == 0: we are the child. Attempt exec; if it returns, raw-exit 127.
+    - pid > 0: we are the parent. Wait on the child and return its decoded exit
+      code.
+    @End Implementation
+    Let pid be process_fork
+    If pid is less than 0:
+        Return -1
+    End If
+    If pid is equal to 0:
+        Let exec_failed be process_execve with path_cstr, argv, envp
+        Let exit_num be proc SYS_EXIT from Syscall
+        proc system_call from SyscallMgr with exit_num, 127, 0, 0, 0, 0, 0
+        Return 127
+    End If
+    Return process_wait with pid
+End Process
+
+Process called "process_spawn" takes path_cstr as Integer, argv as Integer, envp as Integer returns Integer:
+    @Reasoning
+    process_spawn is the asynchronous counterpart to process_run: it forks and
+    execs the requested program but returns the child's pid to the parent WITHOUT
+    waiting. This lets callers launch background work and later reap it with
+    process_wait at a time of their choosing.
+    @End Reasoning
+    @Implementation
+    The same FORK-SAFETY CONTRACT as process_run applies: path_cstr / argv / envp
+    are pre-marshalled C arrays, and the post-fork child path performs no
+    allocation, printing, or shared-heap mutation before execve. On exec failure
+    the child terminates immediately with the raw SYS_EXIT syscall and code 127
+    (no finalizers run in the child).
+
+    Control flow:
+    - pid < 0: fork failed, return -1.
+    - pid == 0: we are the child. Attempt exec; if it returns, raw-exit 127.
+    - pid > 0: we are the parent. Return the child's pid immediately, without
+      waiting.
+    @End Implementation
+    Let pid be process_fork
+    If pid is less than 0:
+        Return -1
+    End If
+    If pid is equal to 0:
+        Let exec_failed be process_execve with path_cstr, argv, envp
+        Let exit_num be proc SYS_EXIT from Syscall
+        proc system_call from SyscallMgr with exit_num, 127, 0, 0, 0, 0, 0
+        Return 127
+    End If
+    Return pid
+End Process
