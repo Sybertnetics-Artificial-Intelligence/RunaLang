@@ -47,6 +47,7 @@ Dependencies:
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/middle/gungnir/hir/translation/frontends/java/java_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_lexer.runa" as Lexer
 
 Note: ============================================================================
 Note: HIR Structure Creation
@@ -2859,6 +2860,73 @@ Process called "translate_assignment_expression" takes ast as Integer returns In
     End If
 
     Return hir_assign
+End Process
+
+Note: ============================================================================
+Note: Source-Level Translation Entry Point
+Note: ============================================================================
+
+@Reasoning:
+End-to-end source convenience entry for the Java frontend, mirroring the
+python_to_hir_from_source contract: it owns the full lex + parse + lower
+pipeline so the central translation dispatcher can route Java source text
+straight to a HIR root with a single call. The Java parser borrows an
+externally constructed lexer - create_parser(lexer) primes its first token
+from that lexer via next_java_token and never takes ownership of it - so
+this wrapper owns both the lexer and the parser records and is responsible
+for releasing both. The lexer must outlive parse(parser) because the
+parser pulls tokens from it on demand during the parse. translate_to_hir
+lowers the AST to a HIR root that is heap-allocated independently of the
+lexer/parser records, which is why both are torn down before returning.
+The Java lexer and parser expose no dedicated destructor, so their
+heap-allocated records are released directly through Layout's deallocate -
+the same underlying release primitive the other frontends' destroy_*
+helpers ultimately invoke. The AST nodes and their lexeme string handles
+are heap-allocated independently of the parser/lexer records and remain
+owned by the lowered HIR. Returning 0 on null source, lexer-allocation
+failure, parser-allocation failure, or parse failure matches Runa's
+nullable-pointer convention and the dispatcher's documented error
+convention (a 0 return is treated as "frontend failed").
+@End Reasoning
+@Implementation:
+Null-guard source (return 0). create_java_lexer(source) builds the token
+source (it computes its own length via string_length); return 0 on
+failure. create_parser(lexer) allocates the parser and primes the first
+token; on failure deallocate the lexer and return 0. parse(parser) walks
+the token stream to an AST_COMPILATION_UNIT root; on a 0 root deallocate
+parser then lexer and return 0. Lower the AST with translate_to_hir(ast),
+capturing the HIR root. Deallocate the parser (it does not own the lexer)
+and then the lexer, then return the HIR root.
+@End Implementation
+Process called "java_to_hir_from_source" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Let lexer be proc create_java_lexer from Lexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from Parser with lexer
+    If parser is equal to 0:
+        proc deallocate from Layout with lexer
+        Return 0
+    End If
+
+    Let ast be proc parse from Parser with parser
+    If ast is equal to 0:
+        proc deallocate from Layout with parser
+        proc deallocate from Layout with lexer
+        Return 0
+    End If
+
+    Let hir be proc translate_to_hir with ast
+
+    proc deallocate from Layout with parser
+    proc deallocate from Layout with lexer
+
+    Return hir
 End Process
 
 Note: End of Java to HIR Translator
