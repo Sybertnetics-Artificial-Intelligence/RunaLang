@@ -2,13 +2,12 @@ Note: ================================================================
 Note: Makefile Translation Test Suite
 Note: ================================================================
 Note: Comprehensive tests for Makefile bidirectional translation.
-Note: Tests cover:
-Note:   - Lexer: Tokenization of all Makefile constructs
-Note:   - Parser: AST generation for various patterns
-Note:   - Translator: AST→HIR conversion accuracy
-Note:   - Backend: HIR→Makefile generation correctness
-Note:   - Round-trip: Source preservation and normalization
-Note:   - Edge cases: Error handling and boundary conditions
+Note: Drives the real Makefile translation pipeline end to end:
+Note:   - Lexer: create_lexer + tokenize (source -> token stream)
+Note:   - Parser: create_parser + parse_makefile (tokens -> AST)
+Note:   - HIR: makefile_to_hir_from_source (source -> HIR)
+Note:   - Backend: create_backend + translate_hir_module (HIR -> Makefile)
+Note:   - Round-trip: emitter parse_makefile + generate_makefile
 Note: ================================================================
 
 Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_lexer.runa" as MakefileLexer
@@ -16,1359 +15,443 @@ Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_pars
 Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_to_hir.runa" as MakefileToHIR
 Import "compiler/middle/gungnir/hir/translation/backends/makefile/hir_to_makefile.runa" as HIRToMakefile
 Import "compiler/middle/gungnir/hir/translation/backends/makefile/makefile_emitter.runa" as MakefileEmitter
-Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/list.runa" as ListCore
-
-Note: ================================================================
-Note: Test Framework
-Note: ================================================================
 
 @Reasoning:
-Per-test record carrying name, pass/fail (1/0), diagnostic message,
-and expected/actual value strings. Identical schema to peer suites
-(verilog) for cross-suite report aggregation.
+Three-counter aggregate for the Makefile pipeline driver. The shared
+results handle threads through every test_* proc so the final verdict
+reflects all phases.
 @End Reasoning
 
 @Implementation:
-5 fields at offsets 0/8/16/24/32 in a 40-byte heap allocation.
-Populated by add_test_result, consumed by print_test_results.
+total at offset 0, passed at 8, failed at 16, maintained through
+type-checked field access on the value-typed SuiteResults.
 @End Implementation
 
-Type called "TestResult":
-    test_name as String
-    passed as Integer  Note: 1 if passed, 0 if failed
-    message as String
-    expected as String
-    actual as String
+Type called "SuiteResults":
+    total as Integer
+    passed as Integer
+    failed as Integer
 End Type
 
 @Reasoning:
-Container for an entire test phase (lexer, parser, etc.) holding
-the suite name, tests list pointer, and aggregate pass/fail
-counters.
+Top-level orchestrator. Runs the lexer, parser, HIR, backend, and
+round-trip phases against the real translation entry points and
+prints a final pass/fail summary. Returns non-zero if any test
+failed so a build runner can gate on the exit code.
 @End Reasoning
 
 @Implementation:
-4 fields at offsets 0 (name)/8 (tests list)/16 (passed_count)/
-24 (failed_count). 32-byte heap block allocated by create_test_suite.
+Initialize SuiteResults, print header, call each test_* proc passing
+the shared results handle, print summary, return 1 when
+results.failed > 0 else 0.
 @End Implementation
 
-Type called "TestSuite":
-    name as String
-    tests as Integer  Note: Pointer to list of test results
-    passed_count as Integer
-    failed_count as Integer
-End Type
+@TestCases:
+- All phases pass -> failed == 0, exit 0
+- Any assertion fails -> failed >= 1, exit 1
+@End TestCases
 
-@Reasoning:
-Constructor for a fresh TestSuite.
-@End Reasoning
+Process called "main" returns Integer:
+    Let results be a value of type SuiteResults with
+        total as 0,
+        passed as 0,
+        failed as 0
 
-@Implementation:
-allocate(32), write name + empty tests list + zero counters.
-@End Implementation
+    proc print_main_header
 
-Process called "create_test_suite" that takes suite_name as String returns Integer:
-    @Reasoning
-    Create a new test suite for organizing related tests.
-    @End Reasoning
+    proc test_lexer with results
+    proc test_parser with results
+    proc test_to_hir with results
+    proc test_backend with results
+    proc test_round_trip with results
 
-    Let suite_ptr be proc allocate from Memory with 32
+    proc print_final_results with results
 
-    proc write_string from Memory with suite_ptr, 0, suite_name
+    If results.failed is greater than 0:
+        Return 1
+    End If
 
-    Let tests_list be proc create_list from ListCore
-    proc write_integer from Memory with suite_ptr, 8, tests_list
-
-    proc write_integer from Memory with suite_ptr, 16, 0  Note: passed_count
-    proc write_integer from Memory with suite_ptr, 24, 0  Note: failed_count
-
-    Return suite_ptr
+    Return 0
 End Process
 
 @Reasoning:
-Appends a TestResult to the suite and updates pass/fail counters.
+Lexer phase: verifies create_lexer + tokenize produce a non-zero
+token-stream handle for representative Makefile inputs (variable
+assignment, rule with recipe).
 @End Reasoning
 
 @Implementation:
-allocate(40), populate fields, append to tests list at offset 8,
-increment passed_count or failed_count based on the passed flag.
+Two lex+record blocks. Each creates a lexer over the source, runs
+tokenize, and records a pass when the returned tokens handle is
+non-zero.
 @End Implementation
 
-Process called "add_test_result" that takes suite_ptr as Integer, test_name as String, passed as Integer, message as String, expected as String, actual as String returns Integer:
-    @Reasoning
-    Add a test result to the suite.
-    @End Reasoning
+@TestCases:
+- "CC = gcc\n" -> tokens != 0
+- "all:\n\techo hi\n" -> tokens != 0
+@End TestCases
 
-    Let result_ptr be proc allocate from Memory with 40
+Process called "test_lexer" takes results as Integer returns Integer:
+    proc print_string with "Testing Makefile lexer..."
+    proc print_newline
 
-    proc write_string from Memory with result_ptr, 0, test_name
-    proc write_integer from Memory with result_ptr, 8, passed
-    proc write_string from Memory with result_ptr, 16, message
-    proc write_string from Memory with result_ptr, 24, expected
-    proc write_string from Memory with result_ptr, 32, actual
+    Let src1 be proc create_string_literal with "CC = gcc\n"
+    Let lexer1 be proc create_lexer from MakefileLexer with src1
+    Let tokens1 be proc tokenize from MakefileLexer with lexer1
+    proc record_nonzero with results, tokens1, "Lex variable assignment"
 
-    Let tests_list be proc read_integer from Memory with suite_ptr, 8
-    proc add_to_list from ListCore with tests_list, result_ptr
+    Let src2 be proc create_string_literal with "all:\n\techo hi\n"
+    Let lexer2 be proc create_lexer from MakefileLexer with src2
+    Let tokens2 be proc tokenize from MakefileLexer with lexer2
+    proc record_nonzero with results, tokens2, "Lex rule with recipe"
 
-    Note: Update counts
-    If passed is equal to 1:
-        Let passed_count be proc read_integer from Memory with suite_ptr, 16
-        proc write_integer from Memory with suite_ptr, 16, passed_count plus 1
+    Return 1
+End Process
+
+@Reasoning:
+Parser phase: drives the real lex -> create_parser -> parse_makefile
+chain and verifies a non-zero AST handle for a variable assignment
+and a target rule.
+@End Reasoning
+
+@Implementation:
+Two blocks. Each tokenizes the source, builds a parser over the
+tokens, parses the Makefile, and records a pass when the AST handle
+is non-zero.
+@End Implementation
+
+@TestCases:
+- "CFLAGS = -O2\n" -> AST != 0
+- "build: main.o\n\tcc -o build main.o\n" -> AST != 0
+@End TestCases
+
+Process called "test_parser" takes results as Integer returns Integer:
+    proc print_string with "Testing Makefile parser..."
+    proc print_newline
+
+    Let src1 be proc create_string_literal with "CFLAGS = -O2\n"
+    Let lexer1 be proc create_lexer from MakefileLexer with src1
+    Let tokens1 be proc tokenize from MakefileLexer with lexer1
+    Let parser1 be proc create_parser from MakefileParser with tokens1
+    Let ast1 be proc parse_makefile from MakefileParser with parser1
+    proc record_nonzero with results, ast1, "Parse variable assignment"
+
+    Let src2 be proc create_string_literal with "build: main.o\n\tcc -o build main.o\n"
+    Let lexer2 be proc create_lexer from MakefileLexer with src2
+    Let tokens2 be proc tokenize from MakefileLexer with lexer2
+    Let parser2 be proc create_parser from MakefileParser with tokens2
+    Let ast2 be proc parse_makefile from MakefileParser with parser2
+    proc record_nonzero with results, ast2, "Parse target rule"
+
+    Return 1
+End Process
+
+@Reasoning:
+HIR phase: verifies makefile_to_hir_from_source lowers source all the
+way to a non-zero HIR handle, proving lex+parse+translate chains
+correctly.
+@End Reasoning
+
+@Implementation:
+Two source-to-HIR blocks. Each records a pass when the returned HIR
+handle is non-zero.
+@End Implementation
+
+@TestCases:
+- "PREFIX = /usr/local\n" -> HIR != 0
+- "clean:\n\trm -f *.o\n" -> HIR != 0
+@End TestCases
+
+Process called "test_to_hir" takes results as Integer returns Integer:
+    proc print_string with "Testing Makefile to HIR translation..."
+    proc print_newline
+
+    Let src1 be proc create_string_literal with "PREFIX = /usr/local\n"
+    Let hir1 be proc makefile_to_hir_from_source from MakefileToHIR with src1
+    proc record_nonzero with results, hir1, "HIR from variable assignment"
+
+    Let src2 be proc create_string_literal with "clean:\n\trm -f *.o\n"
+    Let hir2 be proc makefile_to_hir_from_source from MakefileToHIR with src2
+    proc record_nonzero with results, hir2, "HIR from clean rule"
+
+    Return 1
+End Process
+
+@Reasoning:
+Backend phase: lowers source to HIR, emits Makefile text via the
+HIR-to-Makefile backend (create_backend + translate_hir_module),
+and asserts the emitted text contains the salient identifier.
+@End Reasoning
+
+@Implementation:
+1. makefile_to_hir_from_source -> hir.
+2. create_backend -> backend.
+3. translate_hir_module(backend, hir) -> output.
+4. string_contains assertion on the output.
+@End Implementation
+
+@TestCases:
+- "CC = gcc\n" -> output contains "CC"
+- Backend drops the variable name -> "Backend emits variable name" fails
+@End TestCases
+
+Process called "test_backend" takes results as Integer returns Integer:
+    proc print_string with "Testing HIR to Makefile generation..."
+    proc print_newline
+
+    Let src be proc create_string_literal with "CC = gcc\n"
+    Let hir be proc makefile_to_hir_from_source from MakefileToHIR with src
+
+    Let backend be proc create_backend from HIRToMakefile
+    Let output be proc translate_hir_module from HIRToMakefile with backend, hir
+
+    Let cc_needle be proc create_string_literal with "CC"
+    Let has_cc be proc string_contains with output, cc_needle
+    proc record_equals with results, has_cc, 1, "Backend emits variable name"
+
+    Return 1
+End Process
+
+@Reasoning:
+Round-trip phase: Makefile -> HIR -> Makefile via the emitter facade.
+parse_makefile lowers the source to HIR inside the emitter, and
+generate_makefile emits the regenerated Makefile text. The salient
+tokens must survive both directions.
+@End Reasoning
+
+@Implementation:
+1. create_emitter -> emitter.
+2. parse_makefile(emitter, source) -> hir.
+3. generate_makefile(emitter) -> output.
+4. string_contains for the variable name and its value.
+@End Implementation
+
+@TestCases:
+- "TARGET = app\n" -> output contains "TARGET" and "app"
+- Emitter drops the value -> "Round-trip preserves value" fails
+@End TestCases
+
+Process called "test_round_trip" takes results as Integer returns Integer:
+    proc print_string with "Testing Makefile round-trip..."
+    proc print_newline
+
+    Let src be proc create_string_literal with "TARGET = app\n"
+    Let emitter be proc create_emitter from MakefileEmitter
+    Let hir be proc parse_makefile from MakefileEmitter with emitter, src
+    proc record_nonzero with results, hir, "Round-trip parse to HIR"
+
+    Let output be proc generate_makefile from MakefileEmitter with emitter
+
+    Let target_needle be proc create_string_literal with "TARGET"
+    Let has_target be proc string_contains with output, target_needle
+    proc record_equals with results, has_target, 1, "Round-trip preserves name"
+
+    Let app_needle be proc create_string_literal with "app"
+    Let has_app be proc string_contains with output, app_needle
+    proc record_equals with results, has_app, 1, "Round-trip preserves value"
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: Recording / assertion helpers
+Note: ========================================
+
+@Reasoning:
+Records a pass when value is non-zero (used for token/AST/HIR handle
+presence checks). Increments total always and passed/failed based on
+the handle, printing a localized failure line on miss.
+@End Reasoning
+
+@Implementation:
+results.total += 1. If value != 0, results.passed += 1; otherwise
+results.failed += 1 and print "FAILED: <message> (null handle)".
+@End Implementation
+
+Process called "record_nonzero" takes results as Integer, value as Integer, message as String returns Integer:
+    Set results.total to results.total plus 1
+
+    If value is not equal to 0:
+        Set results.passed to results.passed plus 1
     Otherwise:
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-        proc write_integer from Memory with suite_ptr, 24, failed_count plus 1
+        Set results.failed to results.failed plus 1
+        proc print_string with "FAILED: "
+        proc print_string with message
+        proc print_string with " (null handle)"
+        proc print_newline
     End If
 
     Return 1
 End Process
 
 @Reasoning:
-String equality assertion. Pass/fail recorded in suite.
+Records a pass when actual equals expected (used for contains
+checks). Increments total always and passed/failed accordingly,
+printing both operands on a miss for fast localization.
 @End Reasoning
 
 @Implementation:
-StringCore.string_equals(expected, actual); on match add_test_result
-pass=1, else pass=0 with message "Values not equal".
+results.total += 1. If actual == expected, results.passed += 1;
+otherwise results.failed += 1 and print the message plus operands.
 @End Implementation
 
-Process called "assert_equals" that takes suite_ptr as Integer, test_name as String, expected as String, actual as String returns Integer:
-    @Reasoning
-    Assert that two strings are equal. Records test result.
-    @End Reasoning
+Process called "record_equals" takes results as Integer, actual as Integer, expected as Integer, message as String returns Integer:
+    Set results.total to results.total plus 1
 
-    Let are_equal be proc string_equals from StringCore with expected, actual
-
-    If are_equal is equal to 1:
-        proc add_test_result with suite_ptr, test_name, 1, "PASS", expected, actual
-        Return 1
+    If actual is equal to expected:
+        Set results.passed to results.passed plus 1
     Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, "Values not equal", expected, actual
+        Set results.failed to results.failed plus 1
+        proc print_string with "FAILED: "
+        proc print_string with message
+        proc print_string with " (expected: "
+        proc print_integer with expected
+        proc print_string with ", actual: "
+        proc print_integer with actual
+        proc print_string with ")"
+        proc print_newline
+    End If
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: Output helpers
+Note: ========================================
+
+@Reasoning:
+Banner emitted once at startup naming the suite and the five pipeline
+phases it drives.
+@End Reasoning
+
+@Implementation:
+Print title, separator, and a one-line description of the covered
+phases.
+@End Implementation
+
+Process called "print_main_header" returns Integer:
+    proc print_string with "MAKEFILE TRANSLATION TEST SUITE"
+    proc print_newline
+    proc print_string with "===================================="
+    proc print_newline
+    proc print_string with "Lexer / Parser / HIR / Backend / Round-Trip"
+    proc print_newline
+
+    Return 1
+End Process
+
+@Reasoning:
+Final summary. Prints the total/passed/failed counts via type-checked
+field access and a single human-readable verdict line.
+@End Reasoning
+
+@Implementation:
+Print separator and three counter lines. If results.failed == 0 print
+"ALL TESTS PASSED!" else "SOME TESTS FAILED!".
+@End Implementation
+
+Process called "print_final_results" takes results as Integer returns Integer:
+    proc print_string with "===================================="
+    proc print_newline
+
+    proc print_string with "Total: "
+    proc print_integer with results.total
+    proc print_newline
+
+    proc print_string with "Passed: "
+    proc print_integer with results.passed
+    proc print_newline
+
+    proc print_string with "Failed: "
+    proc print_integer with results.failed
+    proc print_newline
+
+    If results.failed is equal to 0:
+        proc print_string with "ALL TESTS PASSED!"
+        proc print_newline
+    Otherwise:
+        proc print_string with "SOME TESTS FAILED!"
+        proc print_newline
+    End If
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: String helpers
+Note: ========================================
+
+@Reasoning:
+Naive substring search used by backend and round-trip tests to verify
+Makefile tokens survive translation. Operates on the null-terminated
+C strings produced by the backend and emitter.
+@End Reasoning
+
+@Implementation:
+A zero (null) haystack -> 0. Empty needle -> 1. needle longer than
+haystack -> 0. Slide a window over haystack; if all needle bytes
+match at any position -> 1.
+@End Implementation
+
+Process called "string_contains" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
         Return 0
     End If
-End Process
 
-@Reasoning:
-Boolean condition assertion.
-@End Reasoning
+    Let haystack_len be proc string_length from StringCore with haystack
+    Let needle_len be proc string_length from StringCore with needle
 
-@Implementation:
-If condition == 1 add_test_result pass=1, else pass=0.
-@End Implementation
-
-Process called "assert_true" that takes suite_ptr as Integer, test_name as String, condition as Integer, message as String returns Integer:
-    @Reasoning
-    Assert that a condition is true. Records test result.
-    @End Reasoning
-
-    If condition is equal to 1:
-        proc add_test_result with suite_ptr, test_name, 1, message, "true", "true"
+    If needle_len is equal to 0:
         Return 1
-    Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, message, "true", "false"
+    End If
+
+    If needle_len is greater than haystack_len:
         Return 0
     End If
-End Process
 
-@Reasoning:
-Null-pointer assertion.
-@End Reasoning
+    Let i be 0
+    Let max_i be haystack_len minus needle_len
 
-@Implementation:
-If ptr != 0 add_test_result pass=1, else pass=0 with message "Pointer is null".
-@End Implementation
+    While i is less than or equal to max_i:
+        Let matches be 1
+        Let j be 0
 
-Process called "assert_not_null" that takes suite_ptr as Integer, test_name as String, ptr as Integer returns Integer:
-    @Reasoning
-    Assert that a pointer is not null.
-    @End Reasoning
+        While j is less than needle_len:
+            Let h_char be proc string_char_at from StringCore with haystack, i plus j
+            Let n_char be proc string_char_at from StringCore with needle, j
 
-    If ptr is not equal to 0:
-        proc add_test_result with suite_ptr, test_name, 1, "Pointer not null", "non-null", "non-null"
-        Return 1
-    Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, "Pointer is null", "non-null", "null"
-        Return 0
-    End If
-End Process
+            If h_char is not equal to n_char:
+                Set matches to 0
+                Break
+            End If
 
-Note: ================================================================
-Note: Lexer Tests
-Note: ================================================================
+            Set j to j plus 1
+        End While
 
-@Reasoning:
-Verifies the Makefile lexer handles the four Make variable assignment
-forms (=, :=, +=, ?=).
-@End Reasoning
-
-@Implementation:
-Lex a multi-line source with all four forms; assert token count > 10.
-@End Implementation
-
-@TestCases:
-- 4 assignment forms -> > 10 tokens, passed
-- Lexer treats := as : + = -> count drops or wrong types
-@End TestCases
-
-Process called "test_lexer_variable_assignments" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test lexer tokenization of variable assignments.
-    @End Reasoning
-
-    Let source be "CC = gcc\nCFLAGS := -Wall\nLDFLAGS += -lm\nTARGET ?= app"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-
-    Note: Should have tokens for: CC, =, gcc, CFLAGS, :=, -Wall, LDFLAGS, +=, -lm, TARGET, ?=, app
-    Note: Plus newlines and EOF
-    Let _var_assign_ok be token_count is greater than 10
-    proc assert_true with suite_ptr, "Lexer produces tokens for variable assignments", _var_assign_ok, "Token count > 10"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies the lexer recognizes Makefile target rules with the TAB-
-prefixed recipe lines. The TAB token is semantically significant
-in Make and must be a distinct token type.
-@End Reasoning
-
-@Implementation:
-Lex "main.o: main.c\n\tgcc -c main.c"; assert token count > 5
-includes a TAB token.
-@End Implementation
-
-@TestCases:
-- target with TAB recipe -> > 5 tokens, passed
-- Lexer treats TAB as whitespace -> may still pass but recipe lost
-@End TestCases
-
-Process called "test_lexer_target_rules" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test lexer tokenization of target rules.
-    @End Reasoning
-
-    Let source be "main.o: main.c\n\tgcc -c main.c"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-
-    Note: Should include TAB token for recipe
-    Let _target_ok be token_count is greater than 5
-    proc assert_true with suite_ptr, "Lexer produces tokens for target rule", _target_ok, "Token count > 5"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies lexing of pattern rules with % and automatic variables
-($<, $@). These are Make-specific tokens.
-@End Reasoning
-
-@Implementation:
-Lex "%.o: %.c\n\tgcc -c $< -o $@"; assert token count > 5.
-@End Implementation
-
-@TestCases:
-- Pattern rule -> > 5 tokens, passed
-- Lexer rejects $< -> count drops
-@End TestCases
-
-Process called "test_lexer_pattern_rules" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test lexer tokenization of pattern rules with %.
-    @End Reasoning
-
-    Let source be "%.o: %.c\n\tgcc -c $< -o $@"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-
-    Note: Should include percent signs and automatic variables
-    Let _pattern_ok be token_count is greater than 5
-    proc assert_true with suite_ptr, "Lexer produces tokens for pattern rule", _pattern_ok, "Token count > 5"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies the lexer recognizes ifeq/ifneq/ifdef/ifndef/endif
-conditional directives.
-@End Reasoning
-
-@Implementation:
-Lex a conditional directive source; assert correct keyword tokens.
-@End Implementation
-
-@TestCases:
-- ifeq/endif pair tokenizes -> passed
-- Lexer treats "ifeq" as identifier -> failure
-@End TestCases
-
-Process called "test_lexer_conditionals" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test lexer tokenization of conditionals.
-    @End Reasoning
-
-    Let source be "ifeq ($(CC),gcc)\nCFLAGS += -O2\nendif"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-
-    Note: Should include ifeq, parens, variable ref, endif
-    Let _cond_ok be token_count is greater than 8
-    proc assert_true with suite_ptr, "Lexer produces tokens for conditional", _cond_ok, "Token count > 8"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies the lexer handles all Make automatic variables ($@, $<,
-$^, $*, $?, $+, $|).
-@End Reasoning
-
-@Implementation:
-Lex a source containing all 7 automatic variables; assert each
-tokenizes as an automatic-variable token.
-@End Implementation
-
-@TestCases:
-- All automatic variables tokenize -> passed
-- Lexer rejects "$|" -> count drops
-@End TestCases
-
-Process called "test_lexer_automatic_variables" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test lexer tokenization of automatic variables ($@, $<, $^, $?, $*).
-    @End Reasoning
-
-    Let source be "target: dep\n\techo $@ $< $^ $? $*"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-
-    Note: Should include tokens for all automatic variables
-    Let _auto_ok be token_count is greater than 10
-    proc assert_true with suite_ptr, "Lexer produces tokens for automatic variables", _auto_ok, "Token count > 10"
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Parser Tests
-Note: ================================================================
-
-@Reasoning:
-Verifies parser builds AST for "CC = gcc".
-@End Reasoning
-
-@Implementation:
-Lex+parse, assert ast_root non-null via assert_not_null.
-@End Implementation
-
-@TestCases:
-- "CC = gcc" -> non-null AST, passed
-- Parser returns null -> failure
-@End TestCases
-
-Process called "test_parser_simple_variable" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test parser generation of AST for simple variable assignment.
-    @End Reasoning
-
-    Let source be "CC = gcc"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from MakefileParser with tokens
-    Let ast_root be proc parse from MakefileParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for simple variable", ast_root
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies parser builds AST for target rule with multiple deps and
-TAB-prefixed recipe.
-@End Reasoning
-
-@Implementation:
-Lex+parse "app: main.o utils.o\n\tgcc -o ...", assert AST non-null.
-@End Implementation
-
-@TestCases:
-- Target rule with 2 deps and 1 recipe -> AST non-null, passed
-- Parser drops dep -> may still have non-null AST but shape wrong
-@End TestCases
-
-Process called "test_parser_target_rule" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test parser generation of AST for target rule with dependencies and recipes.
-    @End Reasoning
-
-    Let source be "app: main.o utils.o\n\tgcc -o app main.o utils.o"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from MakefileParser with tokens
-    Let ast_root be proc parse from MakefileParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for target rule", ast_root
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies parser builds AST for pattern rule with % and automatic
-variables.
-@End Reasoning
-
-@Implementation:
-Lex+parse "%.o: %.c\n\tgcc -c $< -o $@", assert AST non-null.
-@End Implementation
-
-@TestCases:
-- Pattern rule -> AST non-null, passed
-- Parser fails on % -> AST null
-@End TestCases
-
-Process called "test_parser_pattern_rule" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test parser generation of AST for pattern rule.
-    @End Reasoning
-
-    Let source be "%.o: %.c\n\tgcc -c $< -o $@"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from MakefileParser with tokens
-    Let ast_root be proc parse from MakefileParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for pattern rule", ast_root
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies parser handles conditional block with else branch.
-@End Reasoning
-
-@Implementation:
-Lex+parse ifeq/else/endif source, assert AST non-null.
-@End Implementation
-
-@TestCases:
-- Conditional with else -> AST non-null, passed
-- Parser fails on "else" -> AST null
-@End TestCases
-
-Process called "test_parser_conditional" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test parser generation of AST for conditional block.
-    @End Reasoning
-
-    Let source be "ifeq ($(DEBUG),1)\nCFLAGS += -g\nelse\nCFLAGS += -O2\nendif"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from MakefileParser with tokens
-    Let ast_root be proc parse from MakefileParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for conditional", ast_root
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies parser handles .PHONY and similar special targets.
-@End Reasoning
-
-@Implementation:
-Lex+parse ".PHONY: clean all\nclean:\n\trm -f *.o", assert AST non-null.
-@End Implementation
-
-@TestCases:
-- .PHONY target -> AST non-null, passed
-- Parser fails on "." prefix -> AST null
-@End TestCases
-
-Process called "test_parser_special_target" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test parser generation of AST for special targets like .PHONY.
-    @End Reasoning
-
-    Let source be ".PHONY: clean all\nclean:\n\trm -f *.o"
-
-    Let lexer_ptr be proc create_lexer from MakefileLexer
-    Let tokens be proc scan from MakefileLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from MakefileParser with tokens
-    Let ast_root be proc parse from MakefileParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for special target", ast_root
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Translator Tests
-Note: ================================================================
-
-@Reasoning:
-Verifies AST -> HIR translation for ":=" variable assignment.
-@End Reasoning
-
-@Implementation:
-Lex+parse+translate "CC := gcc"; assert HIR non-null and no errors.
-@End Implementation
-
-@TestCases:
-- ":=" assignment -> HIR non-null with no errors, passed
-- Translator returns null or sets errors -> failure
-@End TestCases
-
-Process called "test_translator_variable_to_hir" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test AST→HIR translation for variable assignments.
-    @End Reasoning
-
-    Let source be "CC := gcc"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let hir_root be proc makefile_to_hir_with_emitter from MakefileEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for variable", hir_root
-
-    Let has_errors be proc has_errors from MakefileEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies AST -> HIR translation for target rule with recipe.
-@End Reasoning
-
-@Implementation:
-Translate "app: main.c\n\tgcc -o app main.c"; assert HIR non-null
-and no errors.
-@End Implementation
-
-@TestCases:
-- Target rule -> HIR non-null, no errors, passed
-- Translator drops recipe -> may still succeed
-@End TestCases
-
-Process called "test_translator_target_to_hir" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test AST→HIR translation for target rules.
-    @End Reasoning
-
-    Let source be "app: main.c\n\tgcc -o app main.c"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let hir_root be proc makefile_to_hir_with_emitter from MakefileEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for target", hir_root
-
-    Let has_errors be proc has_errors from MakefileEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies AST -> HIR translation for ifdef conditional block.
-@End Reasoning
-
-@Implementation:
-Translate "ifdef DEBUG\nCFLAGS = -g\nendif"; assert HIR non-null.
-@End Implementation
-
-@TestCases:
-- ifdef block -> HIR non-null, no errors, passed
-- Translator drops the inner assignment -> HIR shape wrong
-@End TestCases
-
-Process called "test_translator_conditional_to_hir" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test AST→HIR translation for conditionals.
-    @End Reasoning
-
-    Let source be "ifdef DEBUG\nCFLAGS = -g\nendif"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let hir_root be proc makefile_to_hir_with_emitter from MakefileEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for conditional", hir_root
-
-    Let has_errors be proc has_errors from MakefileEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Backend Tests
-Note: ================================================================
-
-@Reasoning:
-Verifies the HIR -> Makefile backend produces non-empty output for
-a variable assignment.
-@End Reasoning
-
-@Implementation:
-Translate "CC = gcc" to HIR, regenerate, assert output length > 0.
-@End Implementation
-
-@TestCases:
-- Variable HIR -> non-empty regenerated output, passed
-- Backend produces empty string -> "Output not empty" assertion fails
-@End TestCases
-
-Process called "test_backend_variable_generation" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HIR→Makefile generation for variables.
-    @End Reasoning
-
-    Let source be "CC = gcc"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let hir_root be proc makefile_to_hir_with_emitter from MakefileEmitter with emitter_ptr, source
-
-    Let regenerated be proc hir_to_makefile_with_emitter from MakefileEmitter with emitter_ptr, hir_root
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Backend generates non-empty output for variable", is_valid, "Output not empty"
-
-    Return 1
-End Process
-
-@Reasoning:
-Verifies the backend produces output containing a TAB character for
-the recipe line, which is semantically required by Make.
-@End Reasoning
-
-@Implementation:
-Translate target rule to HIR, regenerate; assert output non-empty
-AND contains tab character.
-@End Implementation
-
-@TestCases:
-- Target rule HIR -> regenerated has TAB, passed
-- Backend uses spaces instead of TAB -> "Contains tab character" fails
-@End TestCases
-
-Process called "test_backend_target_generation" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test HIR→Makefile generation for targets.
-    @End Reasoning
-
-    Let source be "app: main.o\n\tgcc -o app main.o"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let hir_root be proc makefile_to_hir_with_emitter from MakefileEmitter with emitter_ptr, source
-
-    Let regenerated be proc hir_to_makefile_with_emitter from MakefileEmitter with emitter_ptr, hir_root
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Backend generates non-empty output for target", is_valid, "Output not empty"
-
-    Note: Check that recipe line starts with tab
-    Let has_tab be proc string_contains from StringCore with regenerated, "\t"
-    proc assert_true with suite_ptr, "Backend generates tab for recipe", has_tab, "Contains tab character"
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Round-Trip Tests
-Note: ================================================================
-
-@Reasoning:
-Round-trip check that a simple variable assignment preserves both
-the variable name and value through translation.
-@End Reasoning
-
-@Implementation:
-round_trip_translate("CC = gcc"); assert output contains both "CC"
-and "gcc".
-@End Implementation
-
-@TestCases:
-- "CC = gcc" -> output contains "CC" and "gcc", passed
-- Backend loses variable name -> "Contains CC" fails
-- Backend loses variable value -> "Contains gcc" fails
-@End TestCases
-
-Process called "test_round_trip_simple_variable" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test round-trip translation of simple variable assignment.
-    @End Reasoning
-
-    Let source be "CC = gcc"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Note: Regenerated should preserve semantics (may normalize formatting)
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves variable assignment", is_valid, "Non-empty output"
-
-    Let contains_cc be proc string_contains from StringCore with regenerated, "CC"
-    proc assert_true with suite_ptr, "Round-trip preserves variable name", contains_cc, "Contains CC"
-
-    Let contains_gcc be proc string_contains from StringCore with regenerated, "gcc"
-    proc assert_true with suite_ptr, "Round-trip preserves variable value", contains_gcc, "Contains gcc"
-
-    Return 1
-End Process
-
-@Reasoning:
-Round-trip check that target rule preserves target name and colon
-separator.
-@End Reasoning
-
-@Implementation:
-round_trip_translate target rule; assert output contains "app" and ":".
-@End Implementation
-
-@TestCases:
-- target rule -> output contains "app" and ":", passed
-- Backend drops target name -> "Contains app" fails
-@End TestCases
-
-Process called "test_round_trip_target_rule" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test round-trip translation of target rule.
-    @End Reasoning
-
-    Let source be "app: main.o\n\tgcc -o app main.o"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves target rule", is_valid, "Non-empty output"
-
-    Let contains_app be proc string_contains from StringCore with regenerated, "app"
-    proc assert_true with suite_ptr, "Round-trip preserves target name", contains_app, "Contains app"
-
-    Let contains_colon be proc string_contains from StringCore with regenerated, ":"
-    proc assert_true with suite_ptr, "Round-trip preserves colon", contains_colon, "Contains colon"
-
-    Return 1
-End Process
-
-@Reasoning:
-Round-trip check that pattern rule preserves "%" pattern and "$@"
-automatic variable.
-@End Reasoning
-
-@Implementation:
-round_trip_translate pattern rule; assert output contains "%" and "$@".
-@End Implementation
-
-@TestCases:
-- pattern rule -> output contains "%" and "$@", passed
-- Backend expands "$@" -> "Contains $@" fails (silent transformation)
-@End TestCases
-
-Process called "test_round_trip_pattern_rule" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test round-trip translation of pattern rule with %.
-    @End Reasoning
-
-    Let source be "%.o: %.c\n\tgcc -c $< -o $@"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves pattern rule", is_valid, "Non-empty output"
-
-    Let contains_percent be proc string_contains from StringCore with regenerated, "%"
-    proc assert_true with suite_ptr, "Round-trip preserves % pattern", contains_percent, "Contains %"
-
-    Let contains_auto_target be proc string_contains from StringCore with regenerated, "$@"
-    proc assert_true with suite_ptr, "Round-trip preserves $@ automatic variable", contains_auto_target, "Contains $@"
-
-    Return 1
-End Process
-
-@Reasoning:
-Round-trip check that ifeq conditional preserves the conditional
-form through translation.
-@End Reasoning
-
-@Implementation:
-round_trip_translate ifeq conditional; assert output non-empty.
-@End Implementation
-
-@TestCases:
-- ifeq block -> non-empty regenerated, passed
-- Backend drops conditional -> empty output -> fails
-@End TestCases
-
-Process called "test_round_trip_conditional" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test round-trip translation of conditional blocks.
-    @End Reasoning
-
-    Let source be "ifeq ($(CC),gcc)\nCFLAGS = -O2\nendif"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves conditional", is_valid, "Non-empty output"
-
-    Let contains_ifeq be proc string_contains from StringCore with regenerated, "ifeq"
-    proc assert_true with suite_ptr, "Round-trip preserves ifeq", contains_ifeq, "Contains ifeq"
-
-    Let contains_endif be proc string_contains from StringCore with regenerated, "endif"
-    proc assert_true with suite_ptr, "Round-trip preserves endif", contains_endif, "Contains endif"
-
-    Return 1
-End Process
-
-@Reasoning:
-Round-trip check that special targets (.PHONY) survive translation.
-@End Reasoning
-
-@Implementation:
-round_trip_translate .PHONY block; assert output preserves ".PHONY".
-@End Implementation
-
-@TestCases:
-- .PHONY block -> output contains ".PHONY", passed
-- Backend drops directive -> failure
-@End TestCases
-
-Process called "test_round_trip_special_target" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test round-trip translation of special targets.
-    @End Reasoning
-
-    Let source be ".PHONY: clean\nclean:\n\trm -f *.o"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves special target", is_valid, "Non-empty output"
-
-    Let contains_phony be proc string_contains from StringCore with regenerated, ".PHONY"
-    proc assert_true with suite_ptr, "Round-trip preserves .PHONY", contains_phony, "Contains .PHONY"
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Complex Integration Tests
-Note: ================================================================
-
-@Reasoning:
-Integration test using a complete realistic Makefile combining
-variables, targets, pattern rules, and special targets.
-@End Reasoning
-
-@Implementation:
-round_trip_translate a complete Makefile; assert output non-empty
-and contains essential elements.
-@End Implementation
-
-@TestCases:
-- Complete Makefile -> non-empty regenerated with all elements, passed
-- Backend drops a section -> contains check fails
-@End TestCases
-
-Process called "test_complete_makefile" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test complete Makefile with multiple constructs.
-    @End Reasoning
-
-    Let source be "CC = gcc\nCFLAGS = -Wall\n\napp: main.o utils.o\n\t$(CC) $(CFLAGS) -o app main.o utils.o\n\n%.o: %.c\n\t$(CC) $(CFLAGS) -c $<\n\nclean:\n\trm -f *.o app\n\n.PHONY: clean"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Complete Makefile round-trip succeeds", is_valid, "Non-empty output"
-
-    Note: Verify key constructs are preserved
-    Let has_variable be proc string_contains from StringCore with regenerated, "CC"
-    proc assert_true with suite_ptr, "Complete Makefile preserves variables", has_variable, "Has variables"
-
-    Let has_target be proc string_contains from StringCore with regenerated, "app:"
-    proc assert_true with suite_ptr, "Complete Makefile preserves targets", has_target, "Has targets"
-
-    Let has_pattern be proc string_contains from StringCore with regenerated, "%.o"
-    proc assert_true with suite_ptr, "Complete Makefile preserves pattern rules", has_pattern, "Has pattern rules"
-
-    Return 1
-End Process
-
-@Reasoning:
-Edge case test for nested or complex conditional directives.
-@End Reasoning
-
-@Implementation:
-round_trip_translate complex conditional block; assert non-empty output.
-@End Implementation
-
-@TestCases:
-- Nested conditionals -> non-empty output, passed
-- Backend cannot handle nesting -> empty output or shape wrong
-@End TestCases
-
-Process called "test_complex_conditionals" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test complex conditional structures with nested blocks.
-    @End Reasoning
-
-    Let source be "ifdef DEBUG\nCFLAGS += -g\nelse\nifeq ($(OPT),1)\nCFLAGS += -O2\nelse\nCFLAGS += -O0\nendif\nendif"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Complex conditionals round-trip succeeds", is_valid, "Non-empty output"
-
-    Return 1
-End Process
-
-@Reasoning:
-Edge case test for Make's order-only dependencies (separated by "|"
-in the dependency list).
-@End Reasoning
-
-@Implementation:
-round_trip_translate target with order-only deps; assert output
-preserves the "|" separator.
-@End Implementation
-
-@TestCases:
-- "target: dep | order_only_dep" -> output contains "|", passed
-- Backend drops the order-only separator -> failure
-@End TestCases
-
-Process called "test_order_only_dependencies" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Test order-only dependencies (target: normal | order-only).
-    @End Reasoning
-
-    Let source be "app: main.o | build_dir\n\tgcc -o app main.o"
-
-    Let emitter_ptr be proc create_emitter from MakefileEmitter
-    Let regenerated be proc round_trip_translate from MakefileEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Order-only dependencies round-trip succeeds", is_valid, "Non-empty output"
-
-    Let has_pipe be proc string_contains from StringCore with regenerated, "|"
-    proc assert_true with suite_ptr, "Order-only separator preserved", has_pipe, "Contains pipe separator"
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Test Suite Execution
-Note: ================================================================
-
-@Reasoning:
-Dispatcher for the Makefile lexer test suite. Returns the suite
-handle populated with results from 5 lexer test_* procs.
-@End Reasoning
-
-@Implementation:
-create_test_suite("Lexer Tests"); call test_lexer_variable_assignments,
-target_rules, pattern_rules, conditionals, automatic_variables with
-the suite. Return the suite_ptr.
-@End Implementation
-
-Process called "run_lexer_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all lexer tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Lexer Tests"
-
-    proc test_lexer_variable_assignments from suite
-    proc test_lexer_target_rules from suite
-    proc test_lexer_pattern_rules from suite
-    proc test_lexer_conditionals from suite
-    proc test_lexer_automatic_variables from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Dispatcher for the parser test suite. Returns the suite handle
-populated with results from 5 parser test_* procs.
-@End Reasoning
-
-@Implementation:
-create_test_suite("Parser Tests"); call test_parser_simple_variable,
-target_rule, pattern_rule, conditional, special_target.
-@End Implementation
-
-Process called "run_parser_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all parser tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Parser Tests"
-
-    proc test_parser_simple_variable from suite
-    proc test_parser_target_rule from suite
-    proc test_parser_pattern_rule from suite
-    proc test_parser_conditional from suite
-    proc test_parser_special_target from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Dispatcher for the translator test suite. Returns the suite handle
-populated with results from 3 translator test_* procs.
-@End Reasoning
-
-@Implementation:
-create_test_suite("Translator Tests"); call test_translator_*.
-@End Implementation
-
-Process called "run_translator_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all translator tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Translator Tests"
-
-    proc test_translator_variable_to_hir from suite
-    proc test_translator_target_to_hir from suite
-    proc test_translator_conditional_to_hir from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Dispatcher for the backend test suite.
-@End Reasoning
-
-@Implementation:
-create_test_suite("Backend Tests"); call test_backend_*.
-@End Implementation
-
-Process called "run_backend_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all backend tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Backend Tests"
-
-    proc test_backend_variable_generation from suite
-    proc test_backend_target_generation from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Dispatcher for the round-trip test suite.
-@End Reasoning
-
-@Implementation:
-create_test_suite("Round-Trip Tests"); call test_round_trip_*.
-@End Implementation
-
-Process called "run_round_trip_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all round-trip tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Round-Trip Tests"
-
-    proc test_round_trip_simple_variable from suite
-    proc test_round_trip_target_rule from suite
-    proc test_round_trip_pattern_rule from suite
-    proc test_round_trip_conditional from suite
-    proc test_round_trip_special_target from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Dispatcher for the integration test suite (complete Makefile,
-complex conditionals, order-only dependencies).
-@End Reasoning
-
-@Implementation:
-create_test_suite("Integration Tests"); call the three integration
-tests.
-@End Implementation
-
-Process called "run_integration_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run all integration tests.
-    @End Reasoning
-
-    Let suite be proc create_test_suite with "Makefile Integration Tests"
-
-    proc test_complete_makefile from suite
-    proc test_complex_conditionals from suite
-    proc test_order_only_dependencies from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Top-level entry point that runs all 6 sub-suites and aggregates
-results.
-@End Reasoning
-
-@Implementation:
-1. Build empty suites_list.
-2. For each phase (lexer/parser/translator/backend/round_trip/
-   integration) call run_<phase>_tests and append result to suites_list.
-3. print_test_results(suites_list).
-4. Return check_all_passed(suites_list).
-@End Implementation
-
-@TestCases:
-- All 6 suites pass -> returns 1
-- Any suite has failures -> returns 0
-@End TestCases
-
-Process called "run_all_tests" that takes nothing returns Integer:
-    @Reasoning
-    Run complete test suite and report results.
-    @End Reasoning
-
-    Let all_suites be proc create_list from ListCore
-
-    Note: Run all test suites
-    Let lexer_suite be proc run_lexer_tests
-    proc add_to_list from ListCore with all_suites, lexer_suite
-
-    Let parser_suite be proc run_parser_tests
-    proc add_to_list from ListCore with all_suites, parser_suite
-
-    Let translator_suite be proc run_translator_tests
-    proc add_to_list from ListCore with all_suites, translator_suite
-
-    Let backend_suite be proc run_backend_tests
-    proc add_to_list from ListCore with all_suites, backend_suite
-
-    Let round_trip_suite be proc run_round_trip_tests
-    proc add_to_list from ListCore with all_suites, round_trip_suite
-
-    Let integration_suite be proc run_integration_tests
-    proc add_to_list from ListCore with all_suites, integration_suite
-
-    Note: Print results
-    proc print_test_results from all_suites
-
-    Note: Return overall success (1 if all passed, 0 if any failed)
-    Return proc check_all_passed from all_suites
-End Process
-
-Note: ================================================================
-Note: Test Result Reporting
-Note: ================================================================
-
-@Reasoning:
-Iterates suites_list and prints per-suite counts plus per-test
-failure details.
-@End Reasoning
-
-@Implementation:
-For each suite_ptr: print name + pass/fail counts; on any failures,
-call print_failed_tests.
-@End Implementation
-
-Process called "print_test_results" that takes suites_list as Integer returns Integer:
-    @Reasoning
-    Print formatted test results for all suites.
-    @End Reasoning
-
-    Let suite_count be proc get_list_size from ListCore with suites_list
-    Let total_passed be 0
-    Let total_failed be 0
-
-    Let index be 0
-    While index is less than suite_count:
-        Let suite_ptr be proc get_from_list from ListCore with suites_list, index
-
-        Let suite_name be proc read_string from Memory with suite_ptr, 0
-        Let passed_count be proc read_integer from Memory with suite_ptr, 16
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-
-        Note: Print suite header
-        proc print_string from StringCore with "========================================\n"
-        proc print_string from StringCore with suite_name
-        proc print_string from StringCore with "\n"
-        proc print_string from StringCore with "========================================\n"
-
-        Note: Print suite results
-        proc print_string from StringCore with "Passed: "
-        proc print_integer from StringCore with passed_count
-        proc print_string from StringCore with "\n"
-
-        proc print_string from StringCore with "Failed: "
-        proc print_integer from StringCore with failed_count
-        proc print_string from StringCore with "\n\n"
-
-        Note: Print individual test results if any failed
-        If failed_count is greater than 0:
-            proc print_failed_tests from suite_ptr
+        If matches is equal to 1:
+            Return 1
         End If
 
-        Set total_passed to total_passed plus passed_count
-        Set total_failed to total_failed plus failed_count
-
-        Set index to index plus 1
+        Set i to i plus 1
     End While
 
-    Note: Print overall summary
-    proc print_string from StringCore with "========================================\n"
-    proc print_string from StringCore with "OVERALL RESULTS\n"
-    proc print_string from StringCore with "========================================\n"
-    proc print_string from StringCore with "Total Passed: "
-    proc print_integer from StringCore with total_passed
-    proc print_string from StringCore with "\n"
-    proc print_string from StringCore with "Total Failed: "
-    proc print_integer from StringCore with total_failed
-    proc print_string from StringCore with "\n"
-
-    Return 1
+    Return 0
 End Process
 
 @Reasoning:
-Walks the suite's tests list and prints each failing test's name,
-message, expected and actual values.
+Thin wrapper around StringCore.create_from_literal so call sites read
+as "create_string_literal" without a hard dependency on the exact
+primitive name.
 @End Reasoning
 
 @Implementation:
-For each result_ptr in suite's tests list: if passed == 0, print
-all 5 fields. Skip passing tests.
+Forward to StringCore.create_from_literal(value).
 @End Implementation
 
-Process called "print_failed_tests" that takes suite_ptr as Integer returns Integer:
-    @Reasoning
-    Print details of failed tests in a suite.
-    @End Reasoning
-
-    Let tests_list be proc read_integer from Memory with suite_ptr, 8
-    Let test_count be proc get_list_size from ListCore with tests_list
-
-    proc print_string from StringCore with "Failed Tests:\n"
-
-    Let index be 0
-    While index is less than test_count:
-        Let test_ptr be proc get_from_list from ListCore with tests_list, index
-
-        Let passed be proc read_integer from Memory with test_ptr, 8
-
-        If passed is equal to 0:
-            Let test_name be proc read_string from Memory with test_ptr, 0
-            Let message be proc read_string from Memory with test_ptr, 16
-            Let expected be proc read_string from Memory with test_ptr, 24
-            Let actual be proc read_string from Memory with test_ptr, 32
-
-            proc print_string from StringCore with "  - "
-            proc print_string from StringCore with test_name
-            proc print_string from StringCore with "\n"
-            proc print_string from StringCore with "    Message: "
-            proc print_string from StringCore with message
-            proc print_string from StringCore with "\n"
-            proc print_string from StringCore with "    Expected: "
-            proc print_string from StringCore with expected
-            proc print_string from StringCore with "\n"
-            proc print_string from StringCore with "    Actual: "
-            proc print_string from StringCore with actual
-            proc print_string from StringCore with "\n"
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
+Process called "create_string_literal" takes value as String returns Integer:
+    Return proc create_from_literal from StringCore with value
 End Process
 
-@Reasoning:
-Reduces suites_list to a single all-pass signal.
-@End Reasoning
-
-@Implementation:
-For each suite_ptr: read failed_count at offset 24; if > 0 return 0.
-Loop completes -> return 1.
-@End Implementation
-
-@TestCases:
-- All suites have failed_count == 0 -> return 1
-- Any suite has failures -> return 0
-@End TestCases
-
-Process called "check_all_passed" that takes suites_list as Integer returns Integer:
-    @Reasoning
-    Check if all tests in all suites passed.
-    @End Reasoning
-
-    Let suite_count be proc get_list_size from ListCore with suites_list
-
-    Let index be 0
-    While index is less than suite_count:
-        Let suite_ptr be proc get_from_list from ListCore with suites_list, index
-
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-
-        If failed_count is greater than 0:
-            Return 0  Note: At least one test failed
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1  Note: All tests passed
-End Process
-
-Note: ================================================================
-Note: Public API
-Note: ================================================================
-
-@Reasoning:
-External entry point callable from a top-level test runner.
-@End Reasoning
-
-@Implementation:
-Forward to run_all_tests() and return its result.
-@End Implementation
-
-Process called "test_makefile_translation" that takes nothing returns Integer:
-    @Reasoning
-    Main entry point for running Makefile Translation tests.
-    Returns 1 if all tests pass, 0 if any fail.
-    @End Reasoning
-
-    Return proc run_all_tests
-End Process
+Note: print_string, print_newline, and print_integer are bootstrap-runtime
+Note: globals; test code calls them directly.

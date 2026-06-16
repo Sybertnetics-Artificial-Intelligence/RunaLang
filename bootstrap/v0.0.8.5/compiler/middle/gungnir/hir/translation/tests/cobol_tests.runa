@@ -4,657 +4,415 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-COBOL Comprehensive Test Suite Runner
+COBOL Translation Test Suite
 
-Runs all COBOL test suites:
-1. Lexer tests (comprehensive tokenization)
-2. Parser tests (AST generation)
-3. HIR translation tests (AST → HIR)
-4. Code generation tests (HIR → COBOL)
-5. Round-trip translation tests (COBOL → HIR → COBOL)
+Drives the REAL, current COBOL translation API across the five compilation
+phases the suite has always covered:
 
-Total: 50+ comprehensive tests covering all COBOL-85 features
+  1. Lexer / Parser   - parse_cobol(source) builds the COBOL AST.
+  2. AST -> HIR        - translate_cobol_to_hir(ast, arena) and the convenience
+                         cobol_to_hir_from_source(source) lower the AST to the
+                         cobol HIR dictionary/list model (32-byte dict header:
+                         size@0, capacity@8, keys@16, values@24; child lists are
+                         ListOps lists; string payloads are raw char* handles).
+  3. HIR content       - PROGRAM-ID, WORKING-STORAGE item (level + PIC + VALUE),
+                         paragraphs, MOVE / IF-ELSE / PERFORM / COMPUTE / DISPLAY.
+  4. Code generation   - hir_to_cobol(hir) emits COBOL text.
+  5. Round-trip        - the emitted text re-lowers to HIR whose contents survive.
+
+Exit code: number of failed assertions (0 == all passed).
 :End Note
 
+Import "compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_parser.runa" as CobolParser
+Import "compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_to_hir.runa" as CobolFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/cobol/hir_to_cobol.runa" as CobolBackend
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: cobol HIR dict/list decoders (mirror the producer/consumer contract)
+Note: ============================================================================
 
 @Reasoning:
-Aggregated four-counter struct for the COBOL suite-of-suites driver.
-Same layout as the JavaScript/C# variants so a unified runner can
-consume any of them without struct conversion.
+A cobol HIR dictionary is a 32-byte header over two parallel int64 arrays:
+size (offset 0), capacity (offset 8), keys pointer (offset 16), values pointer
+(offset 24). This decoder linear-scans the populated prefix comparing the raw
+key with string_equals and returns the parallel value slot -- the exact lookup
+hir_to_cobol performs.
 @End Reasoning
-
-@Implementation:
-total_suites at 0, passed_suites at 8, failed_suites at 16,
-total_tests at 24. Mutated via Layout.memory_set_integer because the
-struct is shared by handle.
-@End Implementation
-
-Type called "SuiteResults":
-    total_suites as Integer
-    passed_suites as Integer
-    failed_suites as Integer
-    total_tests as Integer
-End Type
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Layout with node, 0
+    Let keys be proc memory_get_int64 from Layout with node, 16
+    Let values be proc memory_get_int64 from Layout with node, 24
+    If keys is equal to 0:
+        Return 0
+    End If
+    Let index be 0
+    While index is less than size:
+        Let slot_offset be index multiplied by 8
+        Let stored_key be proc memory_get_int64 from Layout with keys, slot_offset
+        If stored_key is not equal to 0:
+            Let matches be proc string_equals from StringCore with stored_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with values, slot_offset
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
 
 @Reasoning:
-Top-level orchestrator for the COBOL suite-of-suites. Five sub-suite
-drivers cover the full pipeline (lex, parse, AST->HIR, HIR->COBOL,
-round-trip). The five-stage breakdown means a CI failure immediately
-diagnoses which compilation phase regressed.
+String fields ("_type", "name", "level", "picture", "value") are stored as raw
+char* handles in the value slot, so the same lookup serves string and node
+values; the caller decides how to interpret the result.
 @End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Return proc dict_get with node, key
+End Process
 
-@Implementation:
-Initialize SuiteResults, print banner, then for each sub-suite:
-print separator, call run_<phase>_tests, pass its return through
-update_results. Final summary, return 1 on any failure.
-@End Implementation
+@Reasoning:
+Returns the element count of a cobol HIR child list (a ListOps list), or 0 when
+absent.
+@End Reasoning
+Process called "list_count" takes list_node as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from ListOps with list_node
+End Process
 
-@TestCases:
-- All 5 sub-suite drivers return 0 -> total_suites=5, passed=5, exit 0
-- Any sub-suite returns non-zero -> failed_suites += 1, exit 1
-@End TestCases
+@Reasoning:
+Returns the element at index of a cobol HIR child list, or 0 when absent.
+@End Reasoning
+Process called "list_item" takes list_node as Integer, index as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from ListOps with list_node, index
+End Process
+
+@Reasoning:
+Locates the first element of a child list whose "_type" matches the requested
+kind.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with list_node
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with list_node, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts the elements of a child list whose "_type" matches the requested kind.
+@End Reasoning
+Process called "count_of_type" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with list_node
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with list_node, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Set found to found plus 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Searches a list of paragraphs for any statement of a given kind by scanning
+each paragraph's "statements" list. Returns the first matching statement node,
+or 0. Bounded by the paragraph and statement counts so it always terminates.
+@End Reasoning
+Process called "find_stmt_in_paragraphs" takes paragraphs as Integer, kind as Integer returns Integer:
+    If paragraphs is equal to 0:
+        Return 0
+    End If
+    Let pcount be proc list_count with paragraphs
+    Let p be 0
+    While p is less than pcount:
+        Let para be proc list_item with paragraphs, p
+        Let stmts be proc dict_get with para, "statements"
+        If stmts is not equal to 0:
+            Let scount be proc list_count with stmts
+            Let s be 0
+            While s is less than scount:
+                Let stmt be proc list_item with stmts, s
+                Let stmt_type be proc dict_get_string with stmt, "_type"
+                If stmt_type is not equal to 0:
+                    Let matches be proc string_equals from StringCore with stmt_type, kind
+                    If matches is equal to 1:
+                        Return stmt
+                    End If
+                End If
+                Set s to s plus 1
+            End While
+        End If
+        Set p to p plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Navigation helpers over the cobol_program HIR
+Note: ============================================================================
+
+@Reasoning:
+The program root holds a "divisions" list; this locates a division by its
+"_type" tag.
+@End Reasoning
+Process called "find_division" takes hir_root as Integer, type_name as Integer returns Integer:
+    Let divisions be proc dict_get with hir_root, "divisions"
+    Return proc find_in_list with divisions, type_name
+End Process
+
+@Reasoning:
+Returns the WORKING-STORAGE section's "items" list from the DATA DIVISION.
+@End Reasoning
+Process called "find_working_storage_items" takes hir_root as Integer returns Integer:
+    Let data_div be proc find_division with hir_root, "cobol_data_division"
+    If data_div is equal to 0:
+        Return 0
+    End If
+    Let body be proc dict_get with data_div, "sections"
+    Let ws be proc find_in_list with body, "cobol_working_storage"
+    If ws is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get with ws, "items"
+End Process
+
+@Reasoning:
+Locates a WORKING-STORAGE item by name in the items list.
+@End Reasoning
+Process called "find_item_by_name" takes items as Integer, want_name as Integer returns Integer:
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with items, index
+        Let item_name be proc dict_get_string with item, "name"
+        If item_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_name, want_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the PROCEDURE DIVISION's "body" list (the paragraph nodes).
+@End Reasoning
+Process called "find_procedure_paragraphs" takes hir_root as Integer returns Integer:
+    Let proc_div be proc find_division with hir_root, "cobol_procedure_division"
+    If proc_div is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get with proc_div, "body"
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Runs the identical front of the pipeline (parse -> lower to HIR) so the two
+probe runs (original source and emitted text) are behaviourally identical and
+any divergence is attributable to the emitter.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let ast be proc parse_cobol from CobolParser with source
+    If ast is equal to 0:
+        Return 0
+    End If
+    Let arena be proc allocate from Layout with 65536
+    Return proc translate_cobol_to_hir from CobolFrontend with ast, arena
+End Process
+
+Note: ============================================================================
+Note: Shared representative program
+Note: ============================================================================
+
+@Reasoning:
+A representative COBOL-85 program exercising a broad surface: IDENTIFICATION
+DIVISION with PROGRAM-ID PAYROLL; DATA DIVISION / WORKING-STORAGE with
+level + PIC + VALUE items; PROCEDURE DIVISION with two paragraphs; MOVE,
+COMPUTE, IF/ELSE/END-IF, PERFORM UNTIL, and DISPLAY statements.
+@End Reasoning
+Process called "sample_program" returns Integer:
+    Return "IDENTIFICATION DIVISION.\nPROGRAM-ID. PAYROLL.\nDATA DIVISION.\nWORKING-STORAGE SECTION.\n01 COUNTER PIC 9(4) VALUE 0.\n01 TOTAL PIC 9(6) VALUE 0.\nPROCEDURE DIVISION.\nMAIN-PARA.\nMOVE 0 TO TOTAL.\nPERFORM ADD-PARA UNTIL COUNTER > 10.\nIF TOTAL > 100\nDISPLAY \"BIG\"\nELSE\nDISPLAY \"SMALL\"\nEND-IF.\nADD-PARA.\nCOMPUTE TOTAL = TOTAL + COUNTER.\nDISPLAY TOTAL.\n"
+End Process
+
+Note: ============================================================================
+Note: Content assertion battery (shared by HIR1 and the round-trip HIR2)
+Note: ============================================================================
+
+@Reasoning:
+The same battery of CONTENT assertions runs against the first lowering and the
+lowering of the emitted text, holding the round-trip to exactly the same bar as
+the original. Asserts that PROGRAM-ID, a WORKING-STORAGE item with level + PIC +
+VALUE, >= 2 paragraphs, and a MOVE / IF-ELSE / PERFORM / COMPUTE / DISPLAY all
+survive.
+@End Reasoning
+Process called "assert_program_content" takes results as Integer, hir as Integer returns Integer:
+    Let prog_name be proc dict_get_string with hir, "name"
+    Let prog_name_ok be proc string_equals from StringCore with prog_name, "PAYROLL"
+    proc assert_equal from TestUtils with results, "PROGRAM-ID is 'PAYROLL'", prog_name_ok, 1
+
+    Let items be proc find_working_storage_items with hir
+    proc assert_not_null from TestUtils with results, "WORKING-STORAGE items present", items
+    Let counter be proc find_item_by_name with items, "COUNTER"
+    proc assert_not_null from TestUtils with results, "data item 'COUNTER' present", counter
+    Let counter_level be proc dict_get_string with counter, "level"
+    Let counter_level_ok be proc string_equals from StringCore with counter_level, "01"
+    proc assert_equal from TestUtils with results, "COUNTER level is 01", counter_level_ok, 1
+    Let counter_pic be proc dict_get with counter, "picture"
+    proc assert_not_null from TestUtils with results, "COUNTER has a PIC clause", counter_pic
+    Let counter_value be proc dict_get with counter, "value"
+    proc assert_not_null from TestUtils with results, "COUNTER has a VALUE clause", counter_value
+
+    Let paragraphs be proc find_procedure_paragraphs with hir
+    proc assert_not_null from TestUtils with results, "procedure body present", paragraphs
+    Let para_count be proc count_of_type with paragraphs, "cobol_paragraph"
+    proc assert_greater_than_or_equal from TestUtils with results, ">= 2 paragraphs present", para_count, 2
+
+    Let move_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_move"
+    proc assert_not_null from TestUtils with results, "MOVE statement present", move_stmt
+
+    Let if_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_if"
+    proc assert_not_null from TestUtils with results, "IF statement present", if_stmt
+    Let if_else be proc dict_get with if_stmt, "else_statements"
+    proc assert_not_null from TestUtils with results, "IF has an ELSE branch", if_else
+
+    Let perform_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_perform"
+    proc assert_not_null from TestUtils with results, "PERFORM statement present", perform_stmt
+
+    Let compute_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_compute"
+    proc assert_not_null from TestUtils with results, "COMPUTE statement present", compute_stmt
+
+    Let display_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_display"
+    proc assert_not_null from TestUtils with results, "DISPLAY statement present", display_stmt
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Phase tests
+Note: ============================================================================
+
+@Reasoning:
+Lexer / parser phase: parse_cobol must build a non-null AST for the
+representative program. This is the parse smoke that proves the lexer and
+parser advance over divisions, level numbers, PIC/VALUE clauses, paragraphs,
+and verbs without stalling.
+@End Reasoning
+Process called "test_parse" takes results as Integer returns Integer:
+    Let source be proc sample_program
+    Let ast be proc parse_cobol from CobolParser with source
+    proc assert_not_null from TestUtils with results, "parser produced COBOL AST", ast
+    Return 1
+End Process
+
+@Reasoning:
+AST -> HIR phase: cobol_to_hir_from_source lowers the program and the root must
+be a dict tagged "cobol_program".
+@End Reasoning
+Process called "test_hir" takes results as Integer returns Integer:
+    Let source be proc sample_program
+    Let hir be proc cobol_to_hir_from_source from CobolFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir
+    Let prog_type be proc dict_get_string with hir, "_type"
+    Let type_ok be proc string_equals from StringCore with prog_type, "cobol_program"
+    proc assert_equal from TestUtils with results, "HIR root is a cobol_program", type_ok, 1
+    proc assert_program_content with results, hir
+    Return 1
+End Process
+
+@Reasoning:
+Code generation phase: hir_to_cobol must emit non-empty COBOL text from the
+lowered program.
+@End Reasoning
+Process called "test_codegen" takes results as Integer returns Integer:
+    Let source be proc sample_program
+    Let hir be proc cobol_to_hir_from_source from CobolFrontend with source
+    proc assert_not_null from TestUtils with results, "HIR for codegen created", hir
+    Let emitted be proc hir_to_cobol from CobolBackend with hir
+    proc assert_not_null from TestUtils with results, "backend produced COBOL text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted COBOL is non-empty", emitted_len, 0
+    Return 1
+End Process
+
+@Reasoning:
+Round-trip phase: emit the lowered program to COBOL text, re-lower that text,
+and assert the re-lowered HIR is again a cobol_program whose contents survive.
+A translator that dropped constructs would fail the content battery here.
+@End Reasoning
+Process called "test_round_trip" takes results as Integer returns Integer:
+    Let source be proc sample_program
+    Let hir1 be proc cobol_to_hir_from_source from CobolFrontend with source
+    Let emitted be proc hir_to_cobol from CobolBackend with hir1
+    proc assert_not_null from TestUtils with results, "round-trip emitted COBOL", emitted
+
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted COBOL produced HIR2", hir2
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let type2_ok be proc string_equals from StringCore with prog2_type, "cobol_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a cobol_program", type2_ok, 1
+    proc assert_program_content with results, hir2
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Suite entry point
+Note: ============================================================================
 
 Process called "main" returns Integer:
-    Let results be a value of type SuiteResults with
-        total_suites as 0,
-        passed_suites as 0,
-        failed_suites as 0,
-        total_tests as 0
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "COBOL translation suite"
 
-    proc print_main_header
+    proc test_parse with results
+    proc test_hir with results
+    proc test_codegen with results
+    proc test_round_trip with results
 
-    Note: Run lexer test suite
-    proc print_suite_separator
-    Let lexer_result be proc run_lexer_tests
-    proc update_results with results, lexer_result, "Lexer Tests"
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
 
-    Note: Run parser test suite
-    proc print_suite_separator
-    Let parser_result be proc run_parser_tests
-    proc update_results with results, parser_result, "Parser Tests"
-
-    Note: Run HIR translation test suite
-    proc print_suite_separator
-    Let hir_result be proc run_hir_tests
-    proc update_results with results, hir_result, "HIR Translation Tests"
-
-    Note: Run code generation test suite
-    proc print_suite_separator
-    Let codegen_result be proc run_codegen_tests
-    proc update_results with results, codegen_result, "Code Generation Tests"
-
-    Note: Run round-trip test suite
-    proc print_suite_separator
-    Let roundtrip_result be proc run_roundtrip_tests
-    proc update_results with results, roundtrip_result, "Round-Trip Tests"
-
-    proc print_suite_separator
-    proc print_final_results from results
-
-    If results.failed_suites is greater than 0:
-        Return 1
-    End If
-
-    Return 0
+    Return failed
 End Process
-
-@Reasoning:
-Dispatcher for the COBOL lexer test suite. Calls individual test_*
-procs (defined elsewhere in the test infrastructure) and reports
-the count of passed tests against the total. Returns 1 if all
-sub-tests passed else 0.
-@End Reasoning
-
-@Implementation:
-Initialize test_count and passed_count to 0. For each test_* call,
-increment test_count and increment passed_count if the test returned 1.
-Return 1 if passed_count == test_count, else 0.
-@End Implementation
-
-@TestCases:
-- All sub-tests return 1 -> passed_count == test_count -> return 1
-- Any sub-test returns 0 -> passed_count < test_count -> return 0
-@End TestCases
-
-Process called "run_lexer_tests" returns Integer:
-    @Reasoning:
-    Lexer tests verify complete COBOL tokenization:
-    - All keywords (IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE, MOVE, etc.)
-    - Division headers (IDENTIFICATION DIVISION, DATA DIVISION, etc.)
-    - Level numbers (01-88)
-    - Picture clauses (PIC X, PIC 9, PIC S9V99, etc.)
-    - Number literals (decimal, signed)
-    - String literals (single and double quotes)
-    - Figurative constants (ZERO, SPACES, HIGH-VALUES, etc.)
-    - Comments (asterisk in column 7 or inline)
-    - Operators (arithmetic, relational, logical)
-    - Punctuation (period, comma, parentheses)
-    @End Reasoning
-
-    Note: Execute comprehensive COBOL lexer test suite
-    Let test_count be 0
-    Let passed_count be 0
-
-    Note: Test basic tokenization
-    Set test_count to test_count plus 1
-    If proc test_cobol_basic_tokenization is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test COBOL keywords
-    Set test_count to test_count plus 1
-    If proc test_cobol_keywords is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test literals and identifiers
-    Set test_count to test_count plus 1
-    If proc test_cobol_literals_and_identifiers is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test column-based parsing
-    Set test_count to test_count plus 1
-    If proc test_cobol_column_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test punctuation and operators
-    Set test_count to test_count plus 1
-    If proc test_cobol_punctuation is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Return 1 if all tests passed, 0 otherwise
-    If passed_count is equal to test_count:
-        Return 1
-    End If
-    Return 0
-End Process
-
-@Reasoning:
-Dispatcher for the COBOL parser test suite. Same pattern as
-run_lexer_tests: aggregates individual test_* procs and returns
-the all-or-nothing pass/fail signal.
-@End Reasoning
-
-@Implementation:
-Track test_count and passed_count. Each test_* call increments both
-counters appropriately, then return 1 if all passed else 0.
-@End Implementation
-
-@TestCases:
-- All parser sub-tests pass -> return 1
-- Any parser sub-test fails -> return 0
-@End TestCases
-
-Process called "run_parser_tests" returns Integer:
-    @Reasoning:
-    Parser tests verify complete AST generation:
-    - Four divisions (IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE)
-    - IDENTIFICATION DIVISION (PROGRAM-ID, AUTHOR, DATE-WRITTEN)
-    - ENVIRONMENT DIVISION (CONFIGURATION, INPUT-OUTPUT, SELECT statements)
-    - DATA DIVISION (FILE SECTION, WORKING-STORAGE, LINKAGE with data items)
-    - PROCEDURE DIVISION (sections, paragraphs, all statements)
-    - Data definitions (level numbers, PICTURE clauses, VALUE clauses)
-    - All statement types (MOVE, ADD, COMPUTE, IF, PERFORM, DISPLAY, etc.)
-    - File I/O (OPEN, CLOSE, READ, WRITE)
-    - Control flow (IF-ELSE-END-IF, EVALUATE-WHEN, PERFORM-UNTIL, GO TO)
-    @End Reasoning
-
-    Note: Execute comprehensive COBOL parser test suite
-    Let test_count be 0
-    Let passed_count be 0
-
-    Note: Test IDENTIFICATION DIVISION parsing
-    Set test_count to test_count plus 1
-    If proc test_identification_division_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test ENVIRONMENT DIVISION parsing
-    Set test_count to test_count plus 1
-    If proc test_environment_division_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test DATA DIVISION parsing
-    Set test_count to test_count plus 1
-    If proc test_data_division_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test PROCEDURE DIVISION parsing
-    Set test_count to test_count plus 1
-    If proc test_procedure_division_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test complete program parsing
-    Set test_count to test_count plus 1
-    If proc test_complete_cobol_program_parsing is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Return 1 if all tests passed, 0 otherwise
-    If passed_count is equal to test_count:
-        Return 1
-    End If
-    Return 0
-End Process
-
-@Reasoning:
-Dispatcher for the COBOL AST -> HIR translation test suite. Same
-aggregation pattern as the lexer and parser dispatchers.
-@End Reasoning
-
-@Implementation:
-Track test_count and passed_count across all individual translation
-tests; return 1 if all passed else 0.
-@End Implementation
-
-@TestCases:
-- All translation sub-tests pass -> return 1
-- Any sub-test fails -> return 0
-@End TestCases
-
-Process called "run_hir_tests" returns Integer:
-    @Reasoning:
-    HIR translation tests verify COBOL AST → HIR conversion:
-    - All division types correctly translated
-    - Data items with level numbers and PICTURE preserved
-    - Metadata preserved (level, picture, value)
-    - Nested structures properly represented
-    - Special COBOL features (paragraphs, sections, figurative constants)
-    - Statement translation (all COBOL statement types)
-    - Expression translation (arithmetic, relational, logical)
-    @End Reasoning
-
-    Note: Execute comprehensive HIR translation test suite
-    Let test_count be 0
-    Let passed_count be 0
-
-    Note: Test AST to HIR conversion
-    Set test_count to test_count plus 1
-    If proc test_cobol_ast_to_hir_conversion is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test data structure translation
-    Set test_count to test_count plus 1
-    If proc test_cobol_data_structure_translation is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test statement translation
-    Set test_count to test_count plus 1
-    If proc test_cobol_statement_translation is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test expression translation
-    Set test_count to test_count plus 1
-    If proc test_cobol_expression_translation is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Return 1 if all tests passed, 0 otherwise
-    If passed_count is equal to test_count:
-        Return 1
-    End If
-    Return 0
-End Process
-
-@Reasoning:
-Dispatcher for the HIR -> COBOL code generation test suite. Same
-aggregation pattern. Catches emitter regressions that would corrupt
-the canonical fixed-format COBOL output (column positions, period
-placement, division headers).
-@End Reasoning
-
-@Implementation:
-Track test_count and passed_count across individual codegen tests;
-return 1 if all passed else 0.
-@End Implementation
-
-@TestCases:
-- All codegen sub-tests pass -> return 1
-- Any codegen test fails -> return 0
-@End TestCases
-
-Process called "run_codegen_tests" returns Integer:
-    @Reasoning:
-    Code generation tests verify HIR → COBOL code generation:
-    - Idiomatic COBOL-85 output
-    - Proper formatting (4-space indentation)
-    - Uppercase keywords (COBOL convention)
-    - Statement terminators (periods)
-    - Division headers (IDENTIFICATION DIVISION, etc.)
-    - Data definitions (level number + name + PIC + VALUE)
-    - All statement types with correct syntax
-    - Free-format COBOL output
-    @End Reasoning
-
-    Note: Execute comprehensive code generation test suite
-    Let test_count be 0
-    Let passed_count be 0
-
-    Note: Test HIR to COBOL conversion
-    Set test_count to test_count plus 1
-    If proc test_hir_to_cobol_conversion is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test COBOL-85 compliance
-    Set test_count to test_count plus 1
-    If proc test_cobol_85_compliance is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test idiomatic COBOL output
-    Set test_count to test_count plus 1
-    If proc test_idiomatic_cobol_output is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Return 1 if all tests passed, 0 otherwise
-    If passed_count is equal to test_count:
-        Return 1
-    End If
-    Return 0
-End Process
-
-@Reasoning:
-Dispatcher for the COBOL round-trip test suite. Verifies COBOL ->
-HIR -> COBOL preserves program semantics; the inline @Reasoning
-inside the body describes the COBOL-specific properties checked
-(fixed-format alignment, IDENTIFICATION DIVISION preservation, etc).
-@End Reasoning
-
-@Implementation:
-Track test_count and passed_count across individual round-trip
-tests; return 1 if all passed else 0.
-@End Implementation
-
-@TestCases:
-- All round-trip sub-tests pass -> return 1
-- Any round-trip test fails -> return 0
-@End TestCases
-
-Process called "run_roundtrip_tests" returns Integer:
-    @Reasoning:
-    Round-trip tests verify COBOL → HIR → COBOL preservation:
-    - Semantic equivalence maintained
-    - Syntax may differ but meaning preserved
-    - All COBOL features supported
-    - Test programs: data definitions, arithmetic, file I/O, control flow
-    @End Reasoning
-
-    Note: Execute comprehensive round-trip test suite
-    Let test_count be 0
-    Let passed_count be 0
-
-    Note: Test basic round-trip conversion
-    Set test_count to test_count plus 1
-    If proc test_basic_cobol_round_trip is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test complex program round-trip
-    Set test_count to test_count plus 1
-    If proc test_complex_cobol_round_trip is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Test semantic preservation
-    Set test_count to test_count plus 1
-    If proc test_semantic_preservation is equal to 1:
-        Set passed_count to passed_count plus 1
-    End If
-
-    Note: Return 1 if all tests passed, 0 otherwise
-    If passed_count is equal to test_count:
-        Return 1
-    End If
-    Return 0
-End Process
-
-@Reasoning:
-Updates SuiteResults counters and prints per-suite pass/fail. Same
-pattern as peer suite-of-suites drivers: centralizes bookkeeping
-so all five run_*_tests calls feed through one update path.
-@End Reasoning
-
-@Implementation:
-1. Increment total_suites at offset 0.
-2. If suite_result == 0: increment passed_suites at offset 8, print
-   "[SUITE PASSED] <name>".
-3. Otherwise: increment failed_suites at offset 16, print
-   "[SUITE FAILED] <name>".
-@End Implementation
-
-Process called "update_results" takes results as Integer, suite_result as Integer, suite_name as Integer returns Integer:
-    Let total be proc memory_get_integer with results, 0
-    proc memory_set_integer with results, 0, total plus 1
-
-    If suite_result is equal to 0:
-        Let passed be proc memory_get_integer with results, 8
-        proc memory_set_integer with results, 8, passed plus 1
-        proc print_suite_success from suite_name
-    Otherwise:
-        Let failed be proc memory_get_integer with results, 16
-        proc memory_set_integer with results, 16, failed plus 1
-        proc print_suite_failure from suite_name
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Verbose suite banner. Prints title plus a list of the five sub-suites
-with expected test counts so a CI consumer sees the work plan
-before any tests execute.
-@End Reasoning
-
-@Implementation:
-Allocate and print title "COBOL COMPREHENSIVE TEST SUITE", "="
-separator (30 chars), info intro, then five "- <suite> (count)"
-labels. Each string deallocated after print.
-@End Implementation
-
-Process called "print_main_header" returns Integer:
-    Let header be proc create_string from StringCore with "COBOL COMPREHENSIVE TEST SUITE"
-    proc print from header
-    proc deallocate from Layout with header
-
-    Let separator be proc create_string from StringCore with "================================"
-    proc print from separator
-    proc deallocate from Layout with separator
-
-    Let info1 be proc create_string from StringCore with "Testing all COBOL-85 features:"
-    proc print from info1
-    proc deallocate from Layout with info1
-
-    Let info2 be proc create_string from StringCore with "- Lexer (comprehensive tokenization)"
-    proc print from info2
-    proc deallocate from Layout with info2
-
-    Let info3 be proc create_string from StringCore with "- Parser (complete AST generation)"
-    proc print from info3
-    proc deallocate from Layout with info3
-
-    Let info4 be proc create_string from StringCore with "- HIR Translation (AST \u2192 HIR)"
-    proc print from info4
-    proc deallocate from Layout with info4
-
-    Let info5 be proc create_string from StringCore with "- Code Generation (HIR \u2192 COBOL)"
-    proc print from info5
-    proc deallocate from Layout with info5
-
-    Let info6 be proc create_string from StringCore with "- Round-Trip (50+ test programs)"
-    proc print from info6
-    proc deallocate from Layout with info6
-
-    Return 1
-End Process
-
-@Reasoning:
-Visual separator between sub-suite runs. Same width as the main
-banner for consistent visual structure in CI logs.
-@End Reasoning
-
-@Implementation:
-Print empty line via empty string, then print 30-character "-" rule.
-@End Implementation
-
-Process called "print_suite_separator" returns Integer:
-    Let separator be proc create_string from StringCore with ""
-    proc print from separator
-    proc deallocate from Layout with separator
-
-    Let line be proc create_string from StringCore with "------------------------------------"
-    proc print from line
-    proc deallocate from Layout with line
-
-    Return 1
-End Process
-
-@Reasoning:
-"[SUITE PASSED] <name>" line. Distinct from per-test [PASS].
-@End Reasoning
-
-@Implementation:
-Allocate "[SUITE PASSED] " prefix, print prefix and caller-owned
-suite_name, deallocate the prefix.
-@End Implementation
-
-Process called "print_suite_success" takes suite_name as Integer returns Integer:
-    Let msg be proc create_string from StringCore with "[SUITE PASSED] "
-    proc print from msg
-    proc print from suite_name
-    proc deallocate from Layout with msg
-
-    Return 1
-End Process
-
-@Reasoning:
-"[SUITE FAILED] <name>" line. Distinct from per-test [FAIL].
-@End Reasoning
-
-@Implementation:
-Allocate "[SUITE FAILED] " prefix, print prefix and caller-owned
-suite_name, deallocate the prefix.
-@End Implementation
-
-Process called "print_suite_failure" takes suite_name as Integer returns Integer:
-    Let msg be proc create_string from StringCore with "[SUITE FAILED] "
-    proc print from msg
-    proc print from suite_name
-    proc deallocate from Layout with msg
-
-    Return 1
-End Process
-
-@Reasoning:
-Suite-of-suites final summary. Single human-readable verdict
-("ALL TESTS PASSED!" or "SOME TESTS FAILED!") at the end of the log.
-@End Reasoning
-
-@Implementation:
-Print "=" header, "FINAL RESULTS:" heading, three counter lines
-(Total/Passed/Failed Suites via print_int), then conditional verdict
-line based on failed_suites == 0.
-@End Implementation
-
-Process called "print_final_results" takes results as Integer returns Integer:
-    Let header be proc create_string from StringCore with "================================"
-    proc print from header
-    proc deallocate from Layout with header
-
-    Let summary be proc create_string from StringCore with "FINAL RESULTS:"
-    proc print from summary
-    proc deallocate from Layout with summary
-
-    Let total_msg be proc create_string from StringCore with "Total Suites: "
-    proc print from total_msg
-    proc print_int with results.total_suites
-    proc deallocate from Layout with total_msg
-
-    Let passed_msg be proc create_string from StringCore with "Passed Suites: "
-    proc print from passed_msg
-    proc print_int with results.passed_suites
-    proc deallocate from Layout with passed_msg
-
-    Let failed_msg be proc create_string from StringCore with "Failed Suites: "
-    proc print from failed_msg
-    proc print_int with results.failed_suites
-    proc deallocate from Layout with failed_msg
-
-    If results.failed_suites is equal to 0:
-        Let success be proc create_string from StringCore with "ALL TESTS PASSED!"
-        proc print from success
-        proc deallocate from Layout with success
-
-    Otherwise:
-        Let failure be proc create_string from StringCore with "SOME TESTS FAILED!"
-        proc print from failure
-        proc deallocate from Layout with failure
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Local integer formatter so this suite has no dependency on stdlib
-formatting allocators. Zero and negative inputs handled explicitly.
-@End Reasoning
-
-@Implementation:
-1. value == 0 -> print "0", return.
-2. Allocate 32-byte buffer; walk position 31 downward writing
-   48 + (temp % 10), dividing temp by 10.
-3. Negatives: operate on -temp; write '-' (45) at final position.
-4. Increment position, print buffer+position, deallocate.
-@End Implementation
-
-Process called "print_int" takes value as Integer returns Integer:
-    If value is equal to 0:
-        Let zero be proc create_string from StringCore with "0"
-        proc print from zero
-        proc deallocate from Layout with zero
-        Return 1
-    End If
-
-    Let buffer be proc allocate from Layout with 32
-    Let position be 31
-    Let temp be value
-
-    If temp is less than 0:
-        Set temp to -temp
-    End If
-
-    While temp is greater than 0:
-        Let digit be temp modulo by 10
-        Let char be 48 plus digit
-        proc memory_set_byte from Layout with buffer, position, char
-        Set position to position minus 1
-        Set temp to temp divided by 10
-    End While
-
-    If value is less than 0:
-        proc memory_set_byte from Layout with buffer, position, 45
-        Set position to position minus 1
-    End If
-
-    Set position to position plus 1
-    Let str_ptr be buffer plus position
-    proc print from str_ptr
-
-    proc deallocate from Layout with buffer
-
-    Return 1
-End Process
-
-Note: End of COBOL Comprehensive Test Suite Runner

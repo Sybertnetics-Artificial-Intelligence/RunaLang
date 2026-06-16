@@ -10,10 +10,38 @@ Tests: 10 test files covering C# → HIR translation for all major features
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_to_hir.runa" as ToHIR
+Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_lexer.runa" as Lexer
 Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/io/file.runa" as File
+Import "compiler/frontend/primitives/io/file_io.runa" as File
+
+@Reasoning:
+Parses a C# source string into an AST through the real lexer -> parser
+chain (create_csharp_lexer + create_csharp_parser + parse_program), the
+same chain csharp_to_hir_from_source drives internally. Returns the AST
+handle, or 0 on any failure, after tearing down the lexer and parser.
+@End Reasoning
+Process called "parse_csharp" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let source_length be proc string_length from StringCore with source
+    Let lexer be proc create_csharp_lexer from Lexer with source, source_length
+    If lexer is equal to 0:
+        Return 0
+    End If
+    Let parser be proc create_csharp_parser from Parser with lexer
+    If parser is equal to 0:
+        proc destroy_csharp_lexer from Lexer with lexer
+        Return 0
+    End If
+    Let ast be proc parse_program from Parser with parser
+    proc destroy_csharp_parser from Parser with parser
+    proc destroy_csharp_lexer from Lexer with lexer
+    Return ast
+End Process
 
 @Reasoning:
 Counter triple shared across the to_hir driver. Identical layout to
@@ -46,7 +74,7 @@ print_results, then return 1 if any test failed else 0.
 
 @TestCases:
 - basic_class.cs through namespaces_using.cs each parse and translate
-  to a non-null HIR dictionary containing a "_type" key
+  to a non-null HIR node carrying a non-zero node-type tag
 - Missing file -> "Failed to read file" failure
 - Parser regression on any program -> "Parse failed"
 - Translator returns 0 on valid AST -> "Translation to HIR failed"
@@ -68,7 +96,7 @@ Process called "main" returns Integer:
     proc test_translation with "compiler/middle/gungnir/hir/translation/tests/csharp/programs/nullable_types.cs", "Nullable types", results
     proc test_translation with "compiler/middle/gungnir/hir/translation/tests/csharp/programs/namespaces_using.cs", "Namespaces and using", results
 
-    proc print_results from results
+    proc print_results with results
 
     If results.failed is greater than 0:
         Return 1
@@ -86,13 +114,13 @@ exactly where in the C#-to-HIR pipeline the regression occurred.
 
 @Implementation:
 1. Increment results.total.
-2. read_file(file_path) -> content; null: "Failed to read file".
+2. read_entire_file(file_path) -> content; null: "Failed to read file".
 3. parse_csharp(content) -> ast; null: free content, "Parse failed".
 4. Allocate 64 KiB arena; null: free content, "Arena allocation failed".
 5. translate_csharp_to_hir(ast, arena) -> hir; null: free content+arena,
    "Translation to HIR failed".
-6. dict_has_key(hir, "_type") must be non-zero; otherwise free
-   content+arena, "HIR missing _type field".
+6. get_hir_node_type(hir) must be non-zero; otherwise free content+arena,
+   "HIR node has no type tag".
 7. Success: free content+arena, mark passed.
 @End Implementation
 
@@ -101,14 +129,14 @@ exactly where in the C#-to-HIR pipeline the regression occurred.
 - Non-existent path -> stage 2 fails with "Failed to read file"
 - Malformed source -> stage 3 fails with "Parse failed"
 - Translator returns 0 on valid AST -> stage 5 fails with "Translation to HIR failed"
-- HIR dict missing "_type" -> stage 6 fails with "HIR missing _type field"
+- Translator returns an untyped node -> stage 6 fails with "HIR node has no type tag"
 @End TestCases
 
 Process called "test_translation" takes file_path as Integer, test_name as Integer, results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
 
-    Let content be proc read_file from File with file_path
+    Let content be proc read_entire_file from File with file_path
 
     If content is equal to 0:
         proc print_test_failure with test_name, "Failed to read file"
@@ -117,7 +145,7 @@ Process called "test_translation" takes file_path as Integer, test_name as Integ
         Return 0
     End If
 
-    Let ast be proc parse_csharp from Parser with content
+    Let ast be proc parse_csharp with content
 
     If ast is equal to 0:
         proc print_test_failure with test_name, "Parse failed"
@@ -148,14 +176,14 @@ Process called "test_translation" takes file_path as Integer, test_name as Integ
         Return 0
     End If
 
-    Note: Verify HIR structure has "_type" key
-    Let type_key be proc create_string from StringCore with "_type"
-    Let has_type be proc dict_has_key with hir, type_key
+    Note: Verify the translation produced a structured HIR node by reading
+    Note: its node-type tag through the real HIR accessor. Every node the
+    Note: HIR builder emits carries a non-zero node_type; a zero tag means
+    Note: the translator returned an unstructured/garbage handle.
+    Let node_type be proc get_hir_node_type from HIR with hir
 
-    proc deallocate from Layout with type_key
-
-    If has_type is equal to 0:
-        proc print_test_failure with test_name, "HIR missing _type field"
+    If node_type is equal to 0:
+        proc print_test_failure with test_name, "HIR node has no type tag"
         proc deallocate from Layout with content
         proc deallocate from Layout with arena
         Let _rfal5 be proc memory_get_int64 from Layout with results, 16
@@ -163,36 +191,12 @@ Process called "test_translation" takes file_path as Integer, test_name as Integ
         Return 0
     End If
 
-    proc print_test_success from test_name
+    proc print_test_success with test_name
     proc deallocate from Layout with content
     proc deallocate from Layout with arena
     Let _rpas1 be proc memory_get_int64 from Layout with results, 8
     proc memory_set_int64 from Layout with results, 8, _rpas1 plus 1
 
-    Return 1
-End Process
-
-@Reasoning:
-Placeholder dictionary-key probe local to this test file. The HIR builder
-guarantees a "_type" key exists on every returned node, so for the
-purpose of "did translation produce a structured HIR object?" returning
-1 unconditionally when the dict pointer is non-zero is the correct
-contract. A genuine dictionary lookup would require linking the full
-Dict module into this test binary, which is intentionally avoided so
-this suite stays minimal.
-@End Reasoning
-
-@Implementation:
-Caller is responsible for not invoking this with a null dict; the
-test_translation guard rejects null HIR before reaching this point.
-Returns 1 to signal "key present", which combined with the upstream
-null check is sufficient for the contract this file exercises.
-@End Implementation
-
-Process called "dict_has_key" takes dict as Integer, key as Integer returns Integer:
-    Note: Suite-local stub; structural _type presence is guaranteed by the
-    Note: HIR builder contract that translate_csharp_to_hir upholds, so
-    Note: returning 1 when hir is non-null is the correct check here.
     Return 1
 End Process
 
@@ -207,14 +211,8 @@ Always returns 1.
 @End Implementation
 
 Process called "print_header" returns Integer:
-    Let header be proc create_string from StringCore with "C# to HIR Translation Test Suite"
-    proc print from header
-    proc deallocate from Layout with header
-
-    Let separator be proc create_string from StringCore with "==================================="
-    proc print from separator
-    proc deallocate from Layout with separator
-
+    proc print with "C# to HIR Translation Test Suite"
+    proc print with "==================================="
     Return 1
 End Process
 
@@ -229,11 +227,8 @@ then deallocate the prefix.
 @End Implementation
 
 Process called "print_test_success" takes test_name as Integer returns Integer:
-    Let pass_msg be proc create_string from StringCore with "[PASS] "
-    proc print from pass_msg
-    proc print from test_name
-    proc deallocate from Layout with pass_msg
-
+    proc print with "[PASS] "
+    proc print with test_name
     Return 1
 End Process
 
@@ -249,13 +244,10 @@ order, then deallocate the prefix.
 @End Implementation
 
 Process called "print_test_failure" takes test_name as Integer, reason as Integer returns Integer:
-    Let fail_msg be proc create_string from StringCore with "[FAIL] "
-    proc print from fail_msg
-    proc print from test_name
+    proc print with "[FAIL] "
+    proc print with test_name
     proc print with ": "
-    proc print from reason
-    proc deallocate from Layout with fail_msg
-
+    proc print with reason
     Return 1
 End Process
 
@@ -273,28 +265,17 @@ through print_int.
 @End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
-    Let separator be proc create_string from StringCore with "==================================="
-    proc print from separator
-    proc deallocate from Layout with separator
+    proc print with "==================================="
+    proc print with "Test Results:"
 
-    Let summary be proc create_string from StringCore with "Test Results:"
-    proc print from summary
-    proc deallocate from Layout with summary
-
-    Let total_msg be proc create_string from StringCore with "Total: "
-    proc print from total_msg
+    proc print with "Total: "
     proc print_int with results.total
-    proc deallocate from Layout with total_msg
 
-    Let passed_msg be proc create_string from StringCore with "Passed: "
-    proc print from passed_msg
+    proc print with "Passed: "
     proc print_int with results.passed
-    proc deallocate from Layout with passed_msg
 
-    Let failed_msg be proc create_string from StringCore with "Failed: "
-    proc print from failed_msg
+    proc print with "Failed: "
     proc print_int with results.failed
-    proc deallocate from Layout with failed_msg
 
     Return 1
 End Process
@@ -317,14 +298,15 @@ negative values directly with no reliance on a Long->String helper.
 
 Process called "print_int" takes value as Integer returns Integer:
     If value is equal to 0:
-        Let zero be proc create_string from StringCore with "0"
-        proc print from zero
-        proc deallocate from Layout with zero
+        proc print with "0"
         Return 1
     End If
 
     Let buffer be proc allocate from Layout with 32
-    Let position be 31
+    Note: Reserve the final byte as the NUL terminator so print reads a
+    Note: bounded C string; digits are written from index 30 downward.
+    proc memory_set_byte from Layout with buffer, 31, 0
+    Let position be 30
     Let temp be value
 
     If temp is less than 0:
@@ -346,7 +328,7 @@ Process called "print_int" takes value as Integer returns Integer:
 
     Set position to position plus 1
     Let str_ptr be buffer plus position
-    proc print from str_ptr
+    proc print with str_ptr
 
     proc deallocate from Layout with buffer
 

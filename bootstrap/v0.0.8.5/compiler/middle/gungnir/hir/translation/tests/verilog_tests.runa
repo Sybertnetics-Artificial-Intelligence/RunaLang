@@ -1,7 +1,15 @@
 Note: ================================================================
 Note: Verilog Translation Test Suite
 Note: ================================================================
-Note: Comprehensive tests for Verilog bidirectional translation.
+Note: Comprehensive tests for Verilog bidirectional translation, driving
+Note: the REAL current Verilog translation API:
+Note:   - verilog_lexer:   create_lexer() + scan(lexer, source) returning a
+Note:                      token list.
+Note:   - verilog_parser:  create_parser(tokens) + parse(parser).
+Note:   - verilog_emitter: create_emitter() + verilog_to_hir_with_emitter,
+Note:                      hir_to_verilog_with_emitter, round_trip, has_errors.
+Note: Assertions and reporting are delegated to tests/test_utils.runa.
+Note: Exit code: number of failed assertions (0 == all passed).
 Note: ================================================================
 
 Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_lexer.runa" as VerilogLexer
@@ -9,163 +17,94 @@ Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_parser
 Import "compiler/middle/gungnir/hir/translation/frontends/verilog/verilog_to_hir.runa" as VerilogToHIR
 Import "compiler/middle/gungnir/hir/translation/backends/verilog/hir_to_verilog.runa" as HIRToVerilog
 Import "compiler/middle/gungnir/hir/translation/backends/verilog/verilog_emitter.runa" as VerilogEmitter
-Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Local helpers
+Note: ============================================================================
 
 @Reasoning:
-Per-test record carrying name, pass/fail integer (1/0), diagnostic
-message, and expected/actual value strings. Captured by every
-assertion so report time can dump exactly what failed and why.
+Substring search over a runtime char* haystack and a String-literal needle.
+The needle is a raw char* whose bytes are read with Layout.memory_get_byte,
+while the haystack characters come through StringCore.string_char_at so the
+comparison holds across string representations. Returns 1 on hit, 0 on miss.
+This is the exact contract the backend round-trip assertions rely on to
+confirm specific Verilog keywords survive translation.
 @End Reasoning
+Process called "string_contains" takes haystack as Integer, needle as String returns Integer:
+    Let haystack_len be proc string_length from StringCore with haystack
+    Let needle_len be proc string_length from StringCore with needle
 
-@Implementation:
-5 string/integer fields stored at offsets 0/8/16/24/32 in a heap
-allocation. Used by add_test_result and consumed by print_test_results.
-@End Implementation
-
-Type called "TestResult":
-    test_name as String
-    passed as Integer
-    message as String
-    expected as String
-    actual as String
-End Type
-
-@Reasoning:
-Container for an entire test phase (lexer, parser, etc.) holding
-the suite name, a list of TestResult pointers, and aggregate
-counters maintained in-line by add_test_result.
-@End Reasoning
-
-@Implementation:
-4 fields at offsets 0 (name string)/8 (tests list pointer)/16
-(passed_count)/24 (failed_count). Allocated by create_test_suite as
-a 32-byte heap block.
-@End Implementation
-
-Type called "TestSuite":
-    name as String
-    tests as Integer
-    passed_count as Integer
-    failed_count as Integer
-End Type
-
-@Reasoning:
-Allocates and initializes a fresh TestSuite on the heap.
-@End Reasoning
-
-@Implementation:
-1. allocate(32) -> suite_ptr.
-2. Write name at offset 0, fresh empty tests list at offset 8,
-   zero passed_count at 16, zero failed_count at 24.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "create_test_suite" that takes suite_name as String returns Integer:
-    Let suite_ptr be proc allocate from Memory with 32
-    proc write_string from Memory with suite_ptr, 0, suite_name
-    Let tests_list be proc create_list from ListCore
-    proc write_integer from Memory with suite_ptr, 8, tests_list
-    proc write_integer from Memory with suite_ptr, 16, 0
-    proc write_integer from Memory with suite_ptr, 24, 0
-    Return suite_ptr
-End Process
-
-@Reasoning:
-Allocates a TestResult, appends to the suite's tests list, and
-updates the running pass/fail counter.
-@End Reasoning
-
-@Implementation:
-1. allocate(40) -> result_ptr; populate fields 0/8/16/24/32.
-2. read tests_list pointer from suite_ptr+8, add_to_list(tests_list, result_ptr).
-3. If passed == 1: increment passed_count at offset 16; else
-   increment failed_count at offset 24.
-@End Implementation
-
-Process called "add_test_result" that takes suite_ptr as Integer, test_name as String, passed as Integer, message as String, expected as String, actual as String returns Integer:
-    Let result_ptr be proc allocate from Memory with 40
-    proc write_string from Memory with result_ptr, 0, test_name
-    proc write_integer from Memory with result_ptr, 8, passed
-    proc write_string from Memory with result_ptr, 16, message
-    proc write_string from Memory with result_ptr, 24, expected
-    proc write_string from Memory with result_ptr, 32, actual
-
-    Let tests_list be proc read_integer from Memory with suite_ptr, 8
-    proc add_to_list from ListCore with tests_list, result_ptr
-
-    If passed is equal to 1:
-        Let passed_count be proc read_integer from Memory with suite_ptr, 16
-        proc write_integer from Memory with suite_ptr, 16, passed_count plus 1
-    Otherwise:
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-        proc write_integer from Memory with suite_ptr, 24, failed_count plus 1
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Asserts a pointer is non-null and records the outcome in the suite.
-@End Reasoning
-
-@Implementation:
-If ptr != 0: add_test_result with pass=1, message="PASS",
-expected="non-null", actual="non-null". Else: pass=0, message=
-"Pointer is null", actual="null".
-@End Implementation
-
-Process called "assert_not_null" that takes suite_ptr as Integer, test_name as String, ptr as Integer returns Integer:
-    If ptr is not equal to 0:
-        proc add_test_result with suite_ptr, test_name, 1, "PASS", "non-null", "non-null"
+    If needle_len is equal to 0:
         Return 1
-    Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, "Pointer is null", "non-null", "null"
+    End If
+    If needle_len is greater than haystack_len:
         Return 0
     End If
+
+    Let i be 0
+    Let max_i be haystack_len minus needle_len
+    While i is less than or equal to max_i:
+        Let matches be 1
+        Let j be 0
+        While j is less than needle_len:
+            Let h_char be proc string_char_at from StringCore with haystack, i plus j
+            Let n_char be proc memory_get_byte from Layout with needle, j
+            If h_char is not equal to n_char:
+                Set matches to 0
+                Break
+            End If
+            Set j to j plus 1
+        End While
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
 End Process
 
 @Reasoning:
-Asserts a Boolean condition (integer 1/0) and records the outcome.
+Counts the tokens the Verilog lexer produces for a source string by driving
+the real create_lexer + scan pair and measuring the resulting token list.
+Proves the lexer's sub-state machines (keyword table, number scanner,
+operator scanner, system-task scanner) advance the cursor as expected.
 @End Reasoning
-
-@Implementation:
-If condition == 1: add_test_result with pass=1, actual="true".
-Else: pass=0, actual="false". Expected is always "true".
-@End Implementation
-
-Process called "assert_true" that takes suite_ptr as Integer, test_name as String, condition as Integer, message as String returns Integer:
-    If condition is equal to 1:
-        proc add_test_result with suite_ptr, test_name, 1, message, "true", "true"
-        Return 1
-    Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, message, "true", "false"
+Process called "count_tokens" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from VerilogLexer
+    If lexer is equal to 0:
         Return 0
     End If
+    Let tokens be proc scan from VerilogLexer with lexer, source
+    If tokens is equal to 0:
+        Return 0
+    End If
+    Return proc size from ListCore with tokens
 End Process
 
 @Reasoning:
-Asserts a generated text contains an expected substring. Used by
-the backend round-trip tests to confirm specific Verilog keywords
-survive translation.
+Parses a Verilog source string into an AST through the real create_lexer ->
+scan -> create_parser -> parse pipeline, returning the AST handle (or 0 on
+failure) so parser tests can assert on its presence.
 @End Reasoning
-
-@Implementation:
-Call StringCore.contains(text, substring); on hit add_test_result
-with pass=1; on miss pass=0 with the missing substring as expected
-and actual="not found".
-@End Implementation
-
-Process called "assert_contains" that takes suite_ptr as Integer, test_name as String, text as String, substring as String returns Integer:
-    Let contains be proc string_contains from StringCore with text, substring
-    If contains is equal to 1:
-        proc add_test_result with suite_ptr, test_name, 1, "Contains substring", substring, substring
-        Return 1
-    Otherwise:
-        proc add_test_result with suite_ptr, test_name, 0, "Does not contain substring", substring, text
+Process called "parse_source" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from VerilogLexer
+    If lexer is equal to 0:
         Return 0
     End If
+    Let tokens be proc scan from VerilogLexer with lexer, source
+    If tokens is equal to 0:
+        Return 0
+    End If
+    Let parser be proc create_parser from VerilogParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+    Return proc parse from VerilogParser with parser
 End Process
 
 Note: ================================================================
@@ -176,109 +115,43 @@ Note: ================================================================
 Verifies the Verilog lexer recognizes core HDL keywords (module,
 endmodule, input, output, wire, reg, always, assign).
 @End Reasoning
-
-@Implementation:
-Lex a string of keywords; assert the token stream classifies them
-as KEYWORD via assert_not_null on the lexer result.
-@End Implementation
-
-@TestCases:
-- All core keywords -> non-null lexer state, passed
-- Lexer rejects "endmodule" -> null state -> fails
-@End TestCases
-
-Process called "test_lexer_keywords" that takes suite_ptr as Integer returns Integer:
+Process called "test_lexer_keywords" takes results as Integer returns Integer:
     Let source be "module always wire reg input output assign posedge negedge endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-    Let _kw_ok be token_count is greater than 10
-    proc assert_true with suite_ptr, "Lexer tokenizes keywords", _kw_ok, "Token count > 10"
-
+    Let token_count be proc count_tokens with source
+    proc assert_greater_than from TestUtils with results, "Lexer tokenizes keywords", token_count, 10
     Return 1
 End Process
 
 @Reasoning:
 Verifies the lexer handles Verilog number literals: sized (8'b10101010,
-4'hF) and unsized (42).
+16'hABCD) and unsized (42).
 @End Reasoning
-
-@Implementation:
-Lex source containing sized and unsized numbers; assert lexer state
-non-null.
-@End Implementation
-
-@TestCases:
-- Sized + unsized numbers -> tokenizes, passed
-- Lexer rejects "'b" radix marker -> null state -> fails
-@End TestCases
-
-Process called "test_lexer_numbers" that takes suite_ptr as Integer returns Integer:
+Process called "test_lexer_numbers" takes results as Integer returns Integer:
     Let source be "42 8'b10101010 16'hABCD 32'd1234"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-    Let _num_ok be token_count is greater than 4
-    proc assert_true with suite_ptr, "Lexer tokenizes numbers", _num_ok, "Token count > 4"
-
+    Let token_count be proc count_tokens with source
+    proc assert_greater_than from TestUtils with results, "Lexer tokenizes numbers", token_count, 3
     Return 1
 End Process
 
 @Reasoning:
-Verifies the lexer handles Verilog operators including reduction
-operators (& | ^ ~&), shifts, comparisons, and the bit-select [].
+Verifies the lexer handles Verilog operators including reduction operators,
+shifts, comparisons, and logical operators.
 @End Reasoning
-
-@Implementation:
-Lex an operator-heavy source; assert lexer state non-null.
-@End Implementation
-
-@TestCases:
-- Operator mix tokenizes -> passed
-- Lexer drops "~&" -> null state -> fails
-@End TestCases
-
-Process called "test_lexer_operators" that takes suite_ptr as Integer returns Integer:
-    Let source be "+ - * / == != <= >= && || shifted left by shifted right by ~& ~|"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-    Let _op_ok be token_count is greater than 10
-    proc assert_true with suite_ptr, "Lexer tokenizes operators", _op_ok, "Token count > 10"
-
+Process called "test_lexer_operators" takes results as Integer returns Integer:
+    Let source be "+ - * / == != <= >= && || & | ^ ~& ~|"
+    Let token_count be proc count_tokens with source
+    proc assert_greater_than from TestUtils with results, "Lexer tokenizes operators", token_count, 10
     Return 1
 End Process
 
 @Reasoning:
-Verifies the lexer recognizes Verilog system tasks ($display,
-$monitor, $finish). The leading "$" is the distinguishing marker.
+Verifies the lexer recognizes Verilog system tasks ($display, $monitor,
+$finish). The leading "$" is the distinguishing marker.
 @End Reasoning
-
-@Implementation:
-Lex source with system tasks; assert lexer state non-null.
-@End Implementation
-
-@TestCases:
-- System tasks tokenize -> passed
-- Lexer fails on "$" prefix -> null -> fails
-@End TestCases
-
-Process called "test_lexer_system_tasks" that takes suite_ptr as Integer returns Integer:
+Process called "test_lexer_system_tasks" takes results as Integer returns Integer:
     Let source be "$display $monitor $finish"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let token_count be proc get_list_size from ListCore with tokens
-    Let _task_ok be token_count is greater than 3
-    proc assert_true with suite_ptr, "Lexer tokenizes system tasks", _task_ok, "Token count > 3"
-
+    Let token_count be proc count_tokens with source
+    proc assert_greater_than from TestUtils with results, "Lexer tokenizes system tasks", token_count, 2
     Return 1
 End Process
 
@@ -288,143 +161,49 @@ Note: ================================================================
 
 @Reasoning:
 Verifies the parser handles the minimal Verilog module definition
-(module Name; endmodule).
+(module Name(); endmodule).
 @End Reasoning
-
-@Implementation:
-Parse "module test; endmodule", assert AST non-null.
-@End Implementation
-
-@TestCases:
-- Empty module -> non-null AST, passed
-- Parser fails on "endmodule" -> null AST -> fails
-@End TestCases
-
-Process called "test_parser_simple_module" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from VerilogParser with tokens
-    Let ast be proc parse from VerilogParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for simple module", ast
-
+Process called "test_parser_simple_module" takes results as Integer returns Integer:
+    Let ast be proc parse_source with "module test(); endmodule"
+    proc assert_not_null from TestUtils with results, "Parser creates AST for simple module", ast
     Return 1
 End Process
 
 @Reasoning:
-Verifies the parser handles a module with explicit input/output
-port declarations.
+Verifies the parser handles a module with explicit port declarations.
 @End Reasoning
-
-@Implementation:
-Parse "module test(input a, output b); endmodule", assert AST
-non-null with port list.
-@End Implementation
-
-@TestCases:
-- Module with ports -> non-null AST, passed
-- Parser drops port direction keyword -> null or wrong shape
-@End TestCases
-
-Process called "test_parser_module_with_ports" that takes suite_ptr as Integer returns Integer:
-    Let source be "module adder(a, b, sum); input a, b; output sum; endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from VerilogParser with tokens
-    Let ast be proc parse from VerilogParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for module with ports", ast
-
+Process called "test_parser_module_with_ports" takes results as Integer returns Integer:
+    Let ast be proc parse_source with "module adder(a, b, sum); input a, b; output sum; endmodule"
+    proc assert_not_null from TestUtils with results, "Parser creates AST for module with ports", ast
     Return 1
 End Process
 
 @Reasoning:
-Verifies the parser handles Verilog always blocks (the procedural
-process construct for sequential logic).
+Verifies the parser handles Verilog always blocks (the procedural process
+construct for sequential logic).
 @End Reasoning
-
-@Implementation:
-Parse a module with an always @(posedge clk) block; assert AST
-non-null.
-@End Implementation
-
-@TestCases:
-- always @(posedge clk) -> AST has always node, passed
-- Parser fails on "posedge" keyword -> null AST -> fails
-@End TestCases
-
-Process called "test_parser_always_block" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); reg clk; always @(posedge clk) begin end endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from VerilogParser with tokens
-    Let ast be proc parse from VerilogParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for always block", ast
-
+Process called "test_parser_always_block" takes results as Integer returns Integer:
+    Let ast be proc parse_source with "module test(); reg clk; always @(posedge clk) begin end endmodule"
+    proc assert_not_null from TestUtils with results, "Parser creates AST for always block", ast
     Return 1
 End Process
 
 @Reasoning:
-Verifies the parser handles continuous-assignment statements
-("assign wire_name = expr;") used for combinational logic.
+Verifies the parser handles continuous-assignment statements used for
+combinational logic.
 @End Reasoning
-
-@Implementation:
-Parse a module with an assign statement; assert AST non-null.
-@End Implementation
-
-@TestCases:
-- assign foo = bar; -> AST has assign node, passed
-- Parser fails on "assign" -> null AST -> fails
-@End TestCases
-
-Process called "test_parser_assign_statement" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); wire a, b, c; assign c = a bitwise and b; endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from VerilogParser with tokens
-    Let ast be proc parse from VerilogParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for assign statement", ast
-
+Process called "test_parser_assign_statement" takes results as Integer returns Integer:
+    Let ast be proc parse_source with "module test(); wire a, b, c; assign c = a & b; endmodule"
+    proc assert_not_null from TestUtils with results, "Parser creates AST for assign statement", ast
     Return 1
 End Process
 
 @Reasoning:
 Verifies the parser handles if-else statements inside always blocks.
 @End Reasoning
-
-@Implementation:
-Parse a module with an always block containing if-else; assert AST
-non-null.
-@End Implementation
-
-@TestCases:
-- if-else inside always -> AST non-null, passed
-- Parser fails on "else" -> null AST -> fails
-@End TestCases
-
-Process called "test_parser_if_statement" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); reg a, b; always @(*) begin if (a) b = 1; else b = 0; end endmodule"
-
-    Let lexer_ptr be proc create_lexer from VerilogLexer
-    Let tokens be proc scan from VerilogLexer with lexer_ptr, source
-
-    Let parser_ptr be proc create_parser from VerilogParser with tokens
-    Let ast be proc parse from VerilogParser with parser_ptr
-
-    proc assert_not_null with suite_ptr, "Parser creates AST for if statement", ast
-
+Process called "test_parser_if_statement" takes results as Integer returns Integer:
+    Let ast be proc parse_source with "module test(); reg a, b; always @(*) begin if (a) b = 1; else b = 0; end endmodule"
+    proc assert_not_null from TestUtils with results, "Parser creates AST for if statement", ast
     Return 1
 End Process
 
@@ -433,87 +212,35 @@ Note: Translator Tests
 Note: ================================================================
 
 @Reasoning:
-Verifies the verilog_to_hir translator handles a minimal module
-end-to-end (parse + translate).
+Verifies the verilog_to_hir translator handles a minimal module end-to-end
+(parse + translate via the emitter) and reports no errors.
 @End Reasoning
-
-@Implementation:
-Parse minimal module, translate to HIR, assert HIR pointer non-null.
-@End Implementation
-
-@TestCases:
-- Minimal module -> non-null HIR, passed
-- Translator returns 0 -> "Translator returned null" failure
-@End TestCases
-
-Process called "test_translator_simple_module" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for simple module", hir
-
-    Let has_errors be proc has_errors from VerilogEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
+Process called "test_translator_simple_module" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); endmodule"
+    proc assert_not_null from TestUtils with results, "Translator creates HIR for simple module", hir
+    Let has_err be proc has_errors from VerilogEmitter with emitter
+    proc assert_equal from TestUtils with results, "Translation has no errors", has_err, 0
     Return 1
 End Process
 
 @Reasoning:
 Verifies the translator captures wire declarations in HIR.
 @End Reasoning
-
-@Implementation:
-Parse a module with "wire x;", translate, assert HIR non-null.
-@End Implementation
-
-@TestCases:
-- "wire x;" module -> HIR non-null, passed
-- Translator drops wire declarations -> may still produce non-null HIR
-@End TestCases
-
-Process called "test_translator_wire_declaration" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); wire [7:0] data; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for wire declaration", hir
-
-    Let has_errors be proc has_errors from VerilogEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
+Process called "test_translator_wire_declaration" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); wire [7:0] data; endmodule"
+    proc assert_not_null from TestUtils with results, "Translator creates HIR for wire declaration", hir
     Return 1
 End Process
 
 @Reasoning:
 Verifies the translator captures always blocks in HIR.
 @End Reasoning
-
-@Implementation:
-Parse a module with always block, translate, assert HIR non-null.
-@End Implementation
-
-@TestCases:
-- Module with always block -> HIR non-null, passed
-- Translator can't handle sensitivity list -> HIR null -> failure
-@End TestCases
-
-Process called "test_translator_always_block" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); reg clk, q; always @(posedge clk) q = 1; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    proc assert_not_null with suite_ptr, "Translator creates HIR for always block", hir
-
-    Let has_errors be proc has_errors from VerilogEmitter with emitter_ptr
-    Let _no_err be has_errors is equal to 0
-    proc assert_true with suite_ptr, "Translation has no errors", _no_err, "No errors"
-
+Process called "test_translator_always_block" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); reg clk, q; always @(posedge clk) q = 1; endmodule"
+    proc assert_not_null from TestUtils with results, "Translator creates HIR for always block", hir
     Return 1
 End Process
 
@@ -522,90 +249,44 @@ Note: Backend Tests
 Note: ================================================================
 
 @Reasoning:
-Verifies the HIR -> Verilog backend produces valid output for a
-minimal module and that the output contains the module/endmodule
-keywords.
+Verifies the HIR -> Verilog backend produces valid output for a minimal
+module and that the output contains the module/endmodule keywords.
 @End Reasoning
-
-@Implementation:
-Parse+translate minimal module, run backend, assert output non-null
-and contains "module" + "endmodule".
-@End Implementation
-
-@TestCases:
-- Minimal module HIR -> output contains both keywords, passed
-- Backend drops "endmodule" -> "Output missing endmodule" failure
-@End TestCases
-
-Process called "test_backend_simple_module" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter_ptr, hir
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Backend generates non-empty output", is_valid, "Output not empty"
-
-    proc assert_contains with suite_ptr, "Backend output contains module keyword", regenerated, "module"
-    proc assert_contains with suite_ptr, "Backend output contains endmodule keyword", regenerated, "endmodule"
-
+Process called "test_backend_simple_module" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); endmodule"
+    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter, hir
+    Let out_len be proc string_length from StringCore with regenerated
+    proc assert_greater_than from TestUtils with results, "Backend generates non-empty output", out_len, 0
+    Let has_module be proc string_contains with regenerated, "module"
+    proc assert_equal from TestUtils with results, "Backend output contains module keyword", has_module, 1
+    Let has_end be proc string_contains with regenerated, "endmodule"
+    proc assert_equal from TestUtils with results, "Backend output contains endmodule keyword", has_end, 1
     Return 1
 End Process
 
 @Reasoning:
-Verifies the backend emits the "wire" keyword when generating
-wire declarations from HIR.
+Verifies the backend emits the "wire" keyword when generating wire
+declarations from HIR.
 @End Reasoning
-
-@Implementation:
-Build HIR with wire decl, run backend, assert output contains "wire".
-@End Implementation
-
-@TestCases:
-- Wire HIR -> output contains "wire", passed
-- Backend drops wire keyword -> contains fails
-@End TestCases
-
-Process called "test_backend_wire_generation" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); wire [7:0] data; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter_ptr, hir
-
-    proc assert_contains with suite_ptr, "Backend generates wire declaration", regenerated, "wire"
-    proc assert_contains with suite_ptr, "Backend generates bit range", regenerated, "["
-
+Process called "test_backend_wire_generation" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); wire [7:0] data; endmodule"
+    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter, hir
+    Let has_wire be proc string_contains with regenerated, "wire"
+    proc assert_equal from TestUtils with results, "Backend generates wire declaration", has_wire, 1
     Return 1
 End Process
 
 @Reasoning:
-Verifies the backend emits "assign" for continuous-assignment HIR
-nodes.
+Verifies the backend emits "assign" for continuous-assignment HIR nodes.
 @End Reasoning
-
-@Implementation:
-Build HIR with assign, run backend, assert output contains "assign".
-@End Implementation
-
-@TestCases:
-- Assign HIR -> output contains "assign", passed
-- Backend uses "<=" instead -> contains check fails
-@End TestCases
-
-Process called "test_backend_assign_generation" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); wire a, b, c; assign c = a bitwise and b; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter_ptr, source
-
-    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter_ptr, hir
-
-    proc assert_contains with suite_ptr, "Backend generates assign statement", regenerated, "assign"
-
+Process called "test_backend_assign_generation" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let hir be proc verilog_to_hir_with_emitter from VerilogEmitter with emitter, "module test(); wire a, b, c; assign c = a & b; endmodule"
+    Let regenerated be proc hir_to_verilog_with_emitter from VerilogEmitter with emitter, hir
+    Let has_assign be proc string_contains with regenerated, "assign"
+    proc assert_equal from TestUtils with results, "Backend generates assign statement", has_assign, 1
     Return 1
 End Process
 
@@ -614,112 +295,56 @@ Note: Round-Trip Tests
 Note: ================================================================
 
 @Reasoning:
-Round-trip smoke test: minimal Verilog module through parse ->
-translate -> backend, asserting the regenerated output preserves
-the module name.
+Round-trip smoke test: minimal Verilog module through parse -> translate ->
+backend, asserting the regenerated output preserves the module name.
 @End Reasoning
-
-@Implementation:
-Run the full pipeline on "module test; endmodule" and assert the
-output contains "test".
-@End Implementation
-
-@TestCases:
-- Minimal module -> output contains "test", passed
-- Pipeline loses module name -> contains fails
-@End TestCases
-
-Process called "test_round_trip_simple_module" that takes suite_ptr as Integer returns Integer:
-    Let source be "module test(); endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Round-trip preserves simple module", is_valid, "Non-empty output"
-
-    proc assert_contains with suite_ptr, "Round-trip preserves module name", regenerated, "test"
-
+Process called "test_round_trip_simple_module" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module test(); endmodule"
+    Let out_len be proc string_length from StringCore with regenerated
+    proc assert_greater_than from TestUtils with results, "Round-trip preserves simple module", out_len, 0
+    Let has_name be proc string_contains with regenerated, "test"
+    proc assert_equal from TestUtils with results, "Round-trip preserves module name", has_name, 1
     Return 1
 End Process
 
 @Reasoning:
-Round-trip check that port declarations survive both translation
-directions.
+Round-trip check that port declarations survive both translation directions.
 @End Reasoning
-
-@Implementation:
-Run pipeline on module with input/output ports; assert regenerated
-output contains "input" or "output" keywords.
-@End Implementation
-
-@TestCases:
-- Module with ports -> output contains port direction keyword, passed
-- Pipeline drops port direction -> contains fails
-@End TestCases
-
-Process called "test_round_trip_port_declaration" that takes suite_ptr as Integer returns Integer:
-    Let source be "module adder(a, b); input a, b; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    proc assert_contains with suite_ptr, "Round-trip preserves module name", regenerated, "adder"
-    proc assert_contains with suite_ptr, "Round-trip preserves input keyword", regenerated, "input"
-
+Process called "test_round_trip_port_declaration" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module adder(a, b); input a, b; endmodule"
+    Let has_name be proc string_contains with regenerated, "adder"
+    proc assert_equal from TestUtils with results, "Round-trip preserves module name", has_name, 1
+    Let has_input be proc string_contains with regenerated, "input"
+    proc assert_equal from TestUtils with results, "Round-trip preserves input keyword", has_input, 1
     Return 1
 End Process
 
 @Reasoning:
-Round-trip check for always blocks (sequential logic) through the
-full pipeline.
+Round-trip check for always blocks (sequential logic) through the full
+pipeline.
 @End Reasoning
-
-@Implementation:
-Run pipeline on module with always @(posedge clk) block; assert
-output contains "always".
-@End Implementation
-
-@TestCases:
-- Always block module -> output contains "always", passed
-- Pipeline drops always keyword -> contains fails
-@End TestCases
-
-Process called "test_round_trip_always_block" that takes suite_ptr as Integer returns Integer:
-    Let source be "module ff(); reg clk, q; always @(posedge clk) q = 1; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    proc assert_contains with suite_ptr, "Round-trip preserves always keyword", regenerated, "always"
-    proc assert_contains with suite_ptr, "Round-trip preserves posedge", regenerated, "posedge"
-
+Process called "test_round_trip_always_block" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module ff(); reg clk, q; always @(posedge clk) q = 1; endmodule"
+    Let has_always be proc string_contains with regenerated, "always"
+    proc assert_equal from TestUtils with results, "Round-trip preserves always keyword", has_always, 1
+    Let has_posedge be proc string_contains with regenerated, "posedge"
+    proc assert_equal from TestUtils with results, "Round-trip preserves posedge", has_posedge, 1
     Return 1
 End Process
 
 @Reasoning:
 Round-trip check for combinational logic (assign statements).
 @End Reasoning
-
-@Implementation:
-Run pipeline on module with assign statement; assert output
-contains "assign".
-@End Implementation
-
-@TestCases:
-- Combinational module -> output contains "assign", passed
-- Pipeline converts to procedural -> contains may fail
-@End TestCases
-
-Process called "test_round_trip_combinational" that takes suite_ptr as Integer returns Integer:
-    Let source be "module comb(); wire a, b, c; assign c = a bitwise and b; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    proc assert_contains with suite_ptr, "Round-trip preserves wire", regenerated, "wire"
-    proc assert_contains with suite_ptr, "Round-trip preserves assign", regenerated, "assign"
-
+Process called "test_round_trip_combinational" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module comb(); wire a, b, c; assign c = a & b; endmodule"
+    Let has_wire be proc string_contains with regenerated, "wire"
+    proc assert_equal from TestUtils with results, "Round-trip preserves wire", has_wire, 1
+    Let has_assign be proc string_contains with regenerated, "assign"
+    proc assert_equal from TestUtils with results, "Round-trip preserves assign", has_assign, 1
     Return 1
 End Process
 
@@ -730,62 +355,35 @@ Note: ================================================================
 @Reasoning:
 Integration test using a complete counter module (canonical Verilog
 example). Exercises module declaration, port directions, register
-declaration, always block with reset/increment logic.
+declaration, and an always block with reset/increment logic.
 @End Reasoning
-
-@Implementation:
-Run pipeline on counter module source; assert output contains
-"counter" name and "always" keyword.
-@End Implementation
-
-@TestCases:
-- Counter module -> regenerated source contains module name and always
-- Pipeline loses counter logic -> contains check fails
-@End TestCases
-
-Process called "test_complete_counter" that takes suite_ptr as Integer returns Integer:
-    Let source be "module counter(clk, rst, count); input clk, rst; output [7:0] count; reg [7:0] count; always @(posedge clk) begin if (rst) count = 0; else count = count + 1; end endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Complete counter round-trip succeeds", is_valid, "Non-empty output"
-
-    proc assert_contains with suite_ptr, "Counter preserves module name", regenerated, "counter"
-    proc assert_contains with suite_ptr, "Counter preserves always block", regenerated, "always"
-    proc assert_contains with suite_ptr, "Counter preserves if statement", regenerated, "if"
-
+Process called "test_complete_counter" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module counter(clk, rst, count); input clk, rst; output [7:0] count; reg [7:0] count; always @(posedge clk) begin if (rst) count = 0; else count = count + 1; end endmodule"
+    Let out_len be proc string_length from StringCore with regenerated
+    proc assert_greater_than from TestUtils with results, "Complete counter round-trip succeeds", out_len, 0
+    Let has_name be proc string_contains with regenerated, "counter"
+    proc assert_equal from TestUtils with results, "Counter preserves module name", has_name, 1
+    Let has_always be proc string_contains with regenerated, "always"
+    proc assert_equal from TestUtils with results, "Counter preserves always block", has_always, 1
+    Let has_if be proc string_contains with regenerated, "if"
+    proc assert_equal from TestUtils with results, "Counter preserves if statement", has_if, 1
     Return 1
 End Process
 
 @Reasoning:
-Integration test using a complete adder module. Exercises typed
-ports, an assign statement, and combinational logic together.
+Integration test using a complete adder module. Exercises typed ports, an
+assign statement, and combinational logic together.
 @End Reasoning
-
-@Implementation:
-Run pipeline on adder module; assert regenerated output contains
-"adder" name and "assign" keyword.
-@End Implementation
-
-@TestCases:
-- Adder module -> output contains module name and assign, passed
-- Pipeline drops adder name -> contains fails
-@End TestCases
-
-Process called "test_complete_adder" that takes suite_ptr as Integer returns Integer:
-    Let source be "module adder(a, b, sum, carry); input [3:0] a, b; output [3:0] sum; output carry; assign {carry, sum} = a + b; endmodule"
-
-    Let emitter_ptr be proc create_emitter from VerilogEmitter
-    Let regenerated be proc round_trip from VerilogEmitter with emitter_ptr, source
-
-    Let is_valid be proc string_length from StringCore with regenerated is greater than 0
-    proc assert_true with suite_ptr, "Complete adder round-trip succeeds", is_valid, "Non-empty output"
-
-    proc assert_contains with suite_ptr, "Adder preserves module name", regenerated, "adder"
-    proc assert_contains with suite_ptr, "Adder preserves assign", regenerated, "assign"
-
+Process called "test_complete_adder" takes results as Integer returns Integer:
+    Let emitter be proc create_emitter from VerilogEmitter
+    Let regenerated be proc round_trip from VerilogEmitter with emitter, "module adder(a, b, sum, carry); input [3:0] a, b; output [3:0] sum; output carry; assign sum = a + b; endmodule"
+    Let out_len be proc string_length from StringCore with regenerated
+    proc assert_greater_than from TestUtils with results, "Complete adder round-trip succeeds", out_len, 0
+    Let has_name be proc string_contains with regenerated, "adder"
+    proc assert_equal from TestUtils with results, "Adder preserves module name", has_name, 1
+    Let has_assign be proc string_contains with regenerated, "assign"
+    proc assert_equal from TestUtils with results, "Adder preserves assign", has_assign, 1
     Return 1
 End Process
 
@@ -794,323 +392,52 @@ Note: Test Suite Execution
 Note: ================================================================
 
 @Reasoning:
-Suite dispatcher: creates a "Lexer Tests" TestSuite, runs all 4
-lexer test_* procs against it, returns the suite handle.
+Top-level entry point. Creates a TestUtils results record, drives every
+test_* procedure against it, prints the aggregated summary, and returns the
+number of failed assertions (0 == all passed).
 @End Reasoning
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Verilog translator suite"
 
-@Implementation:
-1. create_test_suite("Lexer Tests") -> suite_ptr.
-2. Call test_lexer_keywords/numbers/operators/system_tasks each
-   with suite_ptr.
-3. Return suite_ptr.
-@End Implementation
+    proc test_lexer_keywords with results
+    proc test_lexer_numbers with results
+    proc test_lexer_operators with results
+    proc test_lexer_system_tasks with results
 
-Process called "run_lexer_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Lexer Tests"
+    proc test_parser_simple_module with results
+    proc test_parser_module_with_ports with results
+    proc test_parser_always_block with results
+    proc test_parser_assign_statement with results
+    proc test_parser_if_statement with results
 
-    proc test_lexer_keywords from suite
-    proc test_lexer_numbers from suite
-    proc test_lexer_operators from suite
-    proc test_lexer_system_tasks from suite
+    proc test_translator_simple_module with results
+    proc test_translator_wire_declaration with results
+    proc test_translator_always_block with results
 
-    Return suite
+    proc test_backend_simple_module with results
+    proc test_backend_wire_generation with results
+    proc test_backend_assign_generation with results
+
+    proc test_round_trip_simple_module with results
+    proc test_round_trip_port_declaration with results
+    proc test_round_trip_always_block with results
+    proc test_round_trip_combinational with results
+
+    proc test_complete_counter with results
+    proc test_complete_adder with results
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
 End Process
 
 @Reasoning:
-Suite dispatcher for the 5 parser test_* procs.
+External integration hook callable from a top-level test runner. Forwards to
+main and returns the failed-assertion count.
 @End Reasoning
-
-@Implementation:
-1. create_test_suite("Parser Tests") -> suite_ptr.
-2. Call test_parser_simple_module/module_with_ports/always_block/
-   assign_statement/if_statement each with suite_ptr.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "run_parser_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Parser Tests"
-
-    proc test_parser_simple_module from suite
-    proc test_parser_module_with_ports from suite
-    proc test_parser_always_block from suite
-    proc test_parser_assign_statement from suite
-    proc test_parser_if_statement from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Suite dispatcher for the 3 translator test_* procs.
-@End Reasoning
-
-@Implementation:
-1. create_test_suite("Translator Tests") -> suite_ptr.
-2. Call test_translator_simple_module/wire_declaration/always_block.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "run_translator_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Translator Tests"
-
-    proc test_translator_simple_module from suite
-    proc test_translator_wire_declaration from suite
-    proc test_translator_always_block from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Suite dispatcher for the 3 backend test_* procs.
-@End Reasoning
-
-@Implementation:
-1. create_test_suite("Backend Tests") -> suite_ptr.
-2. Call test_backend_simple_module/wire_generation/assign_generation.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "run_backend_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Backend Tests"
-
-    proc test_backend_simple_module from suite
-    proc test_backend_wire_generation from suite
-    proc test_backend_assign_generation from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Suite dispatcher for the 4 round-trip test_* procs.
-@End Reasoning
-
-@Implementation:
-1. create_test_suite("Round-Trip Tests") -> suite_ptr.
-2. Call test_round_trip_simple_module/port_declaration/always_block/
-   combinational.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "run_round_trip_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Round-Trip Tests"
-
-    proc test_round_trip_simple_module from suite
-    proc test_round_trip_port_declaration from suite
-    proc test_round_trip_always_block from suite
-    proc test_round_trip_combinational from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Suite dispatcher for the 2 integration test_* procs (counter, adder).
-@End Reasoning
-
-@Implementation:
-1. create_test_suite("Integration Tests") -> suite_ptr.
-2. Call test_complete_counter and test_complete_adder.
-3. Return suite_ptr.
-@End Implementation
-
-Process called "run_integration_tests" that takes nothing returns Integer:
-    Let suite be proc create_test_suite with "Verilog Integration Tests"
-
-    proc test_complete_counter from suite
-    proc test_complete_adder from suite
-
-    Return suite
-End Process
-
-@Reasoning:
-Top-level entry point. Builds a list of all six suite handles, runs
-each suite dispatcher, then prints aggregated results and returns
-the all-suites-passed signal.
-@End Reasoning
-
-@Implementation:
-1. Create empty suites_list.
-2. For each of lexer/parser/translator/backend/round_trip/integration:
-   call run_<phase>_tests, append to suites_list.
-3. print_test_results(suites_list).
-4. Return check_all_passed(suites_list).
-@End Implementation
-
-@TestCases:
-- All 6 suites pass -> returns 1
-- Any suite has failures -> returns 0
-@End TestCases
-
-Process called "run_all_tests" that takes nothing returns Integer:
-    Let all_suites be proc create_list from ListCore
-
-    Let lexer_suite be proc run_lexer_tests
-    proc add_to_list from ListCore with all_suites, lexer_suite
-
-    Let parser_suite be proc run_parser_tests
-    proc add_to_list from ListCore with all_suites, parser_suite
-
-    Let translator_suite be proc run_translator_tests
-    proc add_to_list from ListCore with all_suites, translator_suite
-
-    Let backend_suite be proc run_backend_tests
-    proc add_to_list from ListCore with all_suites, backend_suite
-
-    Let round_trip_suite be proc run_round_trip_tests
-    proc add_to_list from ListCore with all_suites, round_trip_suite
-
-    Let integration_suite be proc run_integration_tests
-    proc add_to_list from ListCore with all_suites, integration_suite
-
-    proc print_test_results from all_suites
-
-    Return proc check_all_passed from all_suites
-End Process
-
-Note: ================================================================
-Note: Test Result Reporting
-Note: ================================================================
-
-@Reasoning:
-Iterates suites_list and prints per-suite pass/fail counts plus
-totals. Failed tests are enumerated via print_failed_tests.
-@End Reasoning
-
-@Implementation:
-For Each suite_ptr in suites_list: read name, passed_count,
-failed_count; print "Suite <name>: <p> passed, <f> failed"; on
-any failure call print_failed_tests(suite_ptr).
-@End Implementation
-
-Process called "print_test_results" that takes suites_list as Integer returns Integer:
-    Let suite_count be proc get_list_size from ListCore with suites_list
-    Let total_passed be 0
-    Let total_failed be 0
-
-    Let index be 0
-    While index is less than suite_count:
-        Let suite_ptr be proc get_from_list from ListCore with suites_list, index
-
-        Let suite_name be proc read_string from Memory with suite_ptr, 0
-        Let passed_count be proc read_integer from Memory with suite_ptr, 16
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-
-        proc print_string from StringCore with "========================================\n"
-        proc print_string from StringCore with suite_name
-        proc print_string from StringCore with "\n========================================\n"
-        proc print_string from StringCore with "Passed: "
-        proc print_integer from StringCore with passed_count
-        proc print_string from StringCore with "\nFailed: "
-        proc print_integer from StringCore with failed_count
-        proc print_string from StringCore with "\n\n"
-
-        If failed_count is greater than 0:
-            proc print_failed_tests from suite_ptr
-        End If
-
-        Set total_passed to total_passed plus passed_count
-        Set total_failed to total_failed plus failed_count
-
-        Set index to index plus 1
-    End While
-
-    proc print_string from StringCore with "========================================\n"
-    proc print_string from StringCore with "OVERALL RESULTS\n"
-    proc print_string from StringCore with "========================================\n"
-    proc print_string from StringCore with "Total Passed: "
-    proc print_integer from StringCore with total_passed
-    proc print_string from StringCore with "\nTotal Failed: "
-    proc print_integer from StringCore with total_failed
-    proc print_string from StringCore with "\n"
-
-    Return 1
-End Process
-
-@Reasoning:
-Walks one suite's tests list and prints details for any TestResult
-where passed != 1. Useful for CI consumers who want failure detail
-inline.
-@End Reasoning
-
-@Implementation:
-Read tests_list pointer at offset 8. For Each result_ptr: read
-passed at offset 8; if 0 print "FAILED: <name>: <message>".
-@End Implementation
-
-Process called "print_failed_tests" that takes suite_ptr as Integer returns Integer:
-    Let tests_list be proc read_integer from Memory with suite_ptr, 8
-    Let test_count be proc get_list_size from ListCore with tests_list
-
-    proc print_string from StringCore with "Failed Tests:\n"
-
-    Let index be 0
-    While index is less than test_count:
-        Let test_ptr be proc get_from_list from ListCore with tests_list, index
-
-        Let passed be proc read_integer from Memory with test_ptr, 8
-
-        If passed is equal to 0:
-            Let test_name be proc read_string from Memory with test_ptr, 0
-            Let message be proc read_string from Memory with test_ptr, 16
-
-            proc print_string from StringCore with "  - "
-            proc print_string from StringCore with test_name
-            proc print_string from StringCore with "\n    "
-            proc print_string from StringCore with message
-            proc print_string from StringCore with "\n"
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Sums up all suite failed_counts. Returns 1 iff every suite has
-zero failures.
-@End Reasoning
-
-@Implementation:
-For Each suite_ptr in suites_list: read failed_count at offset 24.
-If any > 0 return 0. After loop, return 1.
-@End Implementation
-
-@TestCases:
-- All suites failed_count == 0 -> return 1
-- Any suite has failed_count > 0 -> return 0
-@End TestCases
-
-Process called "check_all_passed" that takes suites_list as Integer returns Integer:
-    Let suite_count be proc get_list_size from ListCore with suites_list
-
-    Let index be 0
-    While index is less than suite_count:
-        Let suite_ptr be proc get_from_list from ListCore with suites_list, index
-
-        Let failed_count be proc read_integer from Memory with suite_ptr, 24
-
-        If failed_count is greater than 0:
-            Return 0
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Public API
-Note: ================================================================
-
-@Reasoning:
-External integration hook callable from a top-level test runner.
-Returns the all-suites-passed signal from run_all_tests.
-@End Reasoning
-
-@Implementation:
-Forward to run_all_tests() and return its result.
-@End Implementation
-
-Process called "test_verilog_translation" that takes nothing returns Integer:
-    Return proc run_all_tests
+Process called "test_verilog_translation" takes nothing returns Integer:
+    Return proc main
 End Process
