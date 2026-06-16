@@ -1029,29 +1029,39 @@ Process called "arena_string_concat" takes arena as Integer, str1 as Integer, st
     Return arena_result
 End Process
 
-Note: ==== Arena Allocator (Instance/Arena Hybrid Architecture) ====
-Note: Arena structure layout (24 bytes total):
-Note:   - buffer (offset 0): Pointer to memory block
-Note:   - capacity (offset 8): Total size of buffer  
-Note:   - used (offset 16): Bytes currently used
+Note: ==== Arena Allocator (Segmented - never relocates) ====
+Note: Arena structure layout (32 bytes total):
+Note:   - buffer (offset 0): Pointer to the CURRENT block's payload (block_base + 8)
+Note:   - capacity (offset 8): Payload capacity of the current block
+Note:   - used (offset 16): Bytes used in the current block
+Note:   - block_head (offset 24): Most-recent block base; block[0] holds the previous
+Note:                            block base, chaining to 0 (the first block).
+Note: Each block = memory_allocate(8 + payload): the first 8 bytes hold the previous-block
+Note: pointer and the payload starts at block + 8. When a block fills, growth allocates a
+Note: NEW block and chains it - it NEVER copies or frees the old block, so every pointer
+Note: arena_allocate has already returned stays valid until arena_destroy frees the whole
+Note: chain. (This is the invariant import_context_grow_arrays and friends rely on.)
 
 Process called "arena_create" takes initial_capacity as Integer returns Integer:
-    Note: Create new arena with specified capacity
-    Let arena be memory_allocate(24)  Note: sizeof(Arena) = 3 * 8 bytes
+    Note: Create new segmented arena with the given initial block payload capacity
+    Let arena be memory_allocate(32)  Note: sizeof(Arena) = 4 * 8 bytes
     If arena is equal to 0:
         Return 0
     End If
 
-    Let buffer be memory_allocate(initial_capacity)
-    If buffer is equal to 0:
+    Note: First block: 8-byte chain header + payload; payload starts at block + 8.
+    Let block be memory_allocate(initial_capacity plus 8)
+    If block is equal to 0:
         deallocate(arena)
         Return 0
     End If
-    
-    memory_set_pointer(arena, 0, buffer)
+    memory_set_pointer(block, 0, 0)  Note: previous-block pointer = null (first block)
+
+    memory_set_pointer(arena, 0, block plus 8)  Note: current payload base
     memory_set_integer(arena, 8, initial_capacity)
     memory_set_integer(arena, 16, 0)  Note: used = 0
-    
+    memory_set_pointer(arena, 24, block)  Note: block_head
+
     Return arena
 End Process
 
@@ -1072,26 +1082,32 @@ Process called "arena_allocate" takes arena as Integer, size as Integer returns 
     
     Let new_used be used plus aligned_size
     If new_used is greater than capacity:
-        Note: Arena full - grow it
+        Note: Current block full - allocate a NEW block and chain it. We never copy or
+        Note: free the old block, so every pointer already returned stays valid until
+        Note: arena_destroy walks and frees the whole chain.
         Let new_capacity be capacity multiplied by 2
-        If new_capacity is less than new_used:
-            Set new_capacity to new_used multiplied by 2
+        If new_capacity is less than aligned_size:
+            Set new_capacity to aligned_size multiplied by 2
         End If
-        
-        Let new_buffer be memory_allocate(new_capacity)
-        If new_buffer is equal to 0:
+
+        Let new_block be memory_allocate(new_capacity plus 8)
+        If new_block is equal to 0:
             Return 0  Note: Out of memory
         End If
-        
-        Note: Copy existing data
-        memory_copy(new_buffer, buffer, used)
-        
-        deallocate(buffer)
-        memory_set_pointer(arena, 0, new_buffer)
+
+        Note: Chain to the previous block_head, then make this block current.
+        Let prev_head be memory_get_pointer(arena, 24)
+        memory_set_pointer(new_block, 0, prev_head)
+        memory_set_pointer(arena, 24, new_block)
+        Set buffer to new_block plus 8
+        memory_set_pointer(arena, 0, buffer)
         memory_set_integer(arena, 8, new_capacity)
-        Set buffer to new_buffer
+
+        Note: This allocation takes the base of the fresh block; used resets to its size.
+        memory_set_integer(arena, 16, aligned_size)
+        Return buffer
     End If
-    
+
     Let result be buffer plus used
     memory_set_integer(arena, 16, new_used)
     Return result
@@ -1114,18 +1130,34 @@ Process called "arena_string_duplicate" takes arena as Integer, str as Integer r
 End Process
 
 Process called "arena_destroy" takes arena as Integer returns Integer:
-    Note: Destroy arena and free all memory at once
+    Note: Destroy arena - walk the block chain freeing every block, then the struct.
     If arena is not equal to 0:
-        Let buffer be memory_get_pointer(arena, 0)
-        deallocate(buffer)
+        Let block be memory_get_pointer(arena, 24)
+        While block is not equal to 0:
+            Let prev be memory_get_pointer(block, 0)
+            deallocate(block)
+            Set block to prev
+        End While
         deallocate(arena)
     End If
     Return 0
 End Process
 
 Process called "arena_reset" takes arena as Integer returns Integer:
-    Note: Reset arena to empty (reuse existing buffer)
+    Note: Reset arena for reuse: free every block except the most-recent (largest),
+    Note: which is retained as the sole block. Pointers handed out before reset are
+    Note: invalidated, matching reset semantics.
     If arena is not equal to 0:
+        Let head be memory_get_pointer(arena, 24)
+        If head is not equal to 0:
+            Let older be memory_get_pointer(head, 0)
+            While older is not equal to 0:
+                Let prev be memory_get_pointer(older, 0)
+                deallocate(older)
+                Set older to prev
+            End While
+            memory_set_pointer(head, 0, 0)  Note: now the only block in the chain
+        End If
         memory_set_integer(arena, 16, 0)  Note: used = 0
     End If
     Return 0
