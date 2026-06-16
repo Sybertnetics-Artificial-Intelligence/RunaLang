@@ -4029,6 +4029,123 @@ and `root_manifest_version`.
 
 ---
 
+# Data Interchange & Serialization
+
+---
+
+## Overview
+
+Runa's **native** data file is an executable `.data.runa` (or `.config.runa`) that exports a
+structured value — covered fully in the *Data and Configuration Formats* section. This
+section covers the **interchange** problem: exchanging data with systems that do not speak
+Runa, by reading and writing legacy serialization formats.
+
+Three text serializers are built in `compiler/frontend/primitives/format/`, each grounded
+in its standard:
+
+| Module        | Format | Standard                                            |
+|---------------|--------|-----------------------------------------------------|
+| `json.runa`   | JSON   | RFC 8259 / ECMA-404                                 |
+| `csv.runa`    | CSV    | RFC 4180 (+ IANA `text/csv`)                        |
+| `ini.runa`    | INI    | configparser / systemd unit / Wine `.reg` dialects  |
+
+Binary interchange is served by `io/byte_buffer.runa` (length-prefixed binary framing) and
+streaming by `streams/{stream,buffered_io,pipeline,back_pressure}.runa`.
+
+## Direction
+
+- **Inbound** — `json_parse`, `csv_parse`, `ini_parse` read a foreign document into Runa
+  values, so a Runa program consumes an external API response or data file.
+- **Outbound** — the matching serializers emit JSON/CSV/INI from Runa values, so a Runa
+  program produces output a non-Runa system can read.
+
+In both directions the *in-program* representation is ordinary Runa data — the format
+modules are adapters at the boundary, not a parallel data model. A Runa service therefore
+holds one native representation and speaks JSON to a browser, CSV to a spreadsheet, and
+`.data.runa` to another Runa service, with no impedance mismatch internally.
+
+## File-Type
+
+A Runa-native data document uses `*.data.runa`. Foreign serialized files keep their native
+extensions (`.json`, `.csv`, `.ini`) — they are *input/output*, not Runa source — and are
+read/written through the `format/` adapters.
+
+## Summary
+
+- ✅ RFC-grounded JSON / CSV / INI read + write adapters
+- ✅ Binary framing (`byte_buffer`) and streaming (`streams/`)
+- ✅ Single native in-program representation; formats are boundary adapters
+- ✅ Native data documents as `*.data.runa`
+
+---
+
+# CI/CD Pipeline
+
+> **Status: 📋 PLANNED.** The `.pipeline.runa` file-type and its substrate are reserved in
+> the format inventory but **not yet implemented** as of v0.0.8.5. This section records the
+> design intent so the work is captured, not forgotten. It is not yet a shipped capability.
+
+## Intent
+
+A `*.pipeline.runa` file will declare a CI/CD pipeline as executable Runa — replacing
+GitHub Actions YAML, GitLab CI YAML, and Jenkinsfiles. Because it is real Runa, a pipeline
+gains computed matrix expansion, reusable step libraries via `Import`, and conditional
+stages without the templating layers (`if:` expression mini-languages, anchors, `!reference`
+tags) bolted onto YAML-based CI systems.
+
+## Planned Shape
+
+```runa
+Note: release.pipeline.runa  (PLANNED — illustrative)
+Let pipeline be a Pipeline with
+    triggers as a list containing on_push to "main", on_tag matching "v*",
+    jobs as a list containing
+        a Job called "test" with
+            runs_on as "linux_x86_64",
+            steps as a list containing
+                checkout(),
+                run("runa build.runa"),
+                run("runa test")
+End Pipeline
+```
+
+## Why Not Deferred Indefinitely
+
+There is **no technical blocker** — a pipeline is a data/role-profile artifact (Tier 2) on
+top of the existing executable-data substrate plus the process/driver primitives. It is
+sequenced after the compile-and-run driver lands (a pipeline ultimately shells out to
+`runa build` / `runa test`), and is tracked here so it is picked up deliberately rather
+than rediscovered.
+
+---
+
+# Container & Infrastructure
+
+> **Status: 📋 PLANNED.** The `.infra.runa` file-type is reserved but **not yet
+> implemented** as a native substrate in v0.0.8.5. This section records design intent.
+
+## Intent
+
+A `*.infra.runa` file will declare container images and infrastructure as executable Runa —
+replacing Dockerfiles, `docker-compose.yml`, Kubernetes manifests, and Terraform HCL with
+one typed, computed, importable representation.
+
+## Existing Inbound Conversion
+
+Note that the **RunaConvert** translation matrix already includes *inbound* frontends for
+`dockerfile`, `makefile`, and `cmake` (converting those formats **into** Runa HIR). That is
+the migration path — read an existing Dockerfile into Runa — and is distinct from the
+planned **native** `.infra.runa` authoring substrate, which produces such artifacts from
+Runa. The inbound frontends exist today; the native authoring substrate is the planned
+piece.
+
+## Why Not Deferred Indefinitely
+
+Like CI/CD, infrastructure is a Tier-2 role profile with no hard blocker; it is sequenced
+after the driver and the CI/CD substrate, and recorded here to ensure it is not lost.
+
+---
+
 **Document Version:** 1.1
 **Last Updated:** 2026-06-15
 **Status:** Canonical
