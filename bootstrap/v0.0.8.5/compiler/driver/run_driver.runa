@@ -1,0 +1,615 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements the "runa run" compile-and-run orchestration (task Q2b).
+
+It sits directly on top of the Q2a subprocess primitives in process_manager
+(process_run = fork + execve + wait, returning the child's decoded exit code)
+and drives a complete source-to-running-program flow:
+
+  1. Compile the input .runa source to assembly (.s) by invoking the genuine
+     compiler pipeline entry points (read -> lex -> parse -> codegen), the same
+     entry points the standalone compiler_driver "main" uses.
+  2. Assemble the .s to an object (.o) by running /usr/bin/as.
+  3. Link the .o against the Runa runtime object with /usr/bin/gcc (gcc supplies
+     crt0/libc startup, matching the project's external build recipe).
+  4. Execute the freshly built binary and surface its exit code to the caller.
+
+Each external program is launched via process_run with an argv array marshalled
+in the exact shape the Q2a contract requires: a heap block of 8-byte C-string
+pointers terminated by a 0 entry, with argv[0] being the program name. Runa
+strings are NUL-terminated byte buffers (this is how every path in the codebase
+is already handed to the open/execve syscalls), so each argv entry is simply the
+Runa string pointer itself -- no separate string-to-cstring conversion primitive
+exists or is needed.
+
+This file consists of the following functions/features/operation types:
+- marshal_argv / free_argv: build and release NULL-terminated C pointer arrays
+- empty_envp / free_envp: provide an empty environment vector
+- compile_source_to_asm: reuse of the real compiler pipeline (read/lex/parse/gen)
+- runa_run: the end-to-end compile, assemble, link, execute orchestration
+:End Note
+
+Note: process_run / process_execve / process_fork / process_wait (Q2a).
+Import "runtime/integration/system_interface/wrappers/process_manager.runa" as ProcessManager
+
+Note: Pointer-sized heap allocation and release for the argv/envp arrays.
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: Raw pointer and integer writes into the argv/envp arrays.
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: List length / element access for the caller-supplied argument list.
+Import "compiler/frontend/primitives/collections/list.runa" as ListPrimitive
+
+Note: String concatenation for temp-path construction and basename extraction.
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
+
+Note: NUL-terminated string length scanning for basename extraction.
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: Best-effort temp-file removal (unlink) between and after pipeline stages.
+Import "compiler/frontend/primitives/io/file_io.runa" as FileIO
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Note: Absolute path of the Runa runtime object. This is the install-relative
+Note: runtime artifact that gcc links against to satisfy the runtime's syscall
+Note: wrappers, memory manager, and string primitives. It is isolated in a single
+Note: accessor so that relocating the runtime object (for example after the
+Note: bootstrap/ directory is renamed at v1.0) is a one-line change here. The
+Note: value resolved on this host is the v0.0.8.4.5.3.5 runtime object, which is
+Note: the runtime currently produced by the build pipeline.
+Process called "runtime_object_path" returns Integer:
+    @Reasoning
+    The runtime object location is an install detail, not a value baked into the
+    orchestration logic, so it is exposed through a single accessor rather than
+    scattered string literals. Returning the literal pointer is correct because
+    Runa string literals are stable, NUL-terminated byte buffers for the lifetime
+    of the program, exactly what gcc's argv needs.
+    @End Reasoning
+    @Implementation
+    Returns the absolute path of the runtime object that gcc links against. The
+    path points at bootstrap/v0.0.8.4.5.3.5/runtime/runtime.o relative to the
+    monorepo root; expressed absolutely so it is independent of the process CWD,
+    which differs between compilation (bootstrap/v0.0.8.5) and execution.
+    @End Implementation
+    Return "/mnt/d/SybertneticsUmbrella/SybertneticsAISolutions/MonoRepo/RunaLang/runa/bootstrap/v0.0.8.4.5.3.5/runtime/runtime.o"
+End Process
+
+Note: Absolute path of the system assembler.
+Process called "assembler_path" returns Integer:
+    @Reasoning
+    process_execve needs an absolute executable path; it does not perform PATH
+    resolution. The host's assembler lives at /usr/bin/as (verified present), so
+    that absolute path is returned directly.
+    @End Reasoning
+    @Implementation
+    Returns the NUL-terminated literal "/usr/bin/as".
+    @End Implementation
+    Return "/usr/bin/as"
+End Process
+
+Note: Absolute path of the system C compiler / linker driver.
+Process called "linker_path" returns Integer:
+    @Reasoning
+    gcc is used as the link driver because it supplies crt0/libc startup objects
+    that the produced program needs, matching the project's external build recipe
+    ("gcc x.o runtime.o -o x -lm"). process_execve requires an absolute path, and
+    the host's gcc is at /usr/bin/gcc (verified present).
+    @End Reasoning
+    @Implementation
+    Returns the NUL-terminated literal "/usr/bin/gcc".
+    @End Implementation
+    Return "/usr/bin/gcc"
+End Process
+
+Note: ============================================================================
+Note: ARGV / ENVP MARSHALLING
+Note: ============================================================================
+
+Process called "marshal_argv" takes args_list as Integer returns Integer:
+    @Reasoning
+    process_run / process_execve consume argv as a heap block of 8-byte C-string
+    pointers terminated by a 0 entry. The caller assembles its arguments as a
+    Runa List of string pointers (each a NUL-terminated byte buffer, which is
+    precisely the C-string representation the kernel's execve expects -- the same
+    representation every path in this codebase is already handed to open/execve).
+    This Process converts that List into the contiguous, NULL-terminated pointer
+    array execve requires. No string copying or conversion is performed: a Runa
+    string pointer IS a valid C string, so each pointer is stored verbatim.
+    @End Reasoning
+    @Implementation
+    Steps:
+      1. Read the element count from the List via list_length.
+      2. Allocate (count + 1) pointer slots of 8 bytes each = (count + 1) * 8
+         bytes on the owned heap, so the trailing slot can hold the 0 terminator.
+      3. For each index i in 0..count-1, fetch the i-th element (a Runa string
+         pointer) with list_get and store it at byte offset i*8 with
+         memory_set_pointer.
+      4. Write a 0 pointer at the final slot (offset count*8) to terminate the
+         vector.
+      5. Return the array base pointer. On allocation failure (allocate returns
+         0) return 0 so callers can detect and abort.
+    A NULL or empty List yields a single-slot array holding only the 0
+    terminator, which is a valid (argument-less) argv -- though callers always
+    supply at least argv[0].
+    @End Implementation
+    Let count be proc list_length from ListPrimitive with args_list
+    Let slot_count be count plus 1
+    Let total_bytes be slot_count multiplied by 8
+    Let array be proc allocate from Layout with total_bytes
+    If array is equal to 0:
+        Return 0
+    End If
+    Let index be 0
+    While index is less than count:
+        Let element be proc list_get from ListPrimitive with args_list, index
+        Let offset be index multiplied by 8
+        proc memory_set_pointer from Memory with array, offset, element
+        Set index to index plus 1
+    End While
+    Let terminator_offset be count multiplied by 8
+    proc memory_set_pointer from Memory with array, terminator_offset, 0
+    Return array
+End Process
+
+Process called "free_argv" takes argv as Integer returns Nothing:
+    @Reasoning
+    marshal_argv allocates one contiguous pointer array on the owned heap. The
+    array stores BORROWED pointers (the caller's List elements and string
+    literals), so only the array spine is freed here -- never the pointed-to
+    strings, which the caller still owns.
+    @End Reasoning
+    @Implementation
+    Guards against a 0 pointer (allocation failure / already freed) and otherwise
+    releases the array spine with deallocate.
+    @End Implementation
+    If argv is equal to 0:
+        Return
+    End If
+    proc deallocate from Layout with argv
+    Return
+End Process
+
+Process called "empty_envp" returns Integer:
+    @Reasoning
+    The Q2a contract allows envp to point at a single 0 entry for an empty
+    environment. "runa run" launches the build tools and the target program with
+    a clean, empty environment so the run is reproducible and does not leak the
+    parent shell's variables into the assembled program's view; as and gcc locate
+    their own support files via absolute install paths and do not require
+    inherited environment to function for this fixed recipe.
+    @End Reasoning
+    @Implementation
+    Allocates a single 8-byte slot and writes 0 into it, yielding a valid empty
+    environment vector. Returns 0 on allocation failure.
+    @End Implementation
+    Let envp be proc allocate from Layout with 8
+    If envp is equal to 0:
+        Return 0
+    End If
+    proc memory_set_pointer from Memory with envp, 0, 0
+    Return envp
+End Process
+
+Process called "free_envp" takes envp as Integer returns Nothing:
+    @Reasoning
+    Releases the single-slot environment vector allocated by empty_envp. Mirrors
+    free_argv: only the spine is owned here.
+    @End Reasoning
+    @Implementation
+    Guards against 0 and frees with deallocate.
+    @End Implementation
+    If envp is equal to 0:
+        Return
+    End If
+    proc deallocate from Layout with envp
+    Return
+End Process
+
+Note: ============================================================================
+Note: TEMP PATH CONSTRUCTION
+Note: ============================================================================
+
+Process called "basename_of" takes path as Integer returns Integer:
+    @Reasoning
+    Temp artifacts are named after the input's basename so a user can correlate
+    /tmp/<base>.s / .o / exe with the source they ran. The basename is the
+    substring after the final '/'. No Date or random component is used (neither
+    is available in this context), so repeated runs of the same source overwrite
+    the prior run's temp files deterministically -- which is the intended,
+    self-cleaning behaviour.
+    @End Reasoning
+    @Implementation
+    Scans the NUL-terminated path for the last '/' (byte value 47) and copies the
+    bytes after it into a freshly allocated, NUL-terminated buffer. If the path
+    contains no '/', the whole path is the basename and is duplicated. The
+    returned buffer is owned by the caller and must be deallocated. Returns 0 on
+    allocation failure.
+    @End Implementation
+    Let length be proc string_length from StringCore with path
+    Let last_slash be 0 minus 1
+    Let scan be 0
+    While scan is less than length:
+        Let byte_value be proc memory_get_byte from Memory with path, scan
+        If byte_value is equal to 47:
+            Set last_slash to scan
+        End If
+        Set scan to scan plus 1
+    End While
+    Let start be last_slash plus 1
+    Let base_length be length minus start
+    Let buffer be proc allocate from Layout with base_length plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+    Let copy_index be 0
+    While copy_index is less than base_length:
+        Let source_offset be start plus copy_index
+        Let copied_byte be proc memory_get_byte from Memory with path, source_offset
+        proc memory_set_byte from Memory with buffer, copy_index, copied_byte
+        Set copy_index to copy_index plus 1
+    End While
+    proc memory_set_byte from Memory with buffer, base_length, 0
+    Return buffer
+End Process
+
+Process called "build_temp_path" takes basename as Integer, suffix as Integer returns Integer:
+    @Reasoning
+    Produces an absolute temp path of the form /tmp/<basename><suffix>. Centralized
+    so the .s, .o, and executable paths are built identically and the /tmp prefix
+    lives in exactly one place.
+    @End Reasoning
+    @Implementation
+    Concatenates "/tmp/" + basename, then appends suffix, freeing the intermediate
+    buffer so only the final NUL-terminated path is returned. The caller owns and
+    must deallocate the result. Returns 0 if either concatenation fails to allocate.
+    @End Implementation
+    Let prefix_plus_base be proc string_concat from StringPrimitive with "/tmp/", basename
+    If prefix_plus_base is equal to 0:
+        Return 0
+    End If
+    Let full_path be proc string_concat from StringPrimitive with prefix_plus_base, suffix
+    proc deallocate from Layout with prefix_plus_base
+    Return full_path
+End Process
+
+Process called "best_effort_unlink" takes path as Integer returns Nothing:
+    @Reasoning
+    Temp files are removed as soon as they are no longer needed, but a failed
+    unlink (file already gone, permissions) must never abort the run -- the run's
+    success is defined solely by the stages succeeding, not by cleanup.
+    @End Reasoning
+    @Implementation
+    Guards against a 0 path and otherwise calls delete_file, ignoring its return
+    value (delete_file is itself a no-op on a 0 path and returns 0/1 without
+    raising).
+    @End Implementation
+    If path is equal to 0:
+        Return
+    End If
+    Let unused be proc delete_file from FileIO with path
+    Return
+End Process
+
+Note: ============================================================================
+Note: COMPILE STAGE (reuse of the real compiler pipeline)
+Note: ============================================================================
+
+Process called "compile_source_to_asm" takes input_path as Integer, output_s_path as Integer returns Integer:
+    @Reasoning
+    "runa run" must compile real source, not accept a pre-built .s, so this stage
+    reuses the genuine compiler pipeline entry points -- the SAME functions the
+    standalone compiler_driver "main" invokes: runtime_read_file to load the
+    source, lexer_create / parser_create / parser_parse_program to produce the
+    AST, and compile_program to lower the AST through HIR/MIR/LIR/codegen and
+    write the assembly. These are resolved as link-time externals exactly as they
+    are in compiler_driver (they are not module-local symbols), so no source is
+    duplicated. We deliberately do NOT call process_imports here: that symbol is
+    defined only inside compiler_driver.runa alongside a rival "main", and pulling
+    it in would force the rival main into the link. Single-file run targets (the
+    common case for "runa run") need no import merge; multi-file builds go through
+    the full driver. This is the (a)/(b) hybrid documented in the task: the real
+    pipeline (a) is reused for read/lex/parse/codegen, while import merging is left
+    to the full driver rather than re-linking it here.
+    @End Reasoning
+    @Implementation
+    Steps, each guarded:
+      1. runtime_read_file(input_path) -> source. 0 means the file could not be
+         opened; report and return 1.
+      2. lexer_create(source) -> lexer.
+      3. parser_create(lexer) -> parser.
+      4. parser_parse_program(parser) -> program. 0 means a parse failure; report,
+         release source, and return 1.
+      5. compile_program(program, output_s_path). Nonzero means codegen failed;
+         report and return 1.
+    Returns 0 on success. The intermediate AST/lexer/parser allocations are owned
+    by the pipeline and torn down by the produced program's own ownership; the
+    source buffer is released on the parse-failure path where the pipeline has not
+    yet taken ownership.
+    @End Implementation
+    Let source be runtime_read_file(input_path)
+    If source is equal to 0:
+        Alert "[runa run] compile: could not open input source file"
+        Return 1
+    End If
+    Let lexer be lexer_create(source)
+    Let parser be parser_create(lexer)
+    Let program be parser_parse_program(parser)
+    If program is equal to 0:
+        Alert "[runa run] compile: parsing failed"
+        deallocate(source)
+        Return 1
+    End If
+    Let compile_result be compile_program(program, output_s_path)
+    If compile_result is not equal to 0:
+        Alert "[runa run] compile: code generation failed"
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STAGE RUNNERS (assemble / link / execute)
+Note: ============================================================================
+
+Process called "run_assemble" takes tmp_s as Integer, tmp_o as Integer, envp as Integer returns Integer:
+    @Reasoning
+    Mirrors the project's external build recipe "as --64 <x.s> -o <x.o>". The
+    command is launched in argv form (never a composed shell string) so paths
+    containing spaces or metacharacters cannot be reinterpreted.
+    @End Reasoning
+    @Implementation
+    Builds the argument List ["as", "--64", tmp_s, "-o", tmp_o], marshals it to a
+    NULL-terminated argv (argv[0] = "as"), and invokes process_run on the absolute
+    assembler path. Frees the List and the marshalled argv. Returns process_run's
+    exit code (0 = success); reports on the nonzero path. Returns 1 if argv
+    marshalling failed (allocation).
+    @End Implementation
+    Let args be proc list_create from ListPrimitive
+    proc list_append from ListPrimitive with args, "as"
+    proc list_append from ListPrimitive with args, "--64"
+    proc list_append from ListPrimitive with args, tmp_s
+    proc list_append from ListPrimitive with args, "-o"
+    proc list_append from ListPrimitive with args, tmp_o
+    Let argv be marshal_argv(args)
+    proc list_destroy from ListPrimitive with args
+    If argv is equal to 0:
+        Alert "[runa run] assemble: could not marshal argv"
+        Return 1
+    End If
+    Let code be proc process_run from ProcessManager with assembler_path(), argv, envp
+    free_argv(argv)
+    If code is not equal to 0:
+        Alert "[runa run] assembly failed"
+    End If
+    Return code
+End Process
+
+Process called "run_link" takes tmp_o as Integer, tmp_exe as Integer, envp as Integer returns Integer:
+    @Reasoning
+    Mirrors the project's external link recipe "gcc <x.o> <runtime.o> -o <x> -lm".
+    gcc is the link driver so crt0/libc startup is supplied. argv form is used so
+    the runtime-object and output paths are passed literally.
+    @End Reasoning
+    @Implementation
+    Builds ["gcc", tmp_o, runtime_object_path(), "-o", tmp_exe, "-lm"], marshals
+    to argv (argv[0] = "gcc"), and runs process_run on the absolute gcc path.
+    Frees the List and argv. Returns process_run's exit code; reports on nonzero.
+    Returns 1 if marshalling failed.
+    @End Implementation
+    Let args be proc list_create from ListPrimitive
+    proc list_append from ListPrimitive with args, "gcc"
+    proc list_append from ListPrimitive with args, tmp_o
+    proc list_append from ListPrimitive with args, runtime_object_path()
+    proc list_append from ListPrimitive with args, "-o"
+    proc list_append from ListPrimitive with args, tmp_exe
+    proc list_append from ListPrimitive with args, "-lm"
+    Let argv be marshal_argv(args)
+    proc list_destroy from ListPrimitive with args
+    If argv is equal to 0:
+        Alert "[runa run] link: could not marshal argv"
+        Return 1
+    End If
+    Let code be proc process_run from ProcessManager with linker_path(), argv, envp
+    free_argv(argv)
+    If code is not equal to 0:
+        Alert "[runa run] link failed"
+    End If
+    Return code
+End Process
+
+Process called "run_execute" takes tmp_exe as Integer, program_args as Integer, envp as Integer returns Integer:
+    @Reasoning
+    Launches the freshly built program and returns its exit code verbatim so the
+    caller can mirror a shell's $? convention. The program's own argument vector
+    must begin with argv[0] = the executable path, followed by any caller-supplied
+    program arguments, so the running program sees a conventional argv.
+    @End Reasoning
+    @Implementation
+    Builds an argument List starting with tmp_exe (argv[0]) and then appends each
+    element of the caller-supplied program_args List (which may be 0/empty). The
+    List is marshalled to a NULL-terminated argv and run with process_run on the
+    absolute executable path. Frees the List and argv. Returns the program's exit
+    code; returns 1 if marshalling failed.
+    @End Implementation
+    Let args be proc list_create from ListPrimitive
+    proc list_append from ListPrimitive with args, tmp_exe
+    If program_args is not equal to 0:
+        Let extra_count be proc list_length from ListPrimitive with program_args
+        Let extra_index be 0
+        While extra_index is less than extra_count:
+            Let extra_arg be proc list_get from ListPrimitive with program_args, extra_index
+            proc list_append from ListPrimitive with args, extra_arg
+            Set extra_index to extra_index plus 1
+        End While
+    End If
+    Let argv be marshal_argv(args)
+    proc list_destroy from ListPrimitive with args
+    If argv is equal to 0:
+        Alert "[runa run] execute: could not marshal argv"
+        Return 1
+    End If
+    Let code be proc process_run from ProcessManager with tmp_exe, argv, envp
+    free_argv(argv)
+    Return code
+End Process
+
+Note: ============================================================================
+Note: END-TO-END ORCHESTRATION
+Note: ============================================================================
+
+Process called "runa_run" takes input_path as Integer, program_args as Integer, program_envp as Integer returns Integer:
+    @Reasoning
+    This is the single public entry point for "runa run": given a source file
+    path, it compiles, assembles, links, and executes the program, returning the
+    program's exit code (or the failing stage's nonzero code). Each stage is fully
+    realized -- the compile reuses the genuine compiler pipeline, and the
+    assemble/link/execute stages are real subprocess launches via the Q2a
+    primitive. Temp artifacts are derived deterministically from the input
+    basename under /tmp and cleaned up best-effort as the pipeline advances, so a
+    successful run leaves no residue and a failed run leaves only the artifacts up
+    to the failure point (useful for inspection) without ever aborting on a failed
+    unlink.
+    @End Reasoning
+    @Implementation
+    Argument handling:
+      - input_path: NUL-terminated absolute path to the .runa source.
+      - program_args: a Runa List of NUL-terminated string pointers passed to the
+        built program as its arguments (after argv[0]); may be 0 for none.
+      - program_envp: a marshalled, NULL-terminated environment vector for the
+        BUILD TOOLS and the program. If 0, an empty environment is built via
+        empty_envp and freed before return; if nonzero it is borrowed (the caller
+        owns it).
+
+    Flow:
+      1. Derive basename = basename_of(input_path); build tmp_s/.s, tmp_o/.o,
+         tmp_exe (no suffix) via build_temp_path.
+      2. Resolve the environment vector (caller's, or a freshly built empty one).
+      3. compile_source_to_asm(input_path, tmp_s); nonzero -> clean up and return.
+      4. run_assemble(tmp_s, tmp_o); on success the .s is unlinked (no longer
+         needed); nonzero -> clean up and return the code.
+      5. run_link(tmp_o, tmp_exe); on success the .o is unlinked; nonzero -> clean
+         up and return the code.
+      6. run_execute(tmp_exe, program_args); capture the exit code.
+      7. Final cleanup: unlink any surviving temp artifacts (best-effort), free the
+         derived path buffers and the owned empty env (if we built one), and return
+         the captured exit code.
+    Every allocation made here (paths, owned env) is released on every return
+    path. A path-allocation failure (basename/temp path returning 0) is reported
+    and returns 1 after releasing whatever was allocated.
+    @End Implementation
+    Let basename be basename_of(input_path)
+    If basename is equal to 0:
+        Alert "[runa run] could not derive input basename"
+        Return 1
+    End If
+    Let tmp_s be build_temp_path(basename, ".s")
+    Let tmp_o be build_temp_path(basename, ".o")
+    Let tmp_exe be build_temp_path(basename, ".out")
+    deallocate(basename)
+    If tmp_s is equal to 0:
+        Alert "[runa run] could not build temp .s path"
+        best_effort_unlink(tmp_o)
+        best_effort_unlink(tmp_exe)
+        Return 1
+    End If
+    If tmp_o is equal to 0:
+        Alert "[runa run] could not build temp .o path"
+        deallocate(tmp_s)
+        best_effort_unlink(tmp_exe)
+        Return 1
+    End If
+    If tmp_exe is equal to 0:
+        Alert "[runa run] could not build temp executable path"
+        deallocate(tmp_s)
+        deallocate(tmp_o)
+        Return 1
+    End If
+
+    Note: Resolve the environment vector: borrow the caller's, or own an empty one.
+    Let envp be program_envp
+    Let owns_envp be 0
+    If envp is equal to 0:
+        Set envp to empty_envp()
+        Set owns_envp to 1
+        If envp is equal to 0:
+            Alert "[runa run] could not allocate environment vector"
+            deallocate(tmp_s)
+            deallocate(tmp_o)
+            deallocate(tmp_exe)
+            Return 1
+        End If
+    End If
+
+    Note: Stage 1: compile source -> assembly.
+    Let compile_code be compile_source_to_asm(input_path, tmp_s)
+    If compile_code is not equal to 0:
+        best_effort_unlink(tmp_s)
+        If owns_envp is equal to 1:
+            free_envp(envp)
+        End If
+        deallocate(tmp_s)
+        deallocate(tmp_o)
+        deallocate(tmp_exe)
+        Return compile_code
+    End If
+
+    Note: Stage 2: assemble .s -> .o.
+    Let assemble_code be run_assemble(tmp_s, tmp_o, envp)
+    best_effort_unlink(tmp_s)
+    If assemble_code is not equal to 0:
+        best_effort_unlink(tmp_o)
+        If owns_envp is equal to 1:
+            free_envp(envp)
+        End If
+        deallocate(tmp_s)
+        deallocate(tmp_o)
+        deallocate(tmp_exe)
+        Return assemble_code
+    End If
+
+    Note: Stage 3: link .o + runtime -> executable.
+    Let link_code be run_link(tmp_o, tmp_exe, envp)
+    best_effort_unlink(tmp_o)
+    If link_code is not equal to 0:
+        best_effort_unlink(tmp_exe)
+        If owns_envp is equal to 1:
+            free_envp(envp)
+        End If
+        deallocate(tmp_s)
+        deallocate(tmp_o)
+        deallocate(tmp_exe)
+        Return link_code
+    End If
+
+    Note: Stage 4: execute the program and capture its exit code.
+    Let exit_code be run_execute(tmp_exe, program_args, envp)
+
+    Note: Final cleanup (best-effort) and resource release.
+    best_effort_unlink(tmp_exe)
+    If owns_envp is equal to 1:
+        free_envp(envp)
+    End If
+    deallocate(tmp_s)
+    deallocate(tmp_o)
+    deallocate(tmp_exe)
+    Return exit_code
+End Process
