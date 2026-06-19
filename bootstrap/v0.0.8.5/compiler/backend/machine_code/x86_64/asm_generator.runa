@@ -477,29 +477,25 @@ Process called "format_operand" that takes operand as Integer, size as Integer r
         __store8(mem_buf, pos, 40)
         Set pos to pos plus 1
 
-        Note: Base register
-        If base_reg is not 0:
-            Let base_name be get_gpr_name_64(base_reg)
-            Let bi be 0
-            Let bc be __load8(base_name, bi)
-            While bc is not 0:
-                __store8(mem_buf, pos, bc)
-                Set pos to pos plus 1
-                Set bi to bi plus 1
-                Set bc to __load8(base_name, bi)
-            End While
-        Otherwise:
-            Note: No base register - use RBP-relative as default
-            Let rbp_name be "%rbp"
-            Set bi to 0
-            Set bc to __load8(rbp_name, bi)
-            While bc is not 0:
-                __store8(mem_buf, pos, bc)
-                Set pos to pos plus 1
-                Set bi to bi plus 1
-                Set bc to __load8(rbp_name, bi)
-            End While
-        End If
+        Note: Base register. Register id 0 is RAX, a fully valid base register,
+        Note: NOT a "missing base" sentinel: every memory operand this backend
+        Note: constructs (stack-slot addressing and register-computed addresses)
+        Note: carries a real base, and the register allocator legitimately colors
+        Note: a base virtual register to RAX (id 0). Treating base_reg == 0 as
+        Note: "no base, default to RBP-relative" therefore miscompiled any address
+        Note: whose base landed in RAX (e.g. a parameter's stack-slot address
+        Note: under register pressure), emitting `(%rbp)` instead of `(%rax)` and
+        Note: corrupting the frame. A base-less / RIP-relative memory operand is
+        Note: never generated here, so the base register is always emitted as-is.
+        Let base_name be get_gpr_name_64(base_reg)
+        Let bi be 0
+        Let bc be __load8(base_name, bi)
+        While bc is not 0:
+            __store8(mem_buf, pos, bc)
+            Set pos to pos plus 1
+            Set bi to bi plus 1
+            Set bc to __load8(base_name, bi)
+        End While
 
         Note: Index register and scale (if present)
         If index_reg is not 0:
@@ -548,8 +544,19 @@ Note: Context Creation and Main Entry Point
 Note: ============================================================================
 
 Process called "create_asm_context" that takes config as Integer, arena as Integer returns Integer:
-    Note: Creates an X86_64AsmContext ready for assembly generation
-    Let ctx be Layout.allocate(56)
+    Note: Creates an X86_64AsmContext ready for assembly generation.
+    Note:
+    Note: Layout (each slot 8 bytes):
+    Note:   0  output (AssemblyOutput)
+    Note:   8  config
+    Note:   16 current lir_func
+    Note:   24 calling convention
+    Note:   32 arena
+    Note:   40 reserved
+    Note:   48 temporary string buffer
+    Note:   56 current function discriminator index (per-function block-label namespace)
+    Note: :End Note
+    Let ctx be Layout.allocate(64)
     If ctx is 0:
         Return 0
     End If
@@ -565,6 +572,13 @@ Process called "create_asm_context" that takes config as Integer, arena as Integ
     Note: Create temporary string buffer for instruction building
     Let str_buf be StringUtils.stringbuffer_create(arena, 256)
     __store(ctx, 48, str_buf)
+
+    Note: Function discriminator counter. Each emitted function gets a unique
+    Note: index so its basic-block labels live in a private namespace
+    Note: (.LBB<func_idx>_<block_id>). Without this, block ids restart at 0 per
+    Note: function and two functions both emit .LBB0, which the assembler rejects
+    Note: as a duplicate symbol definition.
+    __store(ctx, 56, 0)
 
     Return ctx
 End Process
@@ -699,6 +713,15 @@ Process called "emit_function" that takes ctx as Integer, lir_func as Integer re
     MachineCode.asm_emit_to_section(output, section, func_name)
     MachineCode.asm_emit_line(output, section, ":")
 
+    Note: Claim a unique function discriminator for this function's basic-block
+    Note: labels. The counter persists across the per-function emit loop in
+    Note: generate_x86_64_assembly, so every emitted function gets a distinct
+    Note: index. Block labels and the jump/branch targets within this function are
+    Note: all formatted as .LBB<func_idx>_<block_id>, giving each function a private
+    Note: label namespace while keeping its internal jumps self-consistent.
+    Let func_idx be __load(ctx, 56)
+    __store(ctx, 56, func_idx plus 1)
+
     Note: Emit prologue
     emit_prologue(ctx, lir_func)
 
@@ -825,17 +848,28 @@ Process called "emit_basic_block" that takes ctx as Integer, block as Integer re
     Let output be __load(ctx, 0)
     Let section be MachineCode.SECTION_TEXT
 
-    Let label be __load(block, 8)
-    If label is not 0:
-        MachineCode.asm_emit_to_section(output, section, label)
-        MachineCode.asm_emit_line(output, section, ":")
-    Otherwise:
-        Let block_id be __load(block, 0)
-        MachineCode.asm_emit_to_section(output, section, ".LBB")
-        Let id_str be StringUtils.integer_to_string(block_id)
-        MachineCode.asm_emit_to_section(output, section, id_str)
-        MachineCode.asm_emit_line(output, section, ":")
-    End If
+    Note: Emit the block header label. The LIR builder (lir.runa) precomputes and
+    Note: stores a ".LBB<block_id>" label in the block's offset-8 slot, but that
+    Note: label carries NO function discriminator: block ids restart at 0 for every
+    Note: function, so two functions would both define ".LBB0" and the assembler
+    Note: rejects the second as a duplicate symbol. To make labels globally unique
+    Note: while keeping each function's internal jumps self-consistent, the header
+    Note: is regenerated from the raw block_id (offset 0) qualified by the current
+    Note: function discriminator (ctx offset 56): .LBB<func_idx>_<block_id>. The
+    Note: jump/branch emitters (emit_jmp / emit_conditional_jmp) format their targets
+    Note: with the identical scheme and the same discriminator, so intra-function
+    Note: control flow resolves correctly. The stored offset-8 label is intentionally
+    Note: not used for the header because it lacks the discriminator; in the LIR path
+    Note: that label is always the bare ".LBB<block_id>" form regenerated here.
+    Let func_idx be __load(ctx, 56)
+    Let block_id be __load(block, 0)
+    MachineCode.asm_emit_to_section(output, section, ".LBB")
+    Let func_idx_str be StringUtils.integer_to_string(func_idx)
+    MachineCode.asm_emit_to_section(output, section, func_idx_str)
+    MachineCode.asm_emit_to_section(output, section, "_")
+    Let id_str be StringUtils.integer_to_string(block_id)
+    MachineCode.asm_emit_to_section(output, section, id_str)
+    MachineCode.asm_emit_line(output, section, ":")
 
     Let instructions be __load(block, 16)
     Let instr_count be __load(block, 24)
@@ -893,6 +927,9 @@ Process called "emit_instruction" that takes ctx as Integer, instr as Integer re
     If opcode is 30008:
         Return emit_cmov(ctx, instr)
     End If
+    If opcode is 30009:
+        Return emit_setcc(ctx, instr)
+    End If
 
     Note: Arithmetic (30100-30110)
     If opcode is 30100:
@@ -927,6 +964,12 @@ Process called "emit_instruction" that takes ctx as Integer, instr as Integer re
     End If
     If opcode is 30110:
         Return emit_binary_op(ctx, instr, "sbb")
+    End If
+    If opcode is 30111:
+        Return emit_imod(ctx, instr)
+    End If
+    If opcode is 30112:
+        Return emit_umod(ctx, instr)
     End If
 
     Note: Floating-Point (30120-30129)
@@ -1335,6 +1378,47 @@ Process called "emit_cmov" that takes ctx as Integer, instr as Integer returns I
     Return 1
 End Process
 
+Process called "emit_setcc" that takes ctx as Integer, instr as Integer returns Integer:
+    Note:
+    Materialize a Boolean from the CPU flags set by a preceding cmp. The
+    LIR_SETcc instruction carries the destination register in the result slot
+    (offset 8) and the LIR condition code in operand1 (offset 16). x86 SETcc
+    writes a single byte, so we set the low byte of the scratch register %al,
+    then zero-extend it into the full destination register via movzbq. Using
+    %al as the fixed scratch keeps the sequence independent of the destination
+    register's byte-addressability.
+    :End Note
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let size be 8
+    If result is not 0:
+        Let sz be __load(result, 56)
+        If sz is greater than 0:
+            Set size to sz
+        End If
+    End If
+
+    Let cond_code be 0
+    If operand1 is not 0:
+        Set cond_code to __load(operand1, 16)
+    End If
+    Let cond_str be get_condition_suffix(cond_code)
+    Let dst_str be format_operand(result, 8)
+
+    Note: setCC %al
+    MachineCode.asm_emit_to_section(output, section, "\tset")
+    MachineCode.asm_emit_to_section(output, section, cond_str)
+    MachineCode.asm_emit_line(output, section, "\t%al")
+
+    Note: movzbq %al, <dest>  (zero-extend the byte into the full register)
+    MachineCode.asm_emit_to_section(output, section, "\tmovzbq\t%al, ")
+    MachineCode.asm_emit_line(output, section, dst_str)
+    Return 1
+End Process
+
 Process called "get_condition_suffix" that takes cond_code as Integer returns Integer:
     If cond_code is 0:
         Return "e"
@@ -1374,10 +1458,42 @@ Note: Binary, Unary, and Arithmetic Emitters
 Note: ============================================================================
 
 Process called "emit_binary_op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    @Reasoning
+    A LIR binary op is three-address (dest = left OP right), but x86-64 is
+    two-address (dst = dst OP src). Lowering correctly requires the destination
+    register to hold `left` before the OP, otherwise an operand is lost. The
+    previous emitter blindly emitted "OP operand2(right), result", assuming the
+    register allocator had coalesced result == left. When the allocator instead
+    coalesced result == right (legal for commutative ops), the left operand was
+    silently dropped — e.g. `2 + 3` became `addq %rax, %rax` (= 3+3), discarding
+    the 2 in %rbx. This emitter materialises the correct sequence for every
+    coalescing outcome.
+    @End Reasoning
+
+    @Implementation
+    Read result(@8)/left(@16)/right(@24) and their physical register ids (a
+    register operand has type tag 1 at offset 0 and its reg id at offset 8; a
+    non-register operand yields -1). Then:
+      - result == left            : OP right, result        (dest already = left)
+      - result == right, commutative: OP left, result       (dest = right; add left)
+      - result == right, non-commutative: stage through scratch r11
+                                      mov left,r11; OP right,r11; mov r11,result
+      - result distinct from both : mov left,result; OP right,result
+    Commutativity is decided by the LIR opcode (add/imul/and/or/xor).
+    @End Implementation
+
+    @Security_Scope
+    The scratch path only runs for a non-commutative op whose destination was
+    coalesced onto its right operand; r11 is the SysV caller-saved temporary and
+    is not otherwise used by the emitter. All operand reads are NULL/tag guarded.
+    @End Security_Scope
+
     Let output be __load(ctx, 0)
     Let section be MachineCode.SECTION_TEXT
+    Let opcode be __load(instr, 0)
     Let result be __load(instr, 8)
-    Let operand2 be __load(instr, 24)
+    Let left be __load(instr, 16)
+    Let right be __load(instr, 24)
     Let size be 8
     If result is not 0:
         Let sz be __load(result, 56)
@@ -1386,14 +1502,119 @@ Process called "emit_binary_op" that takes ctx as Integer, instr as Integer, mne
         End If
     End If
     Let suffix be get_size_suffix(size)
-    Let src_str be format_operand(operand2, size)
+
+    Note: Physical register id of each operand (-1 if not a plain register).
+    Let result_reg be 0 minus 1
+    If result is not 0:
+        If __load(result, 0) is equal to 1:
+            Set result_reg to __load(result, 8)
+        End If
+    End If
+    Let left_reg be 0 minus 1
+    If left is not 0:
+        If __load(left, 0) is equal to 1:
+            Set left_reg to __load(left, 8)
+        End If
+    End If
+    Let right_reg be 0 minus 1
+    If right is not 0:
+        If __load(right, 0) is equal to 1:
+            Set right_reg to __load(right, 8)
+        End If
+    End If
+
+    Note: Commutative LIR opcodes: ADD(30100), IMUL(30102), AND(30200),
+    Note: OR(30201), XOR(30202). SUB and the shifts are not commutative.
+    Let commutative be 0
+    If opcode is equal to 30100:
+        Set commutative to 1
+    End If
+    If opcode is equal to 30102:
+        Set commutative to 1
+    End If
+    If opcode is equal to 30200:
+        Set commutative to 1
+    End If
+    If opcode is equal to 30201:
+        Set commutative to 1
+    End If
+    If opcode is equal to 30202:
+        Set commutative to 1
+    End If
+
     Let dst_str be format_operand(result, size)
+    Let left_str be format_operand(left, size)
+    Let right_str be format_operand(right, size)
+
+    Note: Case 1: destination already holds the left operand -> OP right, dest.
+    If result_reg is not equal to left_reg:
+        Note: not case 1
+        Set output to output
+    Otherwise:
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, mnemonic)
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, right_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, dst_str)
+        Return 1
+    End If
+
+    Note: Case 2: destination coalesced onto the right operand.
+    If result_reg is equal to right_reg:
+        If commutative is equal to 1:
+            Note: dest = right; add the left operand in place.
+            MachineCode.asm_emit_to_section(output, section, "\t")
+            MachineCode.asm_emit_to_section(output, section, mnemonic)
+            MachineCode.asm_emit_to_section(output, section, suffix)
+            MachineCode.asm_emit_to_section(output, section, "\t")
+            MachineCode.asm_emit_to_section(output, section, left_str)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, dst_str)
+            Return 1
+        End If
+        Note: Non-commutative with dest == right: stage through r11 so the right
+        Note: operand is consumed before the destination is overwritten.
+        Let scratch_str be get_register_name(11, size)
+        MachineCode.asm_emit_to_section(output, section, "\tmov")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, left_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, scratch_str)
+
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, mnemonic)
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, right_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, scratch_str)
+
+        MachineCode.asm_emit_to_section(output, section, "\tmov")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, scratch_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, dst_str)
+        Return 1
+    End If
+
+    Note: Case 3: destination distinct from both operands -> seed with left,
+    Note: then OP right. Correct for commutative and non-commutative alike.
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, left_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dst_str)
 
     MachineCode.asm_emit_to_section(output, section, "\t")
     MachineCode.asm_emit_to_section(output, section, mnemonic)
     MachineCode.asm_emit_to_section(output, section, suffix)
     MachineCode.asm_emit_to_section(output, section, "\t")
-    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, right_str)
     MachineCode.asm_emit_to_section(output, section, ", ")
     MachineCode.asm_emit_line(output, section, dst_str)
     Return 1
@@ -1455,68 +1676,133 @@ Process called "emit_imul" that takes ctx as Integer, instr as Integer returns I
         End If
     End If
 
-    Set src_str to format_operand(operand2, size)
-    Set dst_str to format_operand(result, size)
-    MachineCode.asm_emit_to_section(output, section, "\timul")
+    Note: Register/register form is a standard two-address commutative op
+    Note: (dst = dst * src). Delegate to emit_binary_op, which materialises the
+    Note: correct 3-address -> 2-address sequence regardless of which operand the
+    Note: register allocator coalesced onto the destination. The previous inline
+    Note: form emitted `imul operand2(right), result` assuming result == operand1
+    Note: (left); when the allocator chose result == operand2 it computed
+    Note: right * right (e.g. `6 multiplied by 7` -> `imul %rax,%rax` = 49).
+    Return emit_binary_op(ctx, instr, "imul")
+End Process
+
+Process called "emit_divmod" that takes ctx as Integer, instr as Integer, is_signed as Integer, want_remainder as Integer returns Integer:
+    @Reasoning
+    x86-64 division is fixed-register: the dividend must occupy RDX:RAX, the
+    divisor is the single explicit operand, and the result lands in RAX
+    (quotient) and RDX (remainder). A LIR IDIV/DIV/IMOD/IMOD is three-address
+    (result = left OP right) with result@8, dividend(left)@16, divisor(right)@24.
+    The previous emitters emitted only the bare `idiv operand1` / `div operand1`,
+    never loading the dividend into RAX nor extracting the result — so division
+    produced garbage and modulo (mis-mapped onto NEG) produced 0. This emitter
+    materialises the complete, correct sequence for signed/unsigned quotient and
+    remainder alike.
+    @End Reasoning
+
+    @Implementation
+    1. Move the divisor into the r11 scratch FIRST. This protects the divisor
+       when the allocator placed it in RAX or RDX (both overwritten below) and
+       lets an immediate divisor work (idiv/div cannot take an immediate).
+    2. Move the dividend into RAX.
+    3. Signed: sign-extend RAX into RDX via cqto/cltd/cwtd, then `idiv r11`.
+       Unsigned: clear RDX via `xorq`, then `div r11`.
+    4. Move RAX (quotient) or RDX (remainder) into the destination.
+    r11 is the SysV caller-saved scratch the backend already reserves (see
+    emit_binary_op); the allocator never assigns it to an operand.
+    @End Implementation
+
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let left be __load(instr, 16)
+    Let right be __load(instr, 24)
+    Let size be 8
+    If result is not 0:
+        Let sz be __load(result, 56)
+        If sz is greater than 0:
+            Set size to sz
+        End If
+    End If
+    Let suffix be get_size_suffix(size)
+    Let rax_str be get_register_name(0, size)
+    Let rdx_str be get_register_name(3, size)
+    Let scratch_str be get_register_name(11, size)
+    Let dividend_str be format_operand(left, size)
+    Let divisor_str be format_operand(right, size)
+    Let result_str be format_operand(result, size)
+
+    Note: 1. Protect the divisor in the r11 scratch.
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, divisor_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, scratch_str)
+
+    Note: 2. Load the dividend into RAX.
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, dividend_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, rax_str)
+
+    If is_signed is equal to 1:
+        Note: 3a. Sign-extend RAX into RDX:RAX, then signed divide by r11.
+        If size is 8:
+            MachineCode.asm_emit_line(output, section, "\tcqto")
+        End If
+        If size is 4:
+            MachineCode.asm_emit_line(output, section, "\tcltd")
+        End If
+        If size is 2:
+            MachineCode.asm_emit_line(output, section, "\tcwtd")
+        End If
+        MachineCode.asm_emit_to_section(output, section, "\tidiv")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_line(output, section, scratch_str)
+    Otherwise:
+        Note: 3b. Zero RDX, then unsigned divide by r11.
+        MachineCode.asm_emit_line(output, section, "\txorq\t%rdx, %rdx")
+        MachineCode.asm_emit_to_section(output, section, "\tdiv")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_line(output, section, scratch_str)
+    End If
+
+    Note: 4. Extract quotient (RAX) or remainder (RDX) into the destination.
+    Let src_str be rax_str
+    If want_remainder is equal to 1:
+        Set src_str to rdx_str
+    End If
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
     MachineCode.asm_emit_to_section(output, section, suffix)
     MachineCode.asm_emit_to_section(output, section, "\t")
     MachineCode.asm_emit_to_section(output, section, src_str)
     MachineCode.asm_emit_to_section(output, section, ", ")
-    MachineCode.asm_emit_line(output, section, dst_str)
+    MachineCode.asm_emit_line(output, section, result_str)
     Return 1
 End Process
 
 Process called "emit_idiv" that takes ctx as Integer, instr as Integer returns Integer:
-    Let output be __load(ctx, 0)
-    Let section be MachineCode.SECTION_TEXT
-    Let operand1 be __load(instr, 16)
-    Let size be 8
-    If operand1 is not 0:
-        Let sz be __load(operand1, 56)
-        If sz is greater than 0:
-            Set size to sz
-        End If
-    End If
-    Let suffix be get_size_suffix(size)
-
-    If size is 8:
-        MachineCode.asm_emit_line(output, section, "\tcqto")
-    End If
-    If size is 4:
-        MachineCode.asm_emit_line(output, section, "\tcltd")
-    End If
-    If size is 2:
-        MachineCode.asm_emit_line(output, section, "\tcwtd")
-    End If
-
-    Let op_str be format_operand(operand1, size)
-    MachineCode.asm_emit_to_section(output, section, "\tidiv")
-    MachineCode.asm_emit_to_section(output, section, suffix)
-    MachineCode.asm_emit_to_section(output, section, "\t")
-    MachineCode.asm_emit_line(output, section, op_str)
-    Return 1
+    Note: LIR_IDIV (30103) — signed division, quotient in RAX.
+    Return emit_divmod(ctx, instr, 1, 0)
 End Process
 
 Process called "emit_div" that takes ctx as Integer, instr as Integer returns Integer:
-    Let output be __load(ctx, 0)
-    Let section be MachineCode.SECTION_TEXT
-    Let operand1 be __load(instr, 16)
-    Let size be 8
-    If operand1 is not 0:
-        Let sz be __load(operand1, 56)
-        If sz is greater than 0:
-            Set size to sz
-        End If
-    End If
-    Let suffix be get_size_suffix(size)
+    Note: LIR_DIV (30105) — unsigned division, quotient in RAX.
+    Return emit_divmod(ctx, instr, 0, 0)
+End Process
 
-    MachineCode.asm_emit_line(output, section, "\txorq\t%rdx, %rdx")
-    Let op_str be format_operand(operand1, size)
-    MachineCode.asm_emit_to_section(output, section, "\tdiv")
-    MachineCode.asm_emit_to_section(output, section, suffix)
-    MachineCode.asm_emit_to_section(output, section, "\t")
-    MachineCode.asm_emit_line(output, section, op_str)
-    Return 1
+Process called "emit_imod" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: LIR_IMOD (30111) — signed remainder, taken from RDX.
+    Return emit_divmod(ctx, instr, 1, 1)
+End Process
+
+Process called "emit_umod" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: LIR_MOD (30112) — unsigned remainder, taken from RDX.
+    Return emit_divmod(ctx, instr, 0, 1)
 End Process
 
 Process called "emit_shift" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
@@ -1604,8 +1890,15 @@ Process called "emit_jmp" that takes ctx as Integer, instr as Integer returns In
     Let output be __load(ctx, 0)
     Let operand1 be __load(instr, 16)
     If operand1 is not 0:
+        Note: Target the block label in the CURRENT function's namespace. The
+        Note: discriminator at ctx offset 56 is the same one emit_basic_block used
+        Note: for this function, so the jump resolves to .LBB<func_idx>_<target_id>.
+        Let func_idx be __load(ctx, 56)
         Let target_id be __load(operand1, 16)
         MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tjmp\t.LBB")
+        Let func_idx_str be StringUtils.integer_to_string(func_idx)
+        MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, func_idx_str)
+        MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "_")
         Let id_str be StringUtils.integer_to_string(target_id)
         MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, id_str)
     End If
@@ -1616,10 +1909,17 @@ Process called "emit_conditional_jmp" that takes ctx as Integer, instr as Intege
     Let output be __load(ctx, 0)
     Let operand1 be __load(instr, 16)
     If operand1 is not 0:
+        Note: Target the block label in the CURRENT function's namespace using the
+        Note: same discriminator (ctx offset 56) emit_basic_block used, resolving to
+        Note: .LBB<func_idx>_<target_id>.
+        Let func_idx be __load(ctx, 56)
         Let target_id be __load(operand1, 16)
         MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\t")
         MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, mnemonic)
         MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\t.LBB")
+        Let func_idx_str be StringUtils.integer_to_string(func_idx)
+        MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, func_idx_str)
+        MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "_")
         Let id_str be StringUtils.integer_to_string(target_id)
         MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, id_str)
     End If

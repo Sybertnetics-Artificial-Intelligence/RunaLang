@@ -755,12 +755,36 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
         Return proc lower_index_expression with context, ast_node, line, column
     End If
 
+    If node_type is equal to AST_ARRAY_LITERAL from AST:
+        Return proc lower_array_literal with context, ast_node, line, column
+    End If
+
     If node_type is equal to AST_FUNCTION_POINTER from AST:
         Return proc lower_function_pointer_expression with context, ast_node, line, column
     End If
 
     If node_type is equal to AST_INDIRECT_CALL from AST:
         Return proc lower_indirect_call_expression with context, ast_node, line, column
+    End If
+
+    Note: Conditional (ternary) expression
+    If node_type is equal to AST_TERNARY_EXPRESSION from AST:
+        Return proc lower_ternary_expression with context, ast_node, line, column
+    End If
+
+    Note: Range expression (start..end / start..=end)
+    If node_type is equal to AST_RANGE_EXPRESSION from AST:
+        Return proc lower_range_expression with context, ast_node, line, column
+    End If
+
+    Note: Tuple literal (a, b, c)
+    If node_type is equal to AST_TUPLE_LITERAL from AST:
+        Return proc lower_tuple_literal with context, ast_node, line, column
+    End If
+
+    Note: Record literal { field as value, ... }
+    If node_type is equal to AST_RECORD_LITERAL from AST:
+        Return proc lower_record_literal with context, ast_node, line, column
     End If
 
     Note: Statements (2000-2999)
@@ -790,6 +814,27 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
 
     If node_type is equal to AST_MATCH_STATEMENT from AST:
         Return proc lower_match_statement with context, ast_node, line, column
+    End If
+
+    Note: Break / Continue loop control
+    If node_type is equal to AST_BREAK_STATEMENT from AST:
+        Return proc lower_break_statement with context, ast_node, line, column
+    End If
+
+    If node_type is equal to AST_CONTINUE_STATEMENT from AST:
+        Return proc lower_continue_statement with context, ast_node, line, column
+    End If
+
+    Note: Constant declaration (Constant NAME as Type is value).
+    Note: The modular parser emits AST_CONSTANT_STATEMENT (9011); the older
+    Note: define form emits AST_DEFINE_STATEMENT (2002). Both lower to a HIR
+    Note: define statement (immutable named binding) so identifier uses resolve.
+    If node_type is equal to AST_CONSTANT_STATEMENT from AST:
+        Return proc lower_constant_statement with context, ast_node, line, column
+    End If
+
+    If node_type is equal to AST_DEFINE_STATEMENT from AST:
+        Return proc lower_constant_statement with context, ast_node, line, column
     End If
 
     If node_type is equal to AST_BLOCK_STATEMENT from AST:
@@ -1323,10 +1368,23 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
         Set i to i plus 1
     End While
 
-    Note: Create base HIR node
-    Let base_hir be proc create_hir_node from HIR with HIR_CALL_EXPRESSION from HIR, line, column
+    Note: Build the HIR_CALL_EXPRESSION as a FLAT node (node_type @0). The
+    Note: create_hir_call_expression WRAPPER stored a base-node POINTER at
+    Note: offset 0, so the HIR visitor read that pointer as the node_type tag,
+    Note: never matched HIR_CALL_EXPRESSION (10005), never recursed into the
+    Note: callee/argument children, and the call (plus the enclosing
+    Note: Return/Let) silently produced no MIR — every call-bearing function
+    Note: came out with an empty body. This mirrors the identical fix already
+    Note: applied to lower_binary_expression. The consumer contract is:
+    Note:   node_type @0 = HIR_CALL_EXPRESSION (visitor dispatch),
+    Note:   callee   @8  (visitor child_index 0; call post reads name from it),
+    Note:   arguments@16 (visitor child_index 1..N),
+    Note:   arg_count@24 (visitor loop bound; call pre records it),
+    Note:   resolved_function @32,
+    Note:   return_type @40 (call post reads it for the MIR_RETURN/result type).
+    Let call_expr be proc create_hir_node from HIR with HIR_CALL_EXPRESSION from HIR, line, column
 
-    If base_hir is equal to 0:
+    If call_expr is equal to 0:
         Return 0
     End If
 
@@ -1337,16 +1395,16 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
     Note: Get resolved function symbol (if callee is identifier)
     Let resolved_function be proc get_hir_node_symbol_id from HIR with callee_hir
 
-    Note: Create specialized call expression HIR node
-    Let call_expr be proc create_hir_call_expression from HIRNodes with base_hir, callee_hir, arguments_hir, arg_count, resolved_function, return_type
+    proc memory_set_int64 from Layout with call_expr, 8, callee_hir
+    proc memory_set_int64 from Layout with call_expr, 16, arguments_hir
+    proc memory_set_int64 from Layout with call_expr, 24, arg_count
+    proc memory_set_int64 from Layout with call_expr, 32, resolved_function
+    proc memory_set_int64 from Layout with call_expr, 40, return_type
 
-    If call_expr is equal to 0:
-        Return 0
-    End If
-
-    Note: Set return type on base HIR node
+    Note: Also record the result type in the base header type-info slot for
+    Note: passes that read get_hir_node_type_info.
     If return_type is not equal to 0:
-        proc set_hir_node_type_info from HIR with base_hir, return_type
+        proc set_hir_node_type_info from HIR with call_expr, return_type
     End If
 
     Return call_expr
@@ -1684,6 +1742,83 @@ Process called "lower_index_expression" takes context as Integer, ast_node as In
     End If
 
     Return base_hir
+End Process
+
+Process called "lower_array_literal" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower array/list literal expression ("a list containing 1, 2, 3") to HIR
+
+    @Reasoning:
+    The modular parser emits an AST_ARRAY_LITERAL (1011) node whose element
+    expressions are stored as ordinary AST children (children List at offset
+    24, child_count at offset 32). Without an explicit branch in the
+    lower_ast_node dispatcher this node fell through to the unknown-node
+    Return 0, leaving the enclosing Let initializer null; the function then
+    failed lowering and was dropped from the MIR program. This handler is
+    the missing AST->HIR producer for list literals and mirrors the element
+    ordering the MIR array-literal post handler depends on.
+    @End Reasoning
+
+    @Implementation
+    Create the canonical HIR array-literal node via create_hir_list_literal
+    (node_type HIR_ARRAY_LITERAL at offset 0, elements List eagerly created
+    at the children slot offset 24, element_count at offset 32). Read the AST
+    element count at offset 32, iterate each AST child via ast_node_get_child
+    in source order, lower it through lower_ast_node, and append each lowered
+    HIR element via add_element_to_hir_list (which appends to the elements
+    List at offset 24, increments element_count at offset 32, and sets the
+    element's parent pointer). The element-count and elements-List offsets
+    written here are exactly the offsets the HIR visitor reads to traverse
+    the elements and the offset the MIR post handler reads for the count, so
+    producer and consumer agree.
+    @End Implementation
+
+    @Performance_Hints
+    One node allocation plus one recursive lowering per element. Cost is
+    linear in the number of literal elements; element lowering depth is
+    bounded by each element's subexpression depth.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null-guards the freshly created node and skips any null AST child or
+    null lowering result so a single malformed element cannot inject a null
+    HIR node into the elements List. The returned node owns its elements
+    List and must be attached to a parent (the enclosing Let/Set/Return)
+    for the cleanup walker to reach it.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If ast_node is equal to 0:
+        Return 0
+    End If
+
+    Let list_hir be proc create_hir_list_literal from HIR
+
+    If list_hir is equal to 0:
+        Return 0
+    End If
+
+    Note: Preserve source position on the HIR node header (line@8, column@16)
+    proc memory_set_int64 from Layout with list_hir, 8, line
+    proc memory_set_int64 from Layout with list_hir, 16, column
+
+    Note: Iterate AST element children (child_count at offset 32) in source order
+    Let element_count be proc memory_get_int64 from Layout with ast_node, 32
+    Let i be 0
+    While i is less than element_count:
+        Let element_ast be proc ast_node_get_child from AST with ast_node, i
+        If element_ast is not equal to 0:
+            Let element_hir be proc lower_ast_node with context, element_ast
+            If element_hir is not equal to 0:
+                proc add_element_to_hir_list from HIR with list_hir, element_hir
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return list_hir
 End Process
 
 Note: ============================================================================
@@ -2100,8 +2235,15 @@ Process called "lower_for_statement" takes context as Integer, ast_node as Integ
     push a SCOPE_LOOP, create a symbol for the iterator bound to the
     element type, lower the body, then unwind scope and loop_depth. The
     iterator symbol is added to the loop scope so identifier resolution
-    inside the body finds it; the symbol id is also stamped onto the base
-    HIR_FOR_LOOP node so codegen can synthesise the iterator slot.
+    inside the body finds it; the symbol id is stamped onto the base
+    HIR_FOR_STATEMENT node at offset 88 so the MIR control-flow pre-handler
+    can recover the loop-variable binding key. The specialised
+    HIRForStatement payload (built via create_hir_for_statement) is stored
+    at the base node's metadata slot (offset 56), mirroring
+    lower_if_statement and lower_while_statement, so the HIR visitor can
+    surface the iterable and body children to the lowering pass; without it
+    the FOR branch hits its null-guard at offset 56 and the loop body is
+    never visited.
     @End Implementation
 
     @Performance_Hints
@@ -2175,9 +2317,19 @@ Process called "lower_for_statement" takes context as Integer, ast_node as Integ
         Return 0
     End If
 
-    Note: Attach iterator symbol
+    Note: Attach iterator symbol id at the base node (offset 88). The MIR
+    Note: control-flow pre-handler reads this same slot to seed loop_var_id.
     Let symbol_id be proc get_symbol_id with iterator_symbol
     proc set_hir_node_symbol_id from HIR with base_hir, symbol_id
+
+    Note: Create specialized HIRForStatement structure and store it in the
+    Note: base node metadata slot (offset 56) so the HIR visitor finds the
+    Note: iterable (spec offset 16) and body (spec offset 32) children.
+    Let for_stmt be proc create_hir_for_statement from HIRNodes with base_hir, iterator_symbol, iterable_hir, iterable_type, body_hir, loop_scope
+
+    If for_stmt is not equal to 0:
+        proc memory_set_int64 from Layout with base_hir, 56, for_stmt
+    End If
 
     Return base_hir
 End Process
@@ -2288,10 +2440,15 @@ Process called "lower_match_statement" takes context as Integer, ast_node as Int
     @End Reasoning
 
     @Implementation
-    Read expression/arms/arm_count from offsets 80/88/96 of the
-    MatchStatementNode. Lower the matched expression once, then iterate
-    every when clause via lower_when_clause, passing the expression's
-    type for pattern type-checking. After all arms are lowered, invoke
+    The AST_MATCH_STATEMENT node (producer: ast_builder.build_match_statement)
+    stores its members as generic children, NOT in out-of-line fields. Child 0
+    is the matched expression (scrutinee); children 1..child_count-1 are the
+    When-clause arms in source order. The has_otherwise flag is stored in the
+    node value slot (offset 40) via ast_node_set_value. Child count lives at
+    offset 32. We read the scrutinee from child 0, derive the arm count as
+    child_count minus 1, lower the matched expression once, then iterate every
+    when clause via lower_when_clause, passing the expression's type for
+    pattern type-checking. After all arms are lowered, invoke
     check_match_exhaustiveness which inspects the matched type
     (ADT/record/primitive) and the collected patterns to verify total
     coverage. The HIR_MATCH_STATEMENT base carries the list of lowered
@@ -2310,11 +2467,38 @@ Process called "lower_match_statement" takes context as Integer, ast_node as Int
     user must add a wildcard or cover the missing variant before codegen.
     @End Security_Scope
 
-    Note: Get matched expression and when clauses from MatchStatementNode specialized structure
-    Note: expression at offset 80, arms (when clauses) at offset 88, arm_count at offset 96
-    Let expression_ast be proc memory_get_int64 from Layout with ast_node, 80
-    Let when_clauses be proc memory_get_int64 from Layout with ast_node, 88
-    Let clause_count be proc memory_get_int64 from Layout with ast_node, 96
+    Note: Read members from the AST_MATCH_STATEMENT generic children layout
+    Note: (producer: ast_builder.build_match_statement). Child 0 = scrutinee
+    Note: expression; children 1..child_count-1 = When-clause arms in source
+    Note: order. child_count lives at offset 32. The has_otherwise flag is in
+    Note: the value slot (offset 40); arm count is child_count minus 1.
+    Let child_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    If child_count is less than 1:
+        Note: Malformed match node with no scrutinee child; nothing to lower.
+        Return 0
+    End If
+
+    Let expression_ast be proc ast_node_get_child from AST with ast_node, 0
+
+    If expression_ast is equal to 0:
+        Return 0
+    End If
+
+    Note: Collect When-clause arm AST nodes (children 1..child_count-1) into a
+    Note: List so they can be iterated for lowering and passed to the
+    Note: exhaustiveness checker, which expects a List of when-clause ASTs.
+    Let when_clauses be proc create from List
+    Let collect_index be 1
+    While collect_index is less than child_count:
+        Let arm_ast be proc ast_node_get_child from AST with ast_node, collect_index
+        If arm_ast is not equal to 0:
+            proc append from List with when_clauses, arm_ast
+        End If
+        Set collect_index to collect_index plus 1
+    End While
+
+    Let clause_count be proc length from List with when_clauses
 
     Note: Lower matched expression
     Let expression_hir be proc lower_ast_node with context, expression_ast
@@ -2365,7 +2549,31 @@ Process called "lower_match_statement" takes context as Integer, ast_node as Int
         proc add_error with context, error_msg, line, column
     End If
 
-    Return match_stmt
+    Note: Publish the match payload onto the BASE HIR node and return the base
+    Note: node (not the specialized struct). The HIR tree must carry the base
+    Note: node so its node_type tag (offset 0 = HIR_MATCH_STATEMENT) is what the
+    Note: visitor dispatches on and the MIR control-flow lowering keys on. The
+    Note: specialized HIRMatchStatement struct is attached in the metadata slot
+    Note: (offset 56), mirroring how lower_if_statement / lower_when_clause keep
+    Note: their specialized structs. On the base node we additionally inline the
+    Note: fields the downstream consumers read directly:
+    Note:   offset 8  = scrutinee expression HIR (visitor child 0),
+    Note:   offset 16 = case_count (read by lower_hir_match_statement_pre in
+    Note:               control_flow_lowering and by the visitor to bound arm
+    Note:               iteration),
+    Note:   offset 24 = arms list (the visitor iterates arms 1..case_count).
+    Note: The lowered arm count comes from the specialized struct's arm_count
+    Note: field (offset 32), which add_match_arm keeps in sync, so arms whose
+    Note: lowering failed are not counted.
+    Let lowered_arms be proc memory_get_int64 from Layout with match_stmt, 24
+    Let lowered_arm_count be proc memory_get_int64 from Layout with match_stmt, 32
+
+    proc memory_set_int64 from Layout with base_hir, 8, expression_hir
+    proc memory_set_int64 from Layout with base_hir, 16, lowered_arm_count
+    proc memory_set_int64 from Layout with base_hir, 24, lowered_arms
+    proc memory_set_int64 from Layout with base_hir, 56, match_stmt
+
+    Return base_hir
 End Process
 
 Process called "lower_when_clause" takes context as Integer, ast_node as Integer, expression_type as Integer returns Integer:
@@ -2377,10 +2585,17 @@ Process called "lower_when_clause" takes context as Integer, ast_node as Integer
     @End Reasoning
 
     @Implementation
-    Pattern/guard/body live at offsets 80/88/96 of the WhenClauseNode. A
-    fresh SCOPE_BLOCK is pushed so pattern bindings are visible only
-    within the arm body and guard; this matches the language semantics
-    where a binding in one arm cannot leak into the next. Pattern is
+    The AST_WHEN_CLAUSE node (producer: ast_builder.build_when_clause) stores
+    pattern, optional guard, and body as generic children, NOT in out-of-line
+    fields. The guard child is only appended when present, so child indices
+    shift: with a guard the children are [pattern, guard, body] (child_count
+    == 3); without a guard they are [pattern, body] (child_count == 2). Child 0
+    is always the pattern and the LAST child is always the body. The guard, if
+    any, is the middle child. We read child_count from offset 32, take pattern
+    from child 0, body from the final child, and the guard from child 1 only
+    when child_count is 3. A fresh SCOPE_BLOCK is pushed so pattern bindings
+    are visible only within the arm body and guard; this matches the language
+    semantics where a binding in one arm cannot leak into the next. Pattern is
     lowered first (binds names), guard is lowered against the now-extended
     scope, then the body. The HIRWhenClause carries pattern/guard/body
     references for downstream codegen of decision trees.
@@ -2398,11 +2613,34 @@ Process called "lower_when_clause" takes context as Integer, ast_node as Integer
     by the surrounding match expression.
     @End Security_Scope
 
-    Note: Get pattern, guard, and body from WhenClauseNode specialized structure
-    Note: pattern at offset 80, guard at offset 88, body at offset 96
-    Let pattern_ast be proc memory_get_int64 from Layout with ast_node, 80
-    Let guard_ast be proc memory_get_int64 from Layout with ast_node, 88
-    Let body_ast be proc memory_get_int64 from Layout with ast_node, 96
+    Note: Read pattern, optional guard, and body from the AST_WHEN_CLAUSE
+    Note: generic children layout (producer: ast_builder.build_when_clause).
+    Note: child 0 = pattern; the LAST child = body; the guard, when present,
+    Note: is the middle child (child 1) and exists only when child_count == 3.
+    Let child_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    If child_count is less than 2:
+        Note: A valid When clause always has at least a pattern and a body.
+        Return 0
+    End If
+
+    Let pattern_ast be proc ast_node_get_child from AST with ast_node, 0
+
+    Let body_index be child_count minus 1
+    Let body_ast be proc ast_node_get_child from AST with ast_node, body_index
+
+    Let guard_ast be 0
+    If child_count is equal to 3:
+        Set guard_ast to proc ast_node_get_child from AST with ast_node, 1
+    End If
+
+    If pattern_ast is equal to 0:
+        Return 0
+    End If
+
+    If body_ast is equal to 0:
+        Return 0
+    End If
 
     Note: Create new scope for pattern bindings
     Let current_scope be proc get_current_scope with context
@@ -2509,8 +2747,21 @@ Process called "lower_pattern" takes context as Integer, ast_node as Integer, ma
     End If
 
     If pattern_type is equal to AST_LITERAL_PATTERN from AST:
-        Note: Literal pattern for constant matching
+        Note: Literal pattern for constant matching. The MIR pattern-lowering
+        Note: post handler (lower_hir_literal_pattern_post in pattern_lowering.runa)
+        Note: reads the literal value at HIR pattern offset 8 to emit the MIR_CONST
+        Note: the When clause compares against the scrutinee. Propagate the AST
+        Note: literal pattern's value (AST node value slot, offset 40) into that
+        Note: slot. Offset 8 is the HIRPattern's matched_type slot in the uniform
+        Note: layout, but the literal-pattern kind has no separate matched_type to
+        Note: carry through codegen (the value itself is the type-bearing payload),
+        Note: so repurposing offset 8 for the literal value matches the MIR
+        Note: consumer's contract for this pattern kind.
+        Let literal_value be proc memory_get_int64 from Layout with ast_node, 40
         Set pattern_hir to proc create_hir_pattern from HIRNodes with HIR_LITERAL_PATTERN from HIR, matched_type
+        If pattern_hir is not equal to 0:
+            proc memory_set_int64 from Layout with pattern_hir, 8, literal_value
+        End If
         Return pattern_hir
     End If
 
@@ -2688,6 +2939,531 @@ Process called "lower_block_statement" takes context as Integer, ast_node as Int
 
     Note: Pop block scope
     proc pop_scope with context
+
+    Return base_hir
+End Process
+
+Process called "lower_break_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a Break statement to HIR
+
+    @Reasoning:
+    A Break statement transfers control out of the innermost enclosing
+    loop. It carries no operands; the jump target (the loop's exit label)
+    is resolved by the MIR control-flow pass from the loop frame state
+    recorded in the MIR builder context, not from any field on this node.
+    The HIR layer's responsibility is therefore (1) to confirm the Break
+    occurs inside a loop and (2) to emit a flat HIR_BREAK_STATEMENT node
+    whose node_type tag at offset 0 drives both the visitor and the MIR
+    dispatcher.
+    @End Reasoning
+
+    @Implementation
+    Read the context loop_depth (offset 48); a depth of zero means the
+    Break is outside any loop, which is a localized diagnostic. The HIR
+    node is a flat create_hir_node of type HIR_BREAK_STATEMENT (11012) -
+    the same shape the MIR handler lower_hir_break_statement_post expects
+    (it reads nothing from the node). No specialized struct and no
+    children are attached; visit_statement_children's null-children
+    fallthrough handles it.
+    @End Implementation
+
+    @Performance_Hints
+    O(1): one depth read and one node allocation. Break is rare relative
+    to expression nodes so this is off the hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The outside-loop check is the HIR-layer guard mirrored by the MIR
+    break handler's break_target == -1 rejection, so an illegal Break is
+    caught even if one layer's check is bypassed.
+    @End Security_Scope
+
+    Let loop_depth be proc memory_get_int64 from Layout with context, 48
+    If loop_depth is less than 1:
+        Let break_error be proc create_from_literal from StringCore with "Break statement used outside of a loop"
+        proc add_error with context, line, column, break_error
+    End If
+
+    Let base_hir be proc create_hir_node from HIR with HIR_BREAK_STATEMENT from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    Return base_hir
+End Process
+
+Process called "lower_continue_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a Continue statement to HIR
+
+    @Reasoning:
+    A Continue statement transfers control to the next iteration of the
+    innermost enclosing loop (its header/continue label). Like Break it
+    carries no operands; the continue target is resolved by the MIR
+    control-flow pass from the loop frame state. The HIR layer confirms
+    the Continue is inside a loop and emits a flat HIR_CONTINUE_STATEMENT
+    node so the visitor and MIR dispatcher recognise it.
+    @End Reasoning
+
+    @Implementation
+    Read loop_depth (offset 48); zero means outside any loop (a localized
+    diagnostic). Emit a flat create_hir_node of type HIR_CONTINUE_STATEMENT
+    (11013), the shape lower_hir_continue_statement_post expects. No
+    specialized struct, no children.
+    @End Implementation
+
+    @Performance_Hints
+    O(1): one depth read and one node allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    The outside-loop check mirrors the MIR continue handler's
+    continue_target == -1 rejection.
+    @End Security_Scope
+
+    Let loop_depth be proc memory_get_int64 from Layout with context, 48
+    If loop_depth is less than 1:
+        Let continue_error be proc create_from_literal from StringCore with "Continue statement used outside of a loop"
+        proc add_error with context, line, column, continue_error
+    End If
+
+    Let base_hir be proc create_hir_node from HIR with HIR_CONTINUE_STATEMENT from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    Return base_hir
+End Process
+
+Process called "lower_constant_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a Constant / Define declaration to HIR
+
+    @Reasoning:
+    A Constant declaration (Constant NAME as Type is value) binds an
+    immutable named value. At the MIR level it is identical in shape to a
+    Let/Define: a stack slot is allocated and the initializer is stored
+    once. Immutability is a HIR-layer concern, so we intern the name into
+    the current scope as an immutable symbol; subsequent identifier uses
+    resolve to that symbol's id, which is the same id the MIR define
+    handler maps to the constant's alloca. The constant therefore reads
+    and writes through the standard Let/Define lowering machinery.
+    @End Reasoning
+
+    @Implementation
+    The modular parser's build_constant_statement stores the name in the
+    AST node value slot and children [optional type_annotation,
+    expression]; build_define_statement uses the same layout. Distinguish
+    the type child (tag 4000-4999) from the value expression (tag
+    1000-1999) by examining child 0's node_type, exactly as
+    lower_let_statement does. Resolve the declared type (or infer it from
+    the initializer), intern an immutable symbol, then emit a flat
+    HIR_DEFINE_STATEMENT (11002): node_type@0, type_info@8, const_id
+    (the symbol id)@16, initializer@24 - the contract
+    lower_hir_define_statement_pre/post and visit_statement_children read.
+    @End Implementation
+
+    @Performance_Hints
+    One recursive lowering of the initializer plus one symbol-table
+    insert; the type-vs-expression heuristic is two integer comparisons.
+    Constants are declaration-frequency, off the hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The symbol is interned with SYMBOL_VARIABLE; the immutability
+    contract is carried by the HIR_DEFINE_STATEMENT node kind, which the
+    semantic pass uses to reject reassignment. Name capture honours the
+    current lexical scope via get_current_scope.
+    @End Security_Scope
+
+    Note: Two surface forms reach here with different AST layouts:
+    Note:   AST_DEFINE_STATEMENT (2002), produced by parse_define_statement for
+    Note:   both "Constant" and "Define": children [identifier, type?, expression];
+    Note:   the name is child 0 (an identifier node), so name = child 0's value.
+    Note:   AST_CONSTANT_STATEMENT (9011), produced by build_constant_statement:
+    Note:   name in the node value slot, children [type?, expression].
+    Note: Normalize both to (const_name, type_annotation, initializer_ast).
+    Let node_kind be proc memory_get_int64 from Layout with ast_node, 0
+    Let child_count be proc memory_get_int64 from Layout with ast_node, 32
+    Let const_name be 0
+    Let type_annotation be 0
+    Let initializer_ast be 0
+
+    Note: Scan index points at the first non-name child. For 2002 the name is
+    Note: child 0, so the type/expression scan starts at child 1; for 9011 the
+    Note: name is in the value slot and the scan starts at child 0.
+    Let scan_start be 0
+    If node_kind is equal to AST_DEFINE_STATEMENT from AST:
+        If child_count is greater than 0:
+            Let name_node be proc ast_node_get_child from AST with ast_node, 0
+            Set const_name to proc ast_node_get_value from AST with name_node
+        End If
+        Set scan_start to 1
+    Otherwise:
+        Set const_name to proc ast_node_get_value from AST with ast_node
+        Set scan_start to 0
+    End If
+
+    Note: From scan_start, the next child is either the type annotation
+    Note: (tag 4000-4999) or the value expression; when a type is present the
+    Note: expression follows it.
+    If child_count is greater than scan_start:
+        Let first_child be proc ast_node_get_child from AST with ast_node, scan_start
+        Let first_type be proc memory_get_int64 from Layout with first_child, 0
+
+        Let first_is_type be 0
+        If first_type is greater than or equal to 4000:
+            If first_type is less than 5000:
+                Set first_is_type to 1
+            End If
+        End If
+
+        If first_is_type is equal to 1:
+            Set type_annotation to first_child
+            Let expr_index be scan_start plus 1
+            If child_count is greater than expr_index:
+                Set initializer_ast to proc ast_node_get_child from AST with ast_node, expr_index
+            End If
+        Otherwise:
+            Set initializer_ast to first_child
+        End If
+    End If
+
+    Note: Lower the initializer expression.
+    Let initializer_hir be 0
+    If initializer_ast is not equal to 0:
+        Set initializer_hir to proc lower_ast_node with context, initializer_ast
+    End If
+
+    Note: Resolve the declared type, or infer it from the initializer.
+    Let const_type be 0
+    If type_annotation is not equal to 0:
+        Set const_type to proc lower_type_annotation with context, type_annotation
+    Otherwise:
+        If initializer_hir is not equal to 0:
+            Set const_type to proc get_hir_node_type_info from HIR with initializer_hir
+        End If
+    End If
+
+    Note: Intern an immutable symbol for the constant in the current scope.
+    Let current_scope be proc get_current_scope with context
+    Let const_symbol be proc create_hir_symbol_info from HIR with const_name, SYMBOL_VARIABLE from HIR, current_scope
+
+    If const_symbol is equal to 0:
+        Return 0
+    End If
+
+    If const_type is not equal to 0:
+        proc set_symbol_type with const_symbol, const_type
+    End If
+
+    proc add_symbol_to_scope with current_scope, const_symbol
+
+    Note: Build the flat HIR_DEFINE_STATEMENT. node_type@0 drives dispatch;
+    Note: type_info@8 sizes the alloca; const_id@16 is the symbol id a use
+    Note: resolves to (lower_identifier stores the resolved id at offset 16);
+    Note: initializer@24 is visited so its value is stored into the alloca.
+    Let define_stmt be proc create_hir_node from HIR with HIR_DEFINE_STATEMENT from HIR, line, column
+
+    If define_stmt is equal to 0:
+        Return 0
+    End If
+
+    Let symbol_id be proc get_symbol_id with const_symbol
+    proc set_hir_node_symbol_id from HIR with define_stmt, symbol_id
+
+    proc memory_set_int64 from Layout with define_stmt, 8, const_type
+    proc memory_set_int64 from Layout with define_stmt, 16, symbol_id
+    proc memory_set_int64 from Layout with define_stmt, 24, initializer_hir
+
+    Return define_stmt
+End Process
+
+Process called "lower_ternary_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a conditional (ternary) expression to HIR
+
+    @Reasoning:
+    A ternary expression (value_true If condition Otherwise value_false)
+    selects one of two values based on a boolean condition. All three
+    sub-expressions are real value-producing children: the MIR post
+    handler emits a conditional-select (branch + per-arm store + load),
+    consuming the condition, true, and false values from the result stack
+    in visitor order. The HIR layer lowers each sub-expression and records
+    the result type so the MIR alloca is sized correctly.
+    @End Reasoning
+
+    @Implementation
+    The AST ternary node's children are [condition, true_value,
+    false_value] (child_count 3). Lower each via lower_ast_node, in that
+    order, so visit_expression_children surfaces them as child_index
+    0/1/2 and the MIR post handler pops false, true, condition. Build a
+    flat HIR_TERNARY_EXPRESSION (10004): node_type@0, condition@8,
+    true_value@16, false_value@24, result_type@32 (the offset
+    lower_hir_ternary_expression_post reads). The result type is taken
+    from the true branch (both arms must unify; the true branch is the
+    canonical representative for the foundation pipeline).
+    @End Implementation
+
+    @Performance_Hints
+    Three recursive lowerings plus O(1) node assembly. Ternaries are
+    moderately common in expression-dense code.
+    @End Performance_Hints
+
+    @Security_Scope
+    A non-boolean condition is reported via add_error but lowering
+    proceeds so multiple diagnostics surface in one pass.
+    @End Security_Scope
+
+    Let condition_ast be proc ast_node_get_child from AST with ast_node, 0
+    Let true_ast be proc ast_node_get_child from AST with ast_node, 1
+    Let false_ast be proc ast_node_get_child from AST with ast_node, 2
+
+    Let condition_hir be proc lower_ast_node with context, condition_ast
+    If condition_hir is equal to 0:
+        Return 0
+    End If
+
+    Note: A ternary condition must be boolean; report but continue.
+    Let condition_type be proc get_hir_node_type_info from HIR with condition_hir
+    Let is_bool be proc is_type_boolean with context, condition_type
+    If is_bool is equal to 0:
+        Let tern_error be proc create_from_literal from StringCore with "Ternary condition must be Boolean"
+        proc add_error with context, line, column, tern_error
+    End If
+
+    Let true_hir be proc lower_ast_node with context, true_ast
+    If true_hir is equal to 0:
+        Return 0
+    End If
+
+    Let false_hir be proc lower_ast_node with context, false_ast
+    If false_hir is equal to 0:
+        Return 0
+    End If
+
+    Note: Result type is the unified branch type; use the true branch.
+    Let result_type be proc get_hir_node_type_info from HIR with true_hir
+
+    Let base_hir be proc create_hir_node from HIR with HIR_TERNARY_EXPRESSION from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with base_hir, 8, condition_hir
+    proc memory_set_int64 from Layout with base_hir, 16, true_hir
+    proc memory_set_int64 from Layout with base_hir, 24, false_hir
+    proc memory_set_int64 from Layout with base_hir, 32, result_type
+
+    Note: Propagate the result type onto the base node so a ternary used
+    Note: as a sub-expression (e.g. a Let initializer) infers correctly.
+    proc set_hir_node_type_info from HIR with base_hir, result_type
+
+    Return base_hir
+End Process
+
+Process called "lower_range_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a range expression (start to end / start to end inclusive) to HIR
+
+    @Reasoning:
+    A range expression produces a value describing an interval [start,
+    end] with an inclusivity flag. The MIR post handler materializes a
+    24-byte range record (start@0, end@8, inclusive@16). The HIR layer
+    lowers the two bound expressions and preserves the inclusive flag the
+    parser stored in the AST node value slot.
+    @End Reasoning
+
+    @Implementation
+    The AST range node's children are [start, end] and its value slot
+    carries is_inclusive (0 = exclusive, 1 = inclusive). Lower start then
+    end via lower_ast_node so visit_expression_children surfaces them as
+    child_index 0/1 and the MIR post handler pops end then start. Build a
+    flat HIR_RANGE_EXPRESSION (10010): node_type@0, start@8, end@16,
+    inclusive@24, result_type@32 - the offsets
+    lower_hir_range_expression_post reads (inclusive@24, result_type@32).
+    @End Implementation
+
+    @Performance_Hints
+    Two recursive lowerings plus O(1) node assembly.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null start or end bound propagates a null HIR node to the parent,
+    which the parent's null-guard converts into a dropped sub-tree rather
+    than a wild read; the MIR handler additionally rejects missing bounds.
+    @End Security_Scope
+
+    Let start_ast be proc ast_node_get_child from AST with ast_node, 0
+    Let end_ast be proc ast_node_get_child from AST with ast_node, 1
+
+    Note: Inclusivity flag from the AST node value slot (offset 40).
+    Let is_inclusive be proc ast_node_get_value from AST with ast_node
+
+    Let start_hir be proc lower_ast_node with context, start_ast
+    If start_hir is equal to 0:
+        Return 0
+    End If
+
+    Let end_hir be proc lower_ast_node with context, end_ast
+    If end_hir is equal to 0:
+        Return 0
+    End If
+
+    Note: Range bounds are the element type; use the start bound's type.
+    Let element_type be proc get_hir_node_type_info from HIR with start_hir
+
+    Let base_hir be proc create_hir_node from HIR with HIR_RANGE_EXPRESSION from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with base_hir, 8, start_hir
+    proc memory_set_int64 from Layout with base_hir, 16, end_hir
+    proc memory_set_int64 from Layout with base_hir, 24, is_inclusive
+    proc memory_set_int64 from Layout with base_hir, 32, element_type
+
+    Return base_hir
+End Process
+
+Process called "lower_tuple_literal" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a tuple literal (a, b, c) to HIR
+
+    @Reasoning:
+    A tuple literal aggregates a fixed sequence of element values into a
+    single composite value. The MIR post handler allocates a record and
+    stores each element at an 8-byte slot, consuming the element values
+    from the result stack in reverse. The HIR layer lowers each element
+    expression in source order and records the element count so the MIR
+    handler pops the correct number of values.
+    @End Reasoning
+
+    @Implementation
+    The AST tuple node's children are the element expressions (child_count
+    at offset 32). Lower each via lower_ast_node in source order, storing
+    the lowered nodes into a fresh HIR element List so the visitor can
+    surface them. Build a flat HIR_TUPLE_LITERAL (10012): node_type@0,
+    elements_list@8, element_count@16, tuple_type@24 - the offsets
+    lower_hir_tuple_literal_post reads (element_count@16, tuple_type@24)
+    and visit_expression_children reads (elements_list@8, count@16).
+    @End Implementation
+
+    @Performance_Hints
+    N recursive lowerings (one per element) plus one List allocation.
+    Tuple literals are moderately common in multi-return code.
+    @End Performance_Hints
+
+    @Security_Scope
+    Each element is independently lowered; a null element is skipped so a
+    malformed sub-expression cannot inject a null into the element list
+    that a downstream pass would dereference.
+    @End Security_Scope
+
+    Let element_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    Let elements_list be proc create from List
+    Let lowered_count be 0
+
+    Let i be 0
+    While i is less than element_count:
+        Let element_ast be proc ast_node_get_child from AST with ast_node, i
+        If element_ast is not equal to 0:
+            Let element_hir be proc lower_ast_node with context, element_ast
+            If element_hir is not equal to 0:
+                proc append from List with elements_list, element_hir
+                Set lowered_count to lowered_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let base_hir be proc create_hir_node from HIR with HIR_TUPLE_LITERAL from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with base_hir, 8, elements_list
+    proc memory_set_int64 from Layout with base_hir, 16, lowered_count
+    proc memory_set_int64 from Layout with base_hir, 24, 0
+
+    Return base_hir
+End Process
+
+Process called "lower_record_literal" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower a record literal { field as value, ... } to HIR
+
+    @Reasoning:
+    A record literal aggregates named field values into a composite
+    value. The MIR post handler allocates a record and stores each field
+    value at its declared offset, consuming field values from the result
+    stack in reverse. The HIR layer lowers each field value expression in
+    source order and records the field count and a per-field info list
+    carrying field offsets.
+    @End Reasoning
+
+    @Implementation
+    The AST record node's children are the field value expressions in
+    declaration order (child_count at offset 32); each field-info record
+    in the HIR fields list carries its declared byte offset at offset 8.
+    For the foundation pipeline the field offset is the source position
+    times 8 (8-byte slots), which the MIR handler also assumes when the
+    field-info offset is absent. Lower each field value, build a fields
+    list of single-int64 offset records, and emit a flat
+    HIR_RECORD_LITERAL (10013): node_type@0, fields_list@8,
+    field_count@16, record_type@24 - the offsets
+    lower_hir_record_literal_post reads.
+    @End Implementation
+
+    @Performance_Hints
+    N recursive lowerings plus one List allocation and N field-info
+    allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Each field value is independently lowered; a null field value is
+    skipped so it cannot be dereferenced downstream. Field offsets are
+    bounded by field_count * 8.
+    @End Security_Scope
+
+    Let field_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    Let values_list be proc create from List
+    Let fields_list be proc create from List
+    Let lowered_count be 0
+
+    Let i be 0
+    While i is less than field_count:
+        Let value_ast be proc ast_node_get_child from AST with ast_node, i
+        If value_ast is not equal to 0:
+            Let value_hir be proc lower_ast_node with context, value_ast
+            If value_hir is not equal to 0:
+                proc append from List with values_list, value_hir
+
+                Note: Build a field-info record carrying the declared byte
+                Note: offset at offset 8 (8-byte slot per field).
+                Let field_info be proc allocate from Layout with 16
+                If field_info is not equal to 0:
+                    Let declared_offset be lowered_count multiplied by 8
+                    proc memory_set_int64 from Layout with field_info, 0, 0
+                    proc memory_set_int64 from Layout with field_info, 8, declared_offset
+                    proc append from List with fields_list, field_info
+                End If
+
+                Set lowered_count to lowered_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let base_hir be proc create_hir_node from HIR with HIR_RECORD_LITERAL from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with base_hir, 8, fields_list
+    proc memory_set_int64 from Layout with base_hir, 16, lowered_count
+    proc memory_set_int64 from Layout with base_hir, 24, 0
+
+    Note: The lowered field VALUES are stored in a parallel list at offset
+    Note: 40 so the visitor can surface them as children for the MIR post
+    Note: handler to consume; the fields_list at offset 8 carries offsets.
+    proc memory_set_int64 from Layout with base_hir, 40, values_list
 
     Return base_hir
 End Process
@@ -3402,9 +4178,38 @@ Process called "infer_literal_type" takes context as Integer, value_type as Inte
     explicit type annotation path rather than receiving a phantom type.
     @End Security_Scope
 
-    Note: Map value type to HIRTypeInfo
+    Note: Normalize lexer literal-class token codes to the canonical value-type
+    Note: tags this routine switches on. build_literal_node / build_integer_literal
+    Note: store the lexer token type as the AST value_type, so the tag arrives as
+    Note: e.g. 110 for an integer rather than the canonical 2. Map both the token
+    Note: codes (100/102/110/111/120/121/140) and the canonical tags (1..4) to a
+    Note: single normalized kind: 1=STRING, 2=INTEGER, 3=FLOAT, 4=BOOLEAN.
+    Let normalized_type be value_type
+    If value_type is equal to 110:
+        Set normalized_type to 2
+    End If
+    If value_type is equal to 111:
+        Set normalized_type to 3
+    End If
+    If value_type is equal to 100:
+        Set normalized_type to 1
+    End If
+    If value_type is equal to 102:
+        Set normalized_type to 1
+    End If
+    If value_type is equal to 140:
+        Set normalized_type to 1
+    End If
+    If value_type is equal to 120:
+        Set normalized_type to 4
+    End If
+    If value_type is equal to 121:
+        Set normalized_type to 4
+    End If
+
+    Note: Map normalized value type to HIRTypeInfo
     Note: Value types: 1=STRING, 2=INTEGER, 3=FLOAT, 4=BOOLEAN
-    If value_type is equal to 2:  Note: INTEGER
+    If normalized_type is equal to 2:  Note: INTEGER
         Let type_info be proc create_hir_type_info from HIR with TYPE_INTEGER from HIR
         proc set_type_size_and_alignment from HIR with type_info, 8, 8
         Note: Runa Integer is signed 64-bit; stamp is_signed at HIRTypeInfo offset 32
@@ -3412,19 +4217,19 @@ Process called "infer_literal_type" takes context as Integer, value_type as Inte
         Return type_info
     End If
 
-    If value_type is equal to 3:  Note: FLOAT
+    If normalized_type is equal to 3:  Note: FLOAT
         Set type_info to proc create_hir_type_info from HIR with TYPE_FLOAT from HIR
         proc set_type_size_and_alignment from HIR with type_info, 8, 8
         Return type_info
     End If
 
-    If value_type is equal to 1:  Note: STRING
+    If normalized_type is equal to 1:  Note: STRING
         Set type_info to proc create_hir_type_info from HIR with TYPE_STRING from HIR
         proc set_type_size_and_alignment from HIR with type_info, 8, 8
         Return type_info
     End If
 
-    If value_type is equal to 4:  Note: BOOLEAN
+    If normalized_type is equal to 4:  Note: BOOLEAN
         Set type_info to proc create_hir_type_info from HIR with TYPE_BOOLEAN from HIR
         proc set_type_size_and_alignment from HIR with type_info, 8, 8
         Return type_info
@@ -3994,6 +4799,36 @@ Process called "infer_binary_result_type" takes context as Integer, operator as 
         Return proc create_boolean_type with context
     End If
 
+    Note:
+    Canonical comparison phrases ("X is greater than Y", "X is equal to Y",
+    etc.) are lowered to binary nodes carrying the canonical comparison TOKEN
+    values rather than the OP_* constants: EQUAL (400), NOT_EQUAL (511),
+    LESS_THAN (512), GREATER_THAN (513), LESS_EQUAL (514), GREATER_EQUAL (515).
+    These are the same token values map_binary_operator_to_mir_opcode maps to
+    the MIR comparison opcodes, so they must also be recognised here as
+    Boolean-producing — otherwise an If/While/For condition built from a
+    comparison is flagged "Condition must be Boolean", which accumulates an
+    error and aborts HIR construction for the whole compilation unit.
+    :End Note
+    If operator is equal to 400:
+        Return proc create_boolean_type with context
+    End If
+    If operator is equal to 511:
+        Return proc create_boolean_type with context
+    End If
+    If operator is equal to 512:
+        Return proc create_boolean_type with context
+    End If
+    If operator is equal to 513:
+        Return proc create_boolean_type with context
+    End If
+    If operator is equal to 514:
+        Return proc create_boolean_type with context
+    End If
+    If operator is equal to 515:
+        Return proc create_boolean_type with context
+    End If
+
     Note: Logical operators return Boolean
     If operator is equal to OP_AND:
         Return proc create_boolean_type with context
@@ -4449,18 +5284,44 @@ Process called "check_match_exhaustiveness" takes context as Integer, match_stmt
     risking silent UB.
     @End Security_Scope
 
-    Note: Quick check - if there's a wildcard pattern, match is exhaustive
+    Note: Irrefutable-pattern scan. A match is exhaustive if any arm uses an
+    Note: irrefutable (catch-all) pattern with no guard. Two pattern shapes are
+    Note: irrefutable: the wildcard pattern (_) and a bare identifier-binding
+    Note: pattern (a variable that binds any value). Both match every possible
+    Note: value of the scrutinee, so a later arm can never be reached and the
+    Note: match is total. A guard, however, makes even an irrefutable pattern
+    Note: refutable (the arm is skipped when the guard is false), so an arm is
+    Note: only treated as a catch-all when it has no guard child. When-clause
+    Note: children layout (producer: ast_builder.build_when_clause): child 0 is
+    Note: the pattern, the optional guard is the middle child (present only when
+    Note: child_count is 3), and the last child is the body.
     Let i be 0
     While i is less than clause_count:
         Let when_ast be proc get from List with when_clauses, i
         If when_ast is not equal to 0:
-            Note: Get pattern from when clause (offset 80)
-            Let pattern_ast be proc memory_get_int64 from Layout with when_ast, 80
+            Note: Determine whether this arm carries a guard. A guard exists
+            Note: only when the When clause has three children [pattern, guard, body].
+            Let arm_child_count be proc memory_get_int64 from Layout with when_ast, 32
+            Let arm_has_guard be 0
+            If arm_child_count is equal to 3:
+                Set arm_has_guard to 1
+            End If
+
+            Note: Get pattern from when clause: child 0 (generic children layout)
+            Let pattern_ast be proc ast_node_get_child from AST with when_ast, 0
             If pattern_ast is not equal to 0:
                 Note: Get pattern type (offset 0)
                 Let pattern_type be proc memory_get_int64 from Layout with pattern_ast, 0
-                If pattern_type is equal to AST_WILDCARD_PATTERN from AST:
-                    Return 1  Note: Wildcard catches all cases
+
+                Note: An unguarded wildcard or identifier-binding pattern is
+                Note: irrefutable and covers all remaining cases.
+                If arm_has_guard is equal to 0:
+                    If pattern_type is equal to AST_WILDCARD_PATTERN from AST:
+                        Return 1  Note: Wildcard catches all cases
+                    End If
+                    If pattern_type is equal to AST_IDENTIFIER_PATTERN from AST:
+                        Return 1  Note: Bare binding catches all cases
+                    End If
                 End If
             End If
         End If
@@ -4483,7 +5344,7 @@ Process called "check_match_exhaustiveness" takes context as Integer, match_stmt
         While i is less than clause_count:
             Set when_ast to proc get from List with when_clauses, i
             If when_ast is not equal to 0:
-                Set pattern_ast to proc memory_get_int64 from Layout with when_ast, 80
+                Set pattern_ast to proc ast_node_get_child from AST with when_ast, 0
                 If pattern_ast is not equal to 0:
                     Set pattern_type to proc memory_get_int64 from Layout with pattern_ast, 0
                     If pattern_type is equal to AST_LITERAL_PATTERN from AST:
@@ -4544,7 +5405,7 @@ Process called "check_match_exhaustiveness" takes context as Integer, match_stmt
         While i is less than clause_count:
             Set when_ast to proc get from List with when_clauses, i
             If when_ast is not equal to 0:
-                Set pattern_ast to proc memory_get_int64 from Layout with when_ast, 80
+                Set pattern_ast to proc ast_node_get_child from AST with when_ast, 0
                 If pattern_ast is not equal to 0:
                     Set pattern_type to proc memory_get_int64 from Layout with pattern_ast, 0
                     If pattern_type is equal to AST_VARIANT_PATTERN from AST:

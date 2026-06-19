@@ -196,11 +196,15 @@ Process called "get_available_gprs" that takes uses_frame_pointer as Integer ret
 
     Note: RSP (7) - stack pointer (ALWAYS EXCLUDED)
 
-    Note: R8-R15 (8-15)
+    Note: R8-R15 (8-15), excluding R11.
+    Note: R11 (11) is the x86_64 backend's non-allocatable scratch register.
+    Note: emit_binary_op Case-2 (commutative-operand staging) and emit_divmod
+    Note: both materialise operands into R11 unconditionally, so R11 must never
+    Note: hold an allocator-assigned value — otherwise those emitters clobber a
+    Note: live virtual register under register pressure and miscompile.
     proc append from List with gprs, 8
     proc append from List with gprs, 9
     proc append from List with gprs, 10
-    proc append from List with gprs, 11
     proc append from List with gprs, 12
     proc append from List with gprs, 13
     proc append from List with gprs, 14
@@ -760,6 +764,110 @@ Process called "apply_allocation" that takes lir_function as Integer, allocation
 
         Set b to b plus 1
     End While
+
+    Note: Record every callee-saved physical register the allocator actually
+    Note: assigned, so the function prologue/epilogue save and restore them
+    Note: across the function body. Without this the allocator could hand a
+    Note: virtual register a callee-saved register (e.g. RBX) and the body would
+    Note: clobber it without preservation, violating the ABI: a caller that left
+    Note: a live value in RBX across a call to this function would see it
+    Note: corrupted (the concrete failure was a Let-bound call result whose
+    Note: destination address lived in RBX being destroyed by the callee).
+    proc record_callee_saved_registers with lir_function, allocation
+
+    Return 1
+End Process
+
+@Reasoning
+Scans the final register allocation and records, on the function's stack
+frame, the set of callee-saved physical registers the allocator assigned to
+virtual registers. The prologue (emit_prologue) pushes this set on entry and
+the epilogue (emit_epilogue) pops it on exit, honouring the System V/Win64
+contract that the callee preserves RBX, RBP, R12-R15.
+@End Reasoning
+
+@Implementation
+Iterate the allocation OrderedMap (virtual register -> physical register).
+For each assigned physical register that is callee-saved
+(lir_is_callee_saved_register) and not RBP (the frame pointer, which the
+prologue already saves explicitly via push rbp), add it to the stack frame's
+callee_saved_regs List (offset 48) unless already present, and keep the
+callee_saved_count (offset 56) in sync. Deduplicated because many virtual
+registers can share one physical register.
+@End Implementation
+
+@Performance_Hints
+O(allocated_vregs * recorded_callee_saved). Cold: runs once per function
+after allocation converges.
+@End Performance_Hints
+
+@Security_Scope
+Reads the allocation map and the stack frame; appends register ids to a
+List the backend owns. No external input.
+@End Security_Scope
+
+Process called "record_callee_saved_registers" that takes lir_function as Integer, allocation as Integer returns Integer:
+    If lir_function is equal to 0 or allocation is equal to 0:
+        Return 0
+    End If
+
+    Let stack_frame be proc memory_get_int64 from MemoryCore with lir_function, 72
+    If stack_frame is equal to 0:
+        Return 0
+    End If
+
+    Let saved_list be proc memory_get_int64 from MemoryCore with stack_frame, 48
+    If saved_list is equal to 0:
+        Set saved_list to proc list_create from List
+        proc memory_set_int64 from MemoryCore with stack_frame, 48, saved_list
+    End If
+
+    Let entry be proc omap_first from OrderedMap with allocation
+    While entry is not equal to 0:
+        Let phys_reg be proc omap_entry_value from OrderedMap with entry
+
+        Let is_cs be proc lir_is_callee_saved_register from LIR with phys_reg
+        If is_cs is equal to 1:
+            If phys_reg is not equal to LIR_REG_RBP from LIR:
+                Note: Deduplicate: only add a callee-saved register once.
+                Let already be 0
+                Let existing_count be proc list_length from List with saved_list
+                Let k be 0
+                While k is less than existing_count:
+                    Let existing_reg be proc list_get from List with saved_list, k
+                    If existing_reg is equal to phys_reg:
+                        Set already to 1
+                    End If
+                    Set k to k plus 1
+                End While
+
+                If already is equal to 0:
+                    proc append from List with saved_list, phys_reg
+                End If
+            End If
+        End If
+
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+
+    Let final_count be proc list_length from List with saved_list
+    proc memory_set_int64 from MemoryCore with stack_frame, 56, final_count
+
+    Note:
+    The number of callee-saved registers is only known HERE, after allocation
+    has converged — lir_finalize_stack_frame ran during LIR building when the
+    count was still zero. The prologue pushes one 8-byte slot per callee-saved
+    register on top of the "subq frame_size" reservation, so the net stack
+    decrement below the saved %rbp is (frame_size + final_count*8). For the
+    callq inside this function to satisfy the System V ABI requirement that
+    RSP be 16-byte aligned, that sum must be a multiple of 16. Re-finalize the
+    stack frame now that the count is recorded: lir_finalize_stack_frame
+    recomputes frame_size from the (stable) local/spill/arg areas and adds the
+    odd-count padding, guaranteeing post-prologue RSP%16==0 for ANY count.
+    Re-finalization is idempotent: it reads the same area sizes and the freshly
+    recorded count.
+    :End Note
+    proc lir_finalize_stack_frame from LIR with lir_function
 
     Return 1
 End Process

@@ -148,6 +148,96 @@ Process called "map_binary_operator_to_mir_opcode" that takes hir_operator as In
     If hir_operator is equal to 24:
         Return 20015
     End If
+
+    Note: Canonical operator encoding produced by the parser/AST and carried
+    Note: through HIR (binary_expr offset 24): the lexer TOKEN type for the
+    Note: operator (e.g. TOKEN_PLUS = 500), NOT the legacy 1..24 mini-encoding
+    Note: above. lower_hir_binary_expression_post reads ast_node@80 -> hir@24 and
+    Note: passes it here verbatim, so the real input is the token code. Map every
+    Note: binary operator token to its MIR opcode; an unmapped operator falls
+    Note: through to MIR_NOP (which the backend silently drops), so this table
+    Note: must stay complete. (See compiler/frontend/lexical/token_constants.runa
+    Note: for the token values and mir.runa for the MIR opcode values.)
+    Note: Arithmetic.
+    If hir_operator is equal to 500:
+        Return 20002
+    End If
+    If hir_operator is equal to 501:
+        Return 20003
+    End If
+    If hir_operator is equal to 502:
+        Return 20004
+    End If
+    Note: TOKEN_MULTIPLIED (393) — the word form `multiplied by`.
+    If hir_operator is equal to 393:
+        Return 20004
+    End If
+    If hir_operator is equal to 503:
+        Return 20005
+    End If
+    If hir_operator is equal to 394:
+        Return 20005
+    End If
+    If hir_operator is equal to 504:
+        Return 20006
+    End If
+    Note: Comparisons (symbol and word forms).
+    If hir_operator is equal to 510:
+        Return 20100
+    End If
+    If hir_operator is equal to 400:
+        Return 20100
+    End If
+    If hir_operator is equal to 511:
+        Return 20101
+    End If
+    If hir_operator is equal to 512:
+        Return 20102
+    End If
+    If hir_operator is equal to 402:
+        Return 20102
+    End If
+    If hir_operator is equal to 514:
+        Return 20103
+    End If
+    If hir_operator is equal to 513:
+        Return 20104
+    End If
+    If hir_operator is equal to 401:
+        Return 20104
+    End If
+    If hir_operator is equal to 515:
+        Return 20105
+    End If
+    Note: Bitwise and shifts.
+    If hir_operator is equal to 530:
+        Return 20010
+    End If
+    If hir_operator is equal to 531:
+        Return 20011
+    End If
+    If hir_operator is equal to 532:
+        Return 20012
+    End If
+    If hir_operator is equal to 303:
+        Return 20012
+    End If
+    If hir_operator is equal to 534:
+        Return 20014
+    End If
+    If hir_operator is equal to 535:
+        Return 20015
+    End If
+    Note: Logical and/or over boolean operands lower to bitwise AND/OR (operands
+    Note: are 0/1; short-circuit evaluation for side-effecting operands is handled
+    Note: by the control-flow lowering path, not this value-producing binop).
+    If hir_operator is equal to 380:
+        Return 20010
+    End If
+    If hir_operator is equal to 381:
+        Return 20011
+    End If
+
     Return 20000
 End Process
 
@@ -291,11 +381,41 @@ Process called "lower_hir_identifier_post" that takes ctx as Integer, hir_node_p
     Let mir_value be proc lookup_mir_value from MIRBuilder with builder_ctx, hir_id
 
     If mir_value is equal to 0:
+        Note: A bare identifier with no MIR value mapping while lowering a
+        Note: call's callee child (callee_depth > 0) names a top-level function
+        Note: rather than a local variable. The direct-call path in
+        Note: lower_hir_call_expression_post resolves such callees by NAME and
+        Note: discards this pushed value, so emit a benign sentinel (0) and
+        Note: succeed instead of failing symbol resolution at the MIR layer.
+        Note: Outside callee context an unmapped identifier is a genuine
+        Note: lowering error.
+        Let in_callee be proc lowering_in_callee from LCtx with ctx
+        If in_callee is equal to 1:
+            proc lowering_push_result from LCtx with ctx, 0
+            Return 1
+        End If
         proc lowering_set_error from LCtx with ctx, 1, hir_node_ptr
         Return 0
     End If
 
-    proc lowering_push_result from LCtx with ctx, mir_value
+    Note: A local variable / parameter is backed by an alloca (see the
+    Note: HIR_LET_STATEMENT and process-parameter lowering, which map the
+    Note: symbol id to its alloca via map_hir_to_mir_value). lookup_mir_value
+    Note: therefore returns the alloca's value id, which is the ADDRESS of the
+    Note: variable's storage slot, not its current value. Reading the variable
+    Note: in value context must LOAD from that address; pushing the alloca id
+    Note: directly makes every use of the variable (e.g. `Return x`,
+    Note: `x plus 1`) operate on the stack-slot pointer instead of the stored
+    Note: value. The store/assignment path consumes the variable as an lvalue
+    Note: through its own handler (it looks up the alloca id directly), so it is
+    Note: unaffected by this rvalue load.
+    Let loaded_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with loaded_value, mir_value, 0, 0, 0
+    If load_inst is equal to 0:
+        Return 0
+    End If
+    proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    proc lowering_push_result from LCtx with ctx, loaded_value
     Return 1
 End Process
 
@@ -474,8 +594,78 @@ Process called "lower_hir_call_expression_pre" that takes ctx as Integer, hir_no
         Return 0
     End If
 
+    Note: Record the argument count in the call-dedicated slot (NOT
+    Note: pending_lvalue): when this call is a Let/Set initializer, that
+    Note: statement is holding its destination alloca in pending_lvalue across
+    Note: this call's visit, and reusing pending_lvalue here would clobber it,
+    Note: stranding the call result on the stack and corrupting the function
+    Note: drain.
     Let arg_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
-    proc lowering_set_pending_lvalue from LCtx with ctx, arg_count
+    proc lowering_set_pending_call_argc from LCtx with ctx, arg_count
+    Return 1
+End Process
+
+@Reasoning
+HIR_CALL_EXPRESSION child-enter: the callee is child_index 0 (the HIR
+visitor visits callee before arguments). A direct call's callee names a
+top-level function that has no MIR value mapping, so it must NOT be lowered
+as an ordinary value-context identifier (which would force a variable load
+and fail symbol lookup). Raising callee_depth around the callee child makes
+the identifier post handler treat an unmapped callee name as a benign
+reference rather than an error. Arguments (child_index >= 1) are normal
+value-context expressions and are lowered without the flag.
+@End Reasoning
+
+@Implementation
+On child_index 0, increment callee_depth via lowering_enter_callee. Other
+child indices are left untouched. Always returns 1 (continue traversal).
+@End Implementation
+
+@Performance_Hints
+One field op on the callee child only; no-op for argument children.
+@End Performance_Hints
+
+@Security_Scope
+Balanced with the child-exit handler so the flag is cleared even when the
+callee is the only child.
+@End Security_Scope
+
+Process called "lower_hir_call_expression_child_enter" that takes ctx as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If child_index is equal to 0:
+        proc lowering_enter_callee from LCtx with ctx
+    End If
+    Return 1
+End Process
+
+@Reasoning
+HIR_CALL_EXPRESSION child-exit: clears the callee-context flag once the
+callee child (child_index 0) has been fully lowered, so the argument
+children that follow are lowered in ordinary value context.
+@End Reasoning
+
+@Implementation
+On child_index 0, decrement callee_depth via lowering_exit_callee. Always
+returns 1.
+@End Implementation
+
+@Performance_Hints
+One field op on the callee child only.
+@End Performance_Hints
+
+@Security_Scope
+Pairs with child-enter; lowering_exit_callee floors the depth at 0.
+@End Security_Scope
+
+Process called "lower_hir_call_expression_child_exit" that takes ctx as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If child_index is equal to 0:
+        proc lowering_exit_callee from LCtx with ctx
+    End If
     Return 1
 End Process
 
@@ -527,9 +717,30 @@ Process called "lower_hir_call_expression_post" that takes ctx as Integer, hir_n
         Return 0
     End If
 
-    Let arg_count be proc lowering_take_pending_lvalue from LCtx with ctx
-    Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
-    Let callee_name_ptr be proc memory_get_int64 from Layout with hir_node_ptr, 8
+    Let arg_count be proc lowering_take_pending_call_argc from LCtx with ctx
+
+    Note: HIRCallExpression layout (create_hir_call_expression):
+    Note:   [base(0), callee(8), arguments(16), argument_count(24),
+    Note:    resolved_function(32), return_type(40), is_method_call(48)].
+    Note: The callee at offset 8 is the lowered callee HIR NODE (not a raw
+    Note: name string). The return type lives at offset 40.
+    Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 40
+    Let callee_node be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Note: Resolve the direct-call name. When the callee node is an
+    Note: HIR_IDENTIFIER (kind tag at offset 0 == 10001) it names a known
+    Note: function and its identifier text lives in the HIRNode value slot
+    Note: at offset 40 — this string pointer is the canonical direct-call
+    Note: callee. Any other callee shape (member access, computed value, etc.)
+    Note: has no static name and must be lowered as an indirect call through
+    Note: the lowered callee value id.
+    Let callee_name_ptr be 0
+    If callee_node is not equal to 0:
+        Let callee_kind be proc memory_get_int64 from Layout with callee_node, 0
+        If callee_kind is equal to 10001:
+            Set callee_name_ptr to proc memory_get_int64 from Layout with callee_node, 40
+        End If
+    End If
 
     Note: Build argument list by popping N values; LIFO returns
     Note: arguments in reverse source order, so insert at head.
@@ -551,13 +762,13 @@ Process called "lower_hir_call_expression_post" that takes ctx as Integer, hir_n
     Note: callee so consumers resolve it against the program's function
     Note: list by name; an INDIRECT call (is_indirect=1, opcode
     Note: MIR_CALL_INDIRECT) carries the SSA value id that computes the
-    Note: target. The HIR call node carries the callee identifier text at
-    Note: offset 8 when the call names a known function; when no name is
-    Note: available the callee is only reachable through the lowered
-    Note: callee expression's value id, which is by definition an
-    Note: indirect call. The popped callee_value stays popped in the
-    Note: direct case (stack balance); the lowered callee expression it
-    Note: names becomes dead code that DCE removes.
+    Note: target. callee_name_ptr is the identifier text extracted above when
+    Note: the callee names a known function; when no name is available the
+    Note: callee is only reachable through the lowered callee expression's
+    Note: value id, which is by definition an indirect call. The popped
+    Note: callee_value stays popped in the direct case (stack balance); the
+    Note: lowered callee expression it names becomes dead code that DCE
+    Note: removes.
     Let call_inst be 0
     If callee_name_ptr is not equal to 0:
         Set call_inst to proc create_mir_call from MIRNodes with result_value, callee_name_ptr, mir_args, arg_count, return_type, 0, 0
@@ -806,7 +1017,7 @@ Process called "lower_hir_ternary_expression_post" that takes ctx as Integer, hi
         proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
     End If
 
-    Let true_marker be proc create_mir_jump from MIRNodes with true_label
+    Let true_marker be proc create_mir_label from MIRNodes with true_label
     If true_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, true_marker
     End If
@@ -819,7 +1030,7 @@ Process called "lower_hir_ternary_expression_post" that takes ctx as Integer, hi
         proc emit_instruction from MIRBuilder with builder_ctx, jump_merge_true
     End If
 
-    Let false_marker be proc create_mir_jump from MIRNodes with false_label
+    Let false_marker be proc create_mir_label from MIRNodes with false_label
     If false_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, false_marker
     End If
@@ -832,7 +1043,7 @@ Process called "lower_hir_ternary_expression_post" that takes ctx as Integer, hi
         proc emit_instruction from MIRBuilder with builder_ctx, jump_merge_false
     End If
 
-    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    Let merge_marker be proc create_mir_label from MIRNodes with merge_label
     If merge_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
     End If
@@ -1107,9 +1318,42 @@ Process called "lower_hir_array_literal_post" that takes ctx as Integer, hir_nod
         Return 0
     End If
 
-    Let element_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
-    Let element_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
-    Let array_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Note:
+    The HIR array-literal producer (create_hir_list_literal /
+    add_element_to_hir_list in hir.runa) stores the elements List at the
+    children slot (offset 24) and the element_count at offset 32. There is no
+    separate element_type slot on the literal node; the element type is derived
+    later by the type checker. Read element_count from offset 32 (the producer's
+    count slot) and leave element_type unresolved (0) so the alloca is sized by
+    the element count alone. Reading offset 16 (a stale, never-written slot)
+    yielded 0 elements and a degenerate alloca.
+    :End Note
+    Let element_count be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let element_type be 0
+
+    Note:
+    LENGTH-PREFIXED LIST LAYOUT (matches the For-Each control-flow contract
+    in control_flow_lowering.runa): the backing cell is laid out as
+    [count @0][elem0 @8][elem1 @16]...[elem(n-1) @8+(n-1)*8]. For-Each reads
+    the iteration length from the collection base (offset 0) and addresses
+    element i at base + 8 + i*8. The backing cell therefore needs
+    (element_count + 1) * 8 contiguous bytes: one word for the length plus
+    one word per element.
+
+    The stack-frame alloca lowering (lir_builder.lower_alloca) sizes the
+    spill slot from get_type_size(element_type) at MIR-node offset 40, which
+    reads the stamped size at HIRTypeInfo offset 16 when present. To reserve
+    the full (count+1)*8 byte cell, synthesise an HIRTypeInfo carrying that
+    exact stamped size and pass it as the alloca's type. element_count is a
+    compile-time literal here (read from the HIR list node), so the byte size
+    is fully resolved at lowering time.
+    :End Note
+    Let total_bytes be (element_count plus 1) multiplied by 8
+    Let array_storage_type be proc create_hir_type_info from HIR with HIR_POINTER_TYPE from HIR
+    If array_storage_type is not equal to 0:
+        proc memory_set_int64 from Layout with array_storage_type, 16, total_bytes
+        proc memory_set_int64 from Layout with array_storage_type, 24, 8
+    End If
 
     Let count_value be proc allocate_temp_value from MIRBuilder with builder_ctx
     Let count_const be proc create_mir_const from MIRNodes with count_value, element_count, 0, 0, 0
@@ -1118,7 +1362,7 @@ Process called "lower_hir_array_literal_post" that takes ctx as Integer, hir_nod
     End If
 
     Let array_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
-    Let alloca_inst be proc create_mir_alloca from MIRNodes with array_alloca, element_type, count_value, 8
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with array_alloca, array_storage_type, count_value, 8
     If alloca_inst is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
     End If
@@ -1130,8 +1374,18 @@ Process called "lower_hir_array_literal_post" that takes ctx as Integer, hir_nod
         proc register_variable_value from MIR with array_owner_fn, array_alloca
     End If
 
+    Note:
+    Store the element count at offset 0 (the length word). With FIX 1 in
+    lir_builder, the store's offset field (MIR-node offset 88) is honoured,
+    so this writes to base + 0 exactly.
+    :End Note
+    Let length_store be proc create_mir_store from MIRNodes with array_alloca, count_value, 0, element_type, 0
+    If length_store is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, length_store
+    End If
+
     Note: Pop elements in reverse order (LIFO returns last-pushed
-    Note: first), storing each at its source-order offset.
+    Note: first), storing each at its source-order data offset 8 + i*8.
     Let depth be proc lowering_result_depth from LCtx with ctx
     Let to_pop be element_count
     If to_pop is greater than depth:
@@ -1142,7 +1396,7 @@ Process called "lower_hir_array_literal_post" that takes ctx as Integer, hir_nod
     While i is greater than 0:
         Set i to i minus 1
         Let element_value be proc lowering_pop_result from LCtx with ctx
-        Let element_offset be i multiplied by 8
+        Let element_offset be 8 plus (i multiplied by 8)
         Let store_inst be proc create_mir_store from MIRNodes with array_alloca, element_value, element_offset, element_type, 0
         If store_inst is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, store_inst
@@ -1624,8 +1878,11 @@ Process called "lower_hir_indirect_call_pre" that takes ctx as Integer, hir_node
         Return 0
     End If
 
+    Note: Use the call-dedicated argc slot, not pending_lvalue, so an indirect
+    Note: call appearing as a Let/Set initializer cannot clobber that
+    Note: statement's stashed destination alloca.
     Let arg_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
-    proc lowering_set_pending_lvalue from LCtx with ctx, arg_count
+    proc lowering_set_pending_call_argc from LCtx with ctx, arg_count
     Return 1
 End Process
 
@@ -1668,7 +1925,7 @@ Process called "lower_hir_indirect_call_post" that takes ctx as Integer, hir_nod
         Return 0
     End If
 
-    Let arg_count be proc lowering_take_pending_lvalue from LCtx with ctx
+    Let arg_count be proc lowering_take_pending_call_argc from LCtx with ctx
     Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
 
     Let mir_args be proc create from List
@@ -1741,8 +1998,10 @@ Process called "register_expression_handlers" that takes dispatch_table as Integ
     Note: HIR_UNARY_EXPRESSION (10003): post only
     proc lowering_register_handler from LCtx with dispatch_table, 10003, 0, lower_hir_unary_expression_post, 0, 0
 
-    Note: HIR_CALL_EXPRESSION (10005): pre + post
-    proc lowering_register_handler from LCtx with dispatch_table, 10005, lower_hir_call_expression_pre, lower_hir_call_expression_post, 0, 0
+    Note: HIR_CALL_EXPRESSION (10005): pre + post + child_enter + child_exit.
+    Note: The child hooks raise/clear callee-context around child_index 0 so a
+    Note: direct-call function-name callee is not lowered as a variable load.
+    proc lowering_register_handler from LCtx with dispatch_table, 10005, lower_hir_call_expression_pre, lower_hir_call_expression_post, lower_hir_call_expression_child_enter, lower_hir_call_expression_child_exit
 
     Note: HIR_INDEX_EXPRESSION (10006): post only
     proc lowering_register_handler from LCtx with dispatch_table, 10006, 0, lower_hir_index_expression_post, 0, 0

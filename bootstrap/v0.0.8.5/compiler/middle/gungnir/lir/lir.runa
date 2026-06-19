@@ -67,6 +67,7 @@ Constant LIR_XCHG as Integer is 30005                 Note: Exchange two values
 Constant LIR_MOVSX as Integer is 30006                Note: Move with sign extension
 Constant LIR_MOVZX as Integer is 30007                Note: Move with zero extension
 Constant LIR_CMOVcc as Integer is 30008               Note: Conditional move (various conditions)
+Constant LIR_SETcc as Integer is 30009                 Note: Set byte on condition then zero-extend into destination
 
 Note: Arithmetic Operations (30100-30199)
 Constant LIR_ADD as Integer is 30100                  Note: Integer addition
@@ -80,6 +81,8 @@ Constant LIR_INC as Integer is 30107                  Note: Increment by 1
 Constant LIR_DEC as Integer is 30108                  Note: Decrement by 1
 Constant LIR_ADC as Integer is 30109                  Note: Add with carry
 Constant LIR_SBB as Integer is 30110                  Note: Subtract with borrow
+Constant LIR_IMOD as Integer is 30111                 Note: Signed integer remainder (idiv, take RDX)
+Constant LIR_MOD as Integer is 30112                  Note: Unsigned integer remainder (div, take RDX)
 
 Note: Floating-Point Arithmetic (30120-30149)
 Constant LIR_FADD as Integer is 30120                 Note: Floating-point addition
@@ -1343,13 +1346,21 @@ Process called "lir_add_block" that takes function as Integer, is_entry as Integ
     Let block_count be proc memory_get_int64 from MemoryCore with function, block_count_offset
     Let block_id be block_count
 
-    Note: Generate label
+    Note: Generate label. Branch/jump targets reference a block by its block_id
+    Note: and render it as ".LBB" + block_id (see emit_jmp / emit_branch in the
+    Note: x86-64 asm generator, which read the target block id and prepend
+    Note: ".LBB"). The block's STORED label — emitted as the block header by
+    Note: emit_basic_block — must therefore use the SAME block_id and the SAME
+    Note: ".LBB" prefix; otherwise the header (e.g. ".L2:") and the references to
+    Note: it (e.g. "jmp .LBB1") disagree and the assembler/linker sees an
+    Note: undefined-label reference. The next_label_id counter is still advanced
+    Note: so any independent label consumer keeps a monotonic source.
     Let next_label_id_offset be 96
     Let label_id be proc memory_get_int64 from MemoryCore with function, next_label_id_offset
-    Let label_prefix be proc create_from_literal from StringCore with ".L"
-    Let label_num be proc integer_to_string from StringUtils with label_id
-    Let label be proc string_concat from StringUtils with label_prefix, label_num
     proc memory_set_int64 from MemoryCore with function, next_label_id_offset, label_id plus 1
+    Let label_prefix be proc create_from_literal from StringCore with ".LBB"
+    Let label_num be proc integer_to_string from StringUtils with block_id
+    Let label be proc string_concat from StringUtils with label_prefix, label_num
 
     Note: Initialize block fields
     proc memory_set_int64 from MemoryCore with block, 0, block_id                   Note: block_id
@@ -2038,10 +2049,14 @@ Called after all local variables and spill slots are allocated.
 1. NULL-guard the function and resolve its stack frame (offset 72).
 2. Sum local_area_size + spill_area_size + arg_area_size to get the
    variable portion of the frame.
-3. Add 8 bytes per callee-saved register so the prologue's PUSH sequence
-   has reserved space inside the frame.
-4. Round the total up to the frame's alignment (typically 16 bytes for
-   x86-64) so the post-prologue RSP is properly aligned for any callee.
+3. Round that variable portion up to the frame's alignment (typically 16
+   bytes for x86-64). Callee-saved registers are deliberately NOT folded
+   in: the prologue saves them with an explicit PUSH sequence that
+   decrements RSP itself, so reserving the space here too would
+   double-count it and misalign RSP.
+4. When the callee-saved register count is odd, add 8 bytes of frame
+   padding so the combined decrement (frame_size + callee_count*8) stays
+   a multiple of 16, guaranteeing post-prologue RSP%16==0 for ANY count.
 5. Store the final size at offset 0 and return it for the prologue emitter.
 @End Implementation
 
@@ -2077,18 +2092,35 @@ Process called "lir_finalize_stack_frame" that takes function as Integer returns
     Let arg_size be proc memory_get_int64 from MemoryCore with frame, 24
     Let alignment be proc memory_get_int64 from MemoryCore with frame, 32
 
-    Note: Calculate total size
+    Note: Calculate the variable portion of the frame. Callee-saved registers
+    Note: are NOT folded in here: the asm prologue saves them with an explicit
+    Note: PUSH sequence that decrements RSP on its own. Folding callee_saved*8
+    Note: into frame_size as well would reserve that space TWICE (once in the
+    Note: subq, once in the pushes), over-decrementing RSP and — when the count
+    Note: is odd — leaving post-prologue RSP misaligned by 8, violating the
+    Note: System V ABI requirement that RSP be 16-byte aligned at every call.
     Let total_size be local_size plus spill_size plus arg_size
 
-    Note: Add space for callee-saved registers
-    Let callee_saved_count be proc memory_get_int64 from MemoryCore with frame, 56
-    Let callee_saved_size be callee_saved_count multiplied by 8
-    Set total_size to total_size plus callee_saved_size
-
-    Note: Align total frame size
+    Note: Align the variable portion up to the frame alignment so the post-
+    Note: prologue RSP stays aligned for an EVEN number of callee-saved pushes.
     Let remainder be total_size modulo by alignment
     If remainder is not equal to 0:
         Set total_size to total_size plus (alignment minus remainder)
+    End If
+
+    Note: System V alignment guarantee across the PUSH sequence.
+    Note: Entry RSP%16==8 (return addr); after "pushq %rbp" RSP%16==0; after
+    Note: "subq total_size" RSP%16==0 (total_size is 16-aligned above); each
+    Note: callee-saved PUSH then subtracts 8. The net decrement below the saved
+    Note: %rbp frame is (total_size + callee_count*8), and post-prologue
+    Note: RSP%16 == (-(total_size + callee_count*8)) modulo 16. With total_size
+    Note: a multiple of 16, an ODD callee_count leaves RSP%16==8. Pad the frame
+    Note: by 8 in that case so (total_size + callee_count*8) stays a multiple of
+    Note: 16 for ANY callee-saved count, keeping every callq SysV-aligned.
+    Let callee_saved_count be proc memory_get_int64 from MemoryCore with frame, 56
+    Let callee_parity be callee_saved_count modulo by 2
+    If callee_parity is not equal to 0:
+        Set total_size to total_size plus 8
     End If
 
     Note: Set final frame size

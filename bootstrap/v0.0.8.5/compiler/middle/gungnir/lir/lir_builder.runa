@@ -433,6 +433,22 @@ Process called "lower_binary_op" that takes builder as Integer, mir_node as Inte
         End If
     End If
 
+    If opcode is equal to MIR_MOD from MIR:
+        Note: MIR_MOD (20006) is an integer-only operation (see mir.runa).
+        Note: x86-64 produces the remainder in RDX as a side effect of the
+        Note: same idiv/div instruction used for division, so modulo maps to a
+        Note: single LIR remainder opcode whose backend emitter (emit_imod /
+        Note: emit_umod) extracts RDX. The signed/unsigned selection mirrors
+        Note: the MIR_DIV integer branch exactly: signed operands use the idiv
+        Note: family (LIR_IMOD), unsigned operands use the div family (LIR_MOD).
+        Set is_signed to proc is_signed_type with type_info
+        If is_signed is equal to 1:
+            Set lir_opcode to LIR_IMOD from LIR
+        Otherwise:
+            Set lir_opcode to LIR_MOD from LIR
+        End If
+    End If
+
     If opcode is equal to MIR_AND from MIR:
         Set lir_opcode to LIR_AND from LIR
     End If
@@ -630,15 +646,20 @@ Process called "lower_comparison" that takes builder as Integer, mir_node as Int
         End If
     End If
 
-    Note: Generate conditional move to set result register (SETcc equivalent)
-    Note: Move 1 or 0 into result based on condition
+    Note:
+    Materialize the boolean result with SETcc, not CMOVcc. The previous
+    CMOVcc form emitted "cmovCC $1, %reg", which is an illegal x86 encoding
+    (CMOVcc cannot take an immediate source) AND passed the false-immediate
+    operand where the emitter expected the condition code, so it always
+    produced "cmove $1, ..." regardless of the real comparison. SETcc sets a
+    byte from the flags the cmp above produced; the emitter zero-extends that
+    byte into the full destination register, yielding a clean 0/1 Boolean.
+    Operand1 carries the LIR condition code so emit_setcc can pick setCC.
+    :End Note
     Let dest_operand be proc create_register_operand from LIRNodes with result_reg, size
-    Let true_immediate be proc create_immediate_operand from LIRNodes with 1, size
-    Let false_immediate be proc create_immediate_operand from LIRNodes with 0, size
+    Let cond_operand_set be proc create_immediate_operand from LIRNodes with condition, size
 
-    Note: Use conditional move (CMOVcc) to materialize boolean result
-    Note: This sets result_reg to 1 if condition true, 0 if false
-    Let setcc_inst be proc create_lir_binary_op from LIRNodes with LIR_CMOVcc from LIR, dest_operand, true_immediate, false_immediate, size
+    Let setcc_inst be proc create_lir_unary_op from LIRNodes with LIR_SETcc from LIR, dest_operand, cond_operand_set, size
     proc append_lir_instruction with builder, setcc_inst
 
     Return 1
@@ -663,14 +684,25 @@ Process called "lower_load" that takes builder as Integer, mir_node as Integer r
     Let address_value_id be proc memory_get_int64 from Layout with mir_node, 16
     Let type_info be proc memory_get_int64 from Layout with mir_node, 40
 
+    Note:
+    The MIR load record carries an explicit byte displacement at offset 88
+    (set by create_mir_load). This displacement encodes struct-field offsets
+    (base + field_off) and array-element offsets (base + 8 + index*8). The
+    header slots 8/16/40 mirror result/address/type, but the displacement is
+    NOT mirrored, so it must be read directly from the extended field. A
+    plain local-variable load lowers with offset 0 (the address is computed
+    explicitly upstream), so reading offset 88 preserves that path exactly.
+    :End Note
+    Let mem_displacement be proc memory_get_int64 from Layout with mir_node, 88
+
     Note: Get address register
     Let address_reg be proc get_or_create_register_for_value with builder, address_value_id, type_info
     Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
 
     Let size be proc get_type_size with type_info
 
-    Note: Create memory operand: [address_reg + 0]
-    Let mem_operand be proc create_simple_memory_operand from LIRNodes with address_reg, 0, size
+    Note: Create memory operand: [address_reg + displacement]
+    Let mem_operand be proc create_simple_memory_operand from LIRNodes with address_reg, mem_displacement, size
     Let dest_operand be proc create_register_operand from LIRNodes with result_reg, size
 
     Note: Select sized load based on type size
@@ -709,13 +741,24 @@ Process called "lower_store" that takes builder as Integer, mir_node as Integer 
     Let value_value_id be proc memory_get_int64 from Layout with mir_node, 24
     Let type_info be proc memory_get_int64 from Layout with mir_node, 40
 
+    Note:
+    The MIR store record carries an explicit byte displacement at offset 88
+    (set by create_mir_store). This displacement encodes struct-field offsets
+    (base + field_off) and array-element offsets (base + 8 + index*8). The
+    header slots 16/24/40 mirror address/value/type, but the displacement is
+    NOT mirrored, so it must be read directly from the extended field. A
+    plain local-variable store lowers with offset 0 (the address is computed
+    explicitly upstream), so reading offset 88 preserves that path exactly.
+    :End Note
+    Let mem_displacement be proc memory_get_int64 from Layout with mir_node, 88
+
     Let address_reg be proc get_or_create_register_for_value with builder, address_value_id, type_info
     Let value_reg be proc get_or_create_register_for_value with builder, value_value_id, type_info
 
     Let size be proc get_type_size with type_info
 
-    Note: Create memory operand: [address_reg + 0]
-    Let mem_operand be proc create_simple_memory_operand from LIRNodes with address_reg, 0, size
+    Note: Create memory operand: [address_reg + displacement]
+    Let mem_operand be proc create_simple_memory_operand from LIRNodes with address_reg, mem_displacement, size
     Let src_operand be proc create_register_operand from LIRNodes with value_reg, size
 
     Note: Select sized store based on type size
@@ -812,9 +855,25 @@ Process called "lower_branch" that takes builder as Integer, mir_node as Integer
     Let lir_true_block be proc get_or_create_lir_block with builder, true_block_id
     Let lir_false_block be proc get_or_create_lir_block with builder, false_block_id
 
-    Note: Branch if not equal (condition != 0) to true block
-    Let branch_inst be proc create_lir_branch from LIRNodes with LIR_COND_NE from LIR, lir_true_block, lir_false_block
-    proc append_lir_instruction with builder, branch_inst
+    Note:
+    Emit two FLAT control-flow instructions the x86-64 emitter already
+    understands rather than a generic LIR_BRANCH wrapper. The wrapper form
+    (create_lir_branch) stores the base-instruction pointer at offset 0, but
+    emit_instruction reads the opcode from offset 0 and there is no LIR_BRANCH
+    (30519) emitter, so a wrapper branch produced a garbage "unknown opcode"
+    and never jumped. The compare above already set the flags from
+    "condition != 0"; therefore:
+      1. jne true_block   (LIR_JNE 30504: taken when condition != 0)
+      2. jmp false_block  (fall-through path)
+    Both use create_lir_jump's flat layout (opcode@0, target immediate@16),
+    which emit_conditional_jmp / emit_jmp read directly.
+    :End Note
+    Let cond_jump be proc create_lir_jump from LIRNodes with lir_true_block
+    proc memory_set_int64 from Layout with cond_jump, 0, LIR_JNE from LIR
+    proc append_lir_instruction with builder, cond_jump
+
+    Let fallthrough_jump be proc create_lir_jump from LIRNodes with lir_false_block
+    proc append_lir_instruction with builder, fallthrough_jump
 
     Note: Add CFG edges
     Let lir_function be proc memory_get_int64 from Layout with builder, 8
@@ -1015,20 +1074,105 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
     of the External declaration).
     :End Note
 
-    Note: Setup arguments according to calling convention
+    Note:
+    System V (and Win64) keep TWO independent argument-class counters: a
+    general-purpose counter for integer/pointer arguments (RDI,RSI,RDX,RCX,
+    R8,R9 on SysV) and an SSE counter for floating-point arguments (XMM0-7).
+    The two sequences advance independently of each other and independently
+    of overall argument position. Folding both into a single index (the prior
+    behaviour) mis-assigned every call that interleaved int and float args:
+    the first float would land in XMM<int_position> instead of XMM0, and an
+    int after a float would skip a GP register. lir_get_argument_register is
+    keyed on the PER-CLASS index, so we feed it gp_index for integer args and
+    sse_index for float args, advancing only the consumed class.
+    :End Note
+    Let type_cache be proc memory_get_int64 from Layout with builder, 48
+
+    Note:
+    First pass: determine how many arguments are passed on the stack. An
+    argument spills to the stack exactly when lir_get_argument_register
+    returns -1 for its per-class index (GP regs exhausted past the 6th
+    integer arg, or SSE regs past the 8th float arg). The stack byte count
+    drives a single RSP reservation so the outgoing stack-argument area sits
+    BELOW the return address the callq pushes — without it, the stores would
+    overwrite the slot the return address lands in and corrupt the call.
+    :End Note
+    Let count_gp_index be 0
+    Let count_sse_index be 0
+    Let stack_arg_count be 0
+    Let scan_index be 0
+    While scan_index is less than argument_count:
+        Let scan_value_id be proc get from List with arguments, scan_index
+        Let scan_type be proc omap_get from OrderedMap with type_cache, scan_value_id
+        Let scan_is_float be proc is_float_type with scan_type
+        Let scan_target be -1
+        If scan_is_float is equal to 1:
+            Set scan_target to proc lir_get_argument_register from LIR with calling_convention, count_sse_index, 1
+            Set count_sse_index to count_sse_index plus 1
+        Otherwise:
+            Set scan_target to proc lir_get_argument_register from LIR with calling_convention, count_gp_index, 0
+            Set count_gp_index to count_gp_index plus 1
+        End If
+        If scan_target is equal to -1:
+            Set stack_arg_count to stack_arg_count plus 1
+        End If
+        Set scan_index to scan_index plus 1
+    End While
+
+    Note:
+    Reserve the outgoing stack-argument area, rounded UP to a 16-byte
+    multiple so the callq executes with RSP%16==0 as the System V ABI
+    requires. At the point of the call the frame is already 16-aligned (the
+    prologue guarantees this for any callee-saved count), so subtracting a
+    16-aligned amount preserves alignment. The reservation is reclaimed with
+    a matching add after the call.
+    :End Note
+    Let stack_bytes be stack_arg_count multiplied by 8
+    Let stack_bytes_rem be stack_bytes modulo by 16
+    If stack_bytes_rem is not equal to 0:
+        Set stack_bytes to stack_bytes plus (16 minus stack_bytes_rem)
+    End If
+
+    Let rsp_reg be LIR_REG_RSP from LIR
+    If stack_bytes is greater than 0:
+        Let sub_dst be proc create_register_operand from LIRNodes with rsp_reg, 8
+        Let sub_lhs be proc create_register_operand from LIRNodes with rsp_reg, 8
+        Let sub_imm be proc create_immediate_operand from LIRNodes with stack_bytes, 8
+        Let sub_inst be proc create_lir_binary_op from LIRNodes with LIR_SUB from LIR, sub_dst, sub_lhs, sub_imm, 8
+        proc append_lir_instruction with builder, sub_inst
+    End If
+
+    Note:
+    Second pass: place each argument. Register args move into their assigned
+    GP/SSE register; stack args store to [rsp + slot*8] starting at slot 0 —
+    the stores are relative to the JUST-reserved RSP, so arg7 lands at
+    [rsp+0], arg8 at [rsp+8], and so on, with no collision against the return
+    address. The same per-class counters as the scan reproduce the identical
+    register/stack decisions.
+    :End Note
+    Let gp_index be 0
+    Let sse_index be 0
+    Let stack_slot be 0
     Let arg_index be 0
     While arg_index is less than argument_count:
         Let arg_value_id be proc get from List with arguments, arg_index
 
         Note: Get type info for argument (cached during lowering)
-        Let type_cache be proc memory_get_int64 from Layout with builder, 48
         Let arg_type be proc omap_get from OrderedMap with type_cache, arg_value_id
 
         Let arg_reg be proc get_or_create_register_for_value with builder, arg_value_id, arg_type
         Let is_float be proc is_float_type with arg_type
 
-        Note: Get argument register per calling convention
-        Let target_reg be proc lir_get_argument_register from LIR with calling_convention, arg_index, is_float
+        Note: Resolve the target register from the per-class index, then
+        Note: advance only the class this argument consumed.
+        Let target_reg be -1
+        If is_float is equal to 1:
+            Set target_reg to proc lir_get_argument_register from LIR with calling_convention, sse_index, 1
+            Set sse_index to sse_index plus 1
+        Otherwise:
+            Set target_reg to proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
+            Set gp_index to gp_index plus 1
+        End If
 
         Let size be proc get_type_size with arg_type
 
@@ -1040,15 +1184,13 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
             Let move_inst be proc create_lir_move from LIRNodes with dest_operand, src_operand, size
             proc append_lir_instruction with builder, move_inst
         Otherwise:
-            Note: Argument goes on stack
-            Note: Calculate stack position: arg_index * 8 (assuming 8-byte slots)
-            Let stack_offset be arg_index multiplied by 8
+            Note: Argument goes on stack at [rsp + slot*8], slot indexed from 0.
+            Let stack_offset be stack_slot multiplied by 8
+            Set stack_slot to stack_slot plus 1
 
-            Let rsp_reg be LIR_REG_RSP from LIR
             Let mem_operand be proc create_simple_memory_operand from LIRNodes with rsp_reg, stack_offset, size
             Set src_operand to proc create_register_operand from LIRNodes with arg_reg, size
 
-            Let lir_opcode be LIR_STORE64 from LIR
             Let store_inst be proc create_lir_store from LIRNodes with mem_operand, src_operand, size, size
             proc append_lir_instruction with builder, store_inst
         End If
@@ -1080,6 +1222,21 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
         proc memory_set_int64 from Layout with call_inst, 64, callee_convention_id
     End If
     proc append_lir_instruction with builder, call_inst
+
+    Note:
+    Reclaim the outgoing stack-argument area reserved before the call. The
+    return value (RAX or XMM0) is unaffected by adjusting RSP, so this runs
+    before the result move below. Reclaiming keeps RSP balanced across the
+    call so the caller's frame layout and 16-byte alignment are preserved for
+    any subsequent calls in the same block.
+    :End Note
+    If stack_bytes is greater than 0:
+        Let add_dst be proc create_register_operand from LIRNodes with rsp_reg, 8
+        Let add_lhs be proc create_register_operand from LIRNodes with rsp_reg, 8
+        Let add_imm be proc create_immediate_operand from LIRNodes with stack_bytes, 8
+        Let add_inst be proc create_lir_binary_op from LIRNodes with LIR_ADD from LIR, add_dst, add_lhs, add_imm, 8
+        proc append_lir_instruction with builder, add_inst
+    End If
 
     Note: Retrieve return value if function returns something. return_reg was
     Note: already resolved above (and stored into the call record); reuse it
@@ -1200,84 +1357,6 @@ Process called "lower_type_conversion" that takes builder as Integer, mir_node a
 
     Let conv_inst be proc create_lir_unary_op from LIRNodes with lir_opcode, dest_operand, src_operand, size
     proc append_lir_instruction with builder, conv_inst
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: Modulo Operation Lowering
-Note: ============================================================================
-
-@Reasoning
-Lowers MIR % operation to LIR instruction sequence.
-Since x86-64 doesn't have a direct % instruction, we implement:
-a % b = a - (a / b) * b
-@End Reasoning
-
-Process called "lower_modulo" that takes builder as Integer, mir_node as Integer returns Integer:
-    If builder is equal to 0 or mir_node is equal to 0:
-        Display "lower_modulo: null parameter"
-        Return 0
-    End If
-
-    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
-    Let left_value_id be proc memory_get_int64 from Layout with mir_node, 16
-    Let right_value_id be proc memory_get_int64 from Layout with mir_node, 24
-    Let type_info be proc memory_get_int64 from Layout with mir_node, 40
-
-    Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
-    Let left_reg be proc get_or_create_register_for_value with builder, left_value_id, type_info
-    Let right_reg be proc get_or_create_register_for_value with builder, right_value_id, type_info
-
-    Let size be proc get_type_size with type_info
-    Let left_operand be proc create_register_operand from LIRNodes with left_reg, size
-    Let right_operand be proc create_register_operand from LIRNodes with right_reg, size
-
-    Note: Create register for intermediate result
-    Let lir_function be proc memory_get_int64 from Layout with builder, 8
-    Let next_vreg_id be proc memory_get_int64 from Layout with builder, 56
-    Let temp_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_GPR from LIR, size
-    proc memory_set_int64 from Layout with builder, 56, next_vreg_id plus 1
-
-    Let temp_operand be proc create_register_operand from LIRNodes with temp_reg, size
-
-    Note: Select division opcode based on signedness
-    Let is_signed be proc is_signed_type with type_info
-    Let is_float be proc is_float_type with type_info
-
-    Let div_opcode be 0
-    Let mul_opcode be 0
-
-    If is_float is equal to 1:
-        Set div_opcode to LIR_FDIV from LIR
-        Set mul_opcode to LIR_FMUL from LIR
-    Otherwise:
-        If is_signed is equal to 1:
-            Set div_opcode to LIR_IDIV from LIR
-            Set mul_opcode to LIR_IMUL from LIR
-        Otherwise:
-            Set div_opcode to LIR_DIV from LIR
-            Set mul_opcode to LIR_MUL from LIR
-        End If
-    End If
-
-    Note: = left / right
-    Let div_inst be proc create_lir_binary_op from LIRNodes with div_opcode, temp_operand, left_operand, right_operand, size
-    proc append_lir_instruction with builder, div_inst
-
-    Note: = * right
-    Let mul_inst be proc create_lir_binary_op from LIRNodes with mul_opcode, temp_operand, temp_operand, right_operand, size
-    proc append_lir_instruction with builder, mul_inst
-
-    Note: result = left - 
-    Let result_operand be proc create_register_operand from LIRNodes with result_reg, size
-    Let sub_opcode be LIR_SUB from LIR
-    If is_float is equal to 1:
-        Set sub_opcode to LIR_FSUB from LIR
-    End If
-
-    Let sub_inst be proc create_lir_binary_op from LIRNodes with sub_opcode, result_operand, left_operand, temp_operand, size
-    proc append_lir_instruction with builder, sub_inst
 
     Return 1
 End Process
@@ -2184,11 +2263,6 @@ Process called "lower_mir_instruction" that takes builder as Integer, mir_node a
         Return proc lower_binary_op with builder, mir_node
     End If
 
-    Note: Modulo operation
-    If opcode is equal to MIR_MOD from MIR:
-        Return proc lower_modulo with builder, mir_node
-    End If
-
     Note: Unary operations
     If opcode is equal to MIR_NEG from MIR or opcode is equal to MIR_NOT from MIR:
         Return proc lower_unary_op with builder, mir_node
@@ -2307,6 +2381,168 @@ Lowers a complete MIR basic block to LIR by processing all instructions in order
 Phi nodes are handled specially - they're lowered by inserting moves in predecessors.
 @End Reasoning
 
+@Reasoning
+Emits the System V/Win64 parameter-binding prologue: one move per parameter
+copying its incoming argument register (RDI, RSI, RDX, RCX, R8, R9, then
+stack) into the LIR virtual register the function body uses for that
+parameter value. The MIR parameter lowering recorded the parameters' SSA
+value ids, in declaration order, on the MIR function's parameters List
+(offset 16); the same value ids back the alloca-store the body emits, so
+binding the argument register into that vreg makes the subsequent
+store-to-stack-slot write the real argument rather than an unbound register.
+Emitted as the entry block's first body instructions (after its label marker)
+so the binding and every parameter use stay in one basic block.
+@End Reasoning
+
+@Implementation
+Iterate the MIR function parameters list. For each parameter, resolve the
+body vreg via get_or_create_register_for_value, classify it as integer or
+float from the cached parameter type, and obtain the ABI argument register
+via lir_get_argument_register keyed on the PER-CLASS index (a GP counter for
+integer/pointer params, an SSE counter for float params). This mirrors the
+caller's lower_call marshalling exactly: integer args occupy RDI..R9 in GP
+order, float args occupy XMM0..XMM7 in SSE order, each sequence independent.
+Append a register-to-register move per register-passed parameter. Parameters
+beyond their class's register set (arg register == -1) are passed on the
+stack by the caller and are addressed directly by the body's stack slots, so
+no binding move is emitted for them; their consumed class counter is still
+advanced so later same-class params get the correct register.
+@End Implementation
+
+@Performance_Hints
+O(parameter_count); one move per register-passed parameter. Cold per
+function.
+@End Performance_Hints
+
+@Security_Scope
+Null-safe on the parameters list. Register ids flow into operand records the
+register allocator later validates.
+@End Security_Scope
+
+Process called "emit_parameter_binding_prologue" that takes builder as Integer, mir_function as Integer returns Integer:
+    If builder is equal to 0 or mir_function is equal to 0:
+        Return 0
+    End If
+
+    Let calling_convention be proc memory_get_int64 from Layout with builder, 40
+    Let mir_parameters be proc memory_get_int64 from Layout with mir_function, 16
+    If mir_parameters is equal to 0:
+        Return 1
+    End If
+
+    Note: Same value_id -> type cache the body lowering consults, used here to
+    Note: classify each parameter as integer or float so it draws from the
+    Note: matching ABI argument-register sequence.
+    Let type_cache be proc memory_get_int64 from Layout with builder, 48
+
+    Let parameter_count be proc length from List with mir_parameters
+    Let gp_index be 0
+    Let sse_index be 0
+    Let stack_param_slot be 0
+    Let rbp_reg be LIR_REG_RBP from LIR
+    Let p be 0
+    While p is less than parameter_count:
+        Let param_value_id be proc get from List with mir_parameters, p
+        Let param_type be 0
+        If type_cache is not equal to 0:
+            Set param_type to proc omap_get from OrderedMap with type_cache, param_value_id
+        End If
+        Let param_is_float be proc is_float_type with param_type
+        Let param_dest_reg be proc get_or_create_register_for_value with builder, param_value_id, param_type
+
+        Note: Resolve the incoming argument register from the per-class index,
+        Note: then advance only the class this parameter consumed.
+        Let arg_src_reg be -1
+        If param_is_float is equal to 1:
+            Set arg_src_reg to proc lir_get_argument_register from LIR with calling_convention, sse_index, 1
+            Set sse_index to sse_index plus 1
+        Otherwise:
+            Set arg_src_reg to proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
+            Set gp_index to gp_index plus 1
+        End If
+
+        If arg_src_reg is not equal to 0 minus 1:
+            Note: Register-passed parameter: bind its incoming ABI register into
+            Note: the body vreg with a register-to-register move.
+            Let bind_dest be proc create_register_operand from LIRNodes with param_dest_reg, 8
+            Let bind_src be proc create_register_operand from LIRNodes with arg_src_reg, 8
+            Let bind_move be proc create_lir_move from LIRNodes with bind_dest, bind_src, 8
+            proc append_lir_instruction with builder, bind_move
+        Otherwise:
+            Note:
+            Stack-passed parameter: the caller wrote it into its outgoing
+            stack-argument area, which the callq's pushed return address and
+            this function's "pushq %rbp" then leave above %rbp. The first
+            stack argument therefore lives at 16(%rbp) (8 bytes of return
+            address + 8 bytes of saved %rbp), the second at 24(%rbp), and so
+            on. Load it into the body vreg so the parameter holds its real
+            incoming value rather than a stale register. This load consumes a
+            stack slot independent of the GP/SSE register sequences above.
+            :End Note
+            Let incoming_disp be 16 plus (stack_param_slot multiplied by 8)
+            Set stack_param_slot to stack_param_slot plus 1
+            Let load_addr be proc create_simple_memory_operand from LIRNodes with rbp_reg, incoming_disp, 8
+            Let load_dest be proc create_register_operand from LIRNodes with param_dest_reg, 8
+            Let load_inst be proc create_lir_load from LIRNodes with load_dest, load_addr, 8
+            proc append_lir_instruction with builder, load_inst
+        End If
+        Set p to p plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "lower_mir_basic_block_with_prologue" that takes builder as Integer, mir_block as Integer, mir_function as Integer, is_entry_block as Integer returns Integer:
+    If builder is equal to 0 or mir_block is equal to 0:
+        Display "lower_mir_basic_block_with_prologue: null parameter"
+        Return 0
+    End If
+
+    Let mir_block_id be proc memory_get_int64 from Layout with mir_block, 0
+    Let lir_block_id be proc get_or_create_lir_block with builder, mir_block_id
+    proc memory_set_int64 from Layout with builder, 32, lir_block_id
+
+    Note: Phi nodes first (moves are inserted in predecessors).
+    Let phi_nodes be proc memory_get_int64 from Layout with mir_block, 88
+    If phi_nodes is not equal to 0:
+        Let phi_count be proc length from List with phi_nodes
+        Let pi be 0
+        While pi is less than phi_count:
+            Let phi_node be proc get from List with phi_nodes, pi
+            proc lower_phi_node with builder, phi_node
+            Set pi to pi plus 1
+        End While
+    End If
+
+    Let instructions be proc memory_get_int64 from Layout with mir_block, 16
+    Let instruction_count be proc memory_get_int64 from Layout with mir_block, 24
+
+    Note: Emit the parameter-binding prologue as the entry block's FIRST
+    Note: instructions. CFG construction folds the leading MIR_LABEL marker into
+    Note: the block header (it is not present in the block's instruction list),
+    Note: and the LIR block already carries its own label, so the binding moves
+    Note: appended here land immediately under the block label and ahead of every
+    Note: parameter store the body emits next.
+    If is_entry_block is equal to 1:
+        proc emit_parameter_binding_prologue with builder, mir_function
+    End If
+
+    Let i be 0
+    While i is less than instruction_count:
+        Let mir_inst be proc get from List with instructions, i
+        Let opcode be proc memory_get_int64 from Layout with mir_inst, 0
+
+        Note: Skip phi nodes (already handled above).
+        If opcode is not equal to MIR_PHI from MIR:
+            proc lower_mir_instruction with builder, mir_inst
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
 Process called "lower_mir_basic_block" that takes builder as Integer, mir_block as Integer returns Integer:
     If builder is equal to 0 or mir_block is equal to 0:
         Display "lower_mir_basic_block: null parameter"
@@ -2391,11 +2627,23 @@ Process called "lower_mir_function_to_lir" that takes mir_function as Integer, c
     Let lir_function be proc memory_get_int64 from Layout with builder, 8
     Let stack_frame be proc lir_create_stack_frame from LIR with lir_function
 
-    Note: Lower all basic blocks
+    Note: Lower all basic blocks. The entry block (index 0) additionally
+    Note: receives the calling-convention parameter-binding prologue, emitted as
+    Note: its first instructions so each incoming argument register is bound to
+    Note: its parameter's virtual register before any body instruction reads the
+    Note: parameter. Emitting the prologue INSIDE the entry block's lowering
+    Note: (rather than into a pre-created block) keeps the binding moves and the
+    Note: body in a single basic block, so liveness/interference see the
+    Note: parameter vregs as live from their first def straight through their
+    Note: uses without an artificial block boundary.
     Let i be 0
     While i is less than block_count:
         Let mir_block be proc get from List with mir_blocks, i
-        proc lower_mir_basic_block with builder, mir_block
+        Let is_entry_block be 0
+        If i is equal to 0:
+            Set is_entry_block to 1
+        End If
+        proc lower_mir_basic_block_with_prologue with builder, mir_block, mir_function, is_entry_block
         Set i to i plus 1
     End While
 
@@ -2450,6 +2698,13 @@ Process called "build_lir_module_from_mir" that takes mir_module as Integer, cal
     Let i be 0
     While i is less than function_count:
         Let mir_function be proc get from List with mir_functions, i
+
+        Note: Defensive: a null entry in the functions List (e.g. a function
+        Note: whose lowering aborted) must not be dereferenced. Skip it.
+        If mir_function is equal to 0:
+            Set i to i plus 1
+            Continue
+        End If
 
         Note: Check if external function
         Let is_external be proc memory_get_int64 from Layout with mir_function, 80

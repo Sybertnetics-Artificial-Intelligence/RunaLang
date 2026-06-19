@@ -106,7 +106,20 @@ Process called "lower_hir_if_statement_pre" that takes ctx as Integer, hir_node_
         Return 0
     End If
 
-    Let else_body be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Note: The IF children live in the specialised HIRIfStatement struct
+    Note: stored at the base node's offset 56 (NOT inline on the base
+    Note: header, whose offsets 8/16/24 hold line/column/children-ptr). The
+    Note: visitor passes the base node to this hook, so the else_block must
+    Note: be read from spec offset 24 (create_hir_if_statement layout:
+    Note: base@0, condition@8, then_block@16, else_block@24). Reading
+    Note: offset 24 of the base node instead reads the children-ptr and
+    Note: misclassifies every if as having no else, sending the false path
+    Note: to the merge block rather than the else body.
+    Let if_spec be proc memory_get_int64 from Layout with hir_node_ptr, 56
+    Let else_body be 0
+    If if_spec is not equal to 0:
+        Set else_body to proc memory_get_int64 from Layout with if_spec, 24
+    End If
     Let has_else_block be 0
     If else_body is not equal to 0:
         Set has_else_block to 1
@@ -237,9 +250,9 @@ Process called "lower_hir_if_statement_child_exit" that takes ctx as Integer, hi
             proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
         End If
 
-        Note: Emit leader marker (jump-to-self) so CFG construction
-        Note: recognises then_label as a basic-block leader.
-        Let then_marker be proc create_mir_jump from MIRNodes with then_label
+        Note: Emit a non-terminator label marker so CFG construction
+        Note: starts the then-block here and adopts then_label as its id.
+        Let then_marker be proc create_mir_label from MIRNodes with then_label
         If then_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, then_marker
         End If
@@ -252,7 +265,7 @@ Process called "lower_hir_if_statement_child_exit" that takes ctx as Integer, hi
             proc emit_instruction from MIRBuilder with builder_ctx, then_jump
         End If
         If has_else_block is equal to 1:
-            Let else_marker be proc create_mir_jump from MIRNodes with else_label
+            Let else_marker be proc create_mir_label from MIRNodes with else_label
             If else_marker is not equal to 0:
                 proc emit_instruction from MIRBuilder with builder_ctx, else_marker
             End If
@@ -310,7 +323,7 @@ Process called "lower_hir_if_statement_post" that takes ctx as Integer, hir_node
 
     Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
 
-    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    Let merge_marker be proc create_mir_label from MIRNodes with merge_label
     If merge_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
     End If
@@ -379,6 +392,15 @@ Process called "lower_hir_while_statement_pre" that takes ctx as Integer, hir_no
     Let entry_jump be proc create_mir_jump from MIRNodes with header_label
     If entry_jump is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
+    End If
+
+    Note: The header (condition) block is the target of both the entry jump
+    Note: above and the back-edge jump emitted after the body. Emit its label
+    Note: marker so CFG construction adopts header_label as that block's id;
+    Note: otherwise both jumps would target a block id that no block owns.
+    Let header_marker be proc create_mir_label from MIRNodes with header_label
+    If header_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, header_marker
     End If
     Return 1
 End Process
@@ -453,7 +475,7 @@ Process called "lower_hir_while_statement_child_exit" that takes ctx as Integer,
             proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
         End If
 
-        Let body_marker be proc create_mir_jump from MIRNodes with body_label
+        Let body_marker be proc create_mir_label from MIRNodes with body_label
         If body_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, body_marker
         End If
@@ -465,7 +487,7 @@ Process called "lower_hir_while_statement_child_exit" that takes ctx as Integer,
         If back_jump is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, back_jump
         End If
-        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        Let exit_marker be proc create_mir_label from MIRNodes with exit_label
         If exit_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
         End If
@@ -532,12 +554,22 @@ the collection MIR value is the source of both.
 @End Reasoning
 
 @Implementation
-1. Read loop_var_id at HIR_FOR_STATEMENT offset 24 (the symbol id
-   for the loop variable binding).
+1. Read loop_var_id at the base HIR_FOR_STATEMENT node offset 88
+   (the symbol id for the loop variable binding). The HIR producer
+   (lower_for_statement) stamps this slot via set_hir_node_symbol_id;
+   the visitor passes the base node (not the specialised payload) to
+   this pre-handler, so offset 88 is the agreed location. The value
+   is the iterator HIRSymbolInfo pointer, identical to the key the
+   body's identifier references resolve through, so the body binding
+   established in child_enter matches the loop-variable uses.
 2. Save prev_break, prev_continue from builder_ctx.
 3. Allocate header/body/exit labels.
 4. Push FOR frame with the labels, loop_var_id, and saved targets;
-   index_alloca and len_value will be filled in child_exit(0).
+   index_alloca and the iteration length are derived from the lowered
+   collection value in child_exit(0). The iteration bound is read from
+   the collection's length-prefixed header at runtime (see child_exit),
+   so no compile-time count is needed here; offset 40 is left zero and
+   later reused to carry the collection base pointer.
 @End Implementation
 
 @Performance_Hints
@@ -561,7 +593,7 @@ Process called "lower_hir_for_statement_pre" that takes ctx as Integer, hir_node
         Return 0
     End If
 
-    Let loop_var_id be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let loop_var_id be proc memory_get_int64 from Layout with hir_node_ptr, 88
 
     Let header_label be proc allocate_label from MIRBuilder with builder_ctx
     Let body_label be proc allocate_label from MIRBuilder with builder_ctx
@@ -596,11 +628,14 @@ HIR_FOR_STATEMENT child_enter:
 
 @Implementation
 For child_index = 1 (body about to be visited):
-  1. Peek frame; read index_alloca, collection_value (stored at
-     offset 32 and 40 by child_exit(0)).
+  1. Peek frame; read index_alloca and collection_value (stored at
+     offsets 32 and 40 by child_exit(0)) and loop_var_id (offset 48).
   2. Load the current index from index_alloca.
-  3. Load collection[current_index] into an item temp.
-  4. map_hir_to_mir_value(loop_var_id, item_value).
+  3. Compute byte_offset = index * 8 (element stride) and
+     elem_addr = collection_value + byte_offset.
+  4. Load collection[current_index] from elem_addr into an item temp.
+  5. map_hir_to_mir_value(loop_var_id, item_value) so the body binds
+     to the element value, not the iterator index.
 @End Implementation
 
 @Performance_Hints
@@ -632,13 +667,16 @@ Process called "lower_hir_for_statement_child_enter" that takes ctx as Integer, 
     End If
 
     Let index_alloca be proc cf_frame_get_field from LCtx with frame, 32
-    Let len_value be proc cf_frame_get_field from LCtx with frame, 40
+    Let collection_value be proc cf_frame_get_field from LCtx with frame, 40
     Let loop_var_id be proc cf_frame_get_field from LCtx with frame, 48
 
-    Note: The collection value was popped in child_exit(0) and
-    Note: passed into the index-arithmetic emission there. The
-    Note: index_alloca and the loop_var_id mapping happen here so
-    Note: the body's identifier references resolve correctly.
+    Note: child_exit(0) stored the collection base pointer in the len slot
+    Note: (offset 40) and the index cell in offset 32. Load the current
+    Note: index, compute the element address (base + 8 + index * 8), load the
+    Note: element, and bind the loop variable to that element value so the
+    Note: body sees the iterated value rather than the iterator index. The
+    Note: leading +8 skips the length word that prefixes the element data in
+    Note: the list's length-prefixed header layout.
 
     Let current_index be proc allocate_temp_value from MIRBuilder with builder_ctx
     Let load_index be proc create_mir_load from MIRNodes with current_index, index_alloca, 0, 0, 0
@@ -646,11 +684,49 @@ Process called "lower_hir_for_statement_child_enter" that takes ctx as Integer, 
         proc emit_instruction from MIRBuilder with builder_ctx, load_index
     End If
 
-    Note: For this foundation pipeline, the item value is the
-    Note: current index itself; full collection-iteration lowering
-    Note: (gep + load) is a follow-up task once mir_nodes provides
-    Note: the indexed-load helper.
-    proc map_hir_to_mir_value from MIRBuilder with builder_ctx, loop_var_id, current_index
+    Note: Element stride is 8 bytes: list elements are contiguous 8-byte
+    Note: slots (lower_hir_array_literal_post). byte_offset = index * 8.
+    Let stride_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let stride_const be proc create_mir_const from MIRNodes with stride_value, 8, 0, 0, 0
+    If stride_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, stride_const
+    End If
+
+    Let byte_offset be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let mul_inst be proc create_mir_binary_op from MIRNodes with 20004, byte_offset, current_index, stride_value, 0
+    If mul_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, mul_inst
+    End If
+
+    Note: data_base = collection_base + 8 (skip the leading length word), then
+    Note: elem_addr = data_base + byte_offset. A dynamic address is computed
+    Note: explicitly (rather than a static MIR_LOAD displacement) because the
+    Note: index varies per iteration.
+    Let header_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let header_const be proc create_mir_const from MIRNodes with header_value, 8, 0, 0, 0
+    If header_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, header_const
+    End If
+
+    Let data_base be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let data_add be proc create_mir_binary_op from MIRNodes with 20002, data_base, collection_value, header_value, 0
+    If data_add is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, data_add
+    End If
+
+    Let elem_addr be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let add_inst be proc create_mir_binary_op from MIRNodes with 20002, elem_addr, data_base, byte_offset, 0
+    If add_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, add_inst
+    End If
+
+    Let item_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let item_load be proc create_mir_load from MIRNodes with item_value, elem_addr, 0, 0, 0
+    If item_load is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, item_load
+    End If
+
+    proc map_hir_to_mir_value from MIRBuilder with builder_ctx, loop_var_id, item_value
     Return 1
 End Process
 
@@ -731,12 +807,9 @@ Process called "lower_hir_for_statement_child_exit" that takes ctx as Integer, h
             proc emit_instruction from MIRBuilder with builder_ctx, zero_store
         End If
 
-        Note: Use collection_value directly as len_value. Real
-        Note: length computation requires a get_length helper that
-        Note: mir_nodes does not yet expose; this foundation pass
-        Note: treats the collection value as already holding the
-        Note: length (acceptable for For-loop over Integer ranges
-        Note: which is the v0.0.8.5 usage).
+        Note: Reuse the len slot to carry the collection base pointer to the
+        Note: body's element load in child_enter(1); the length itself is now
+        Note: materialised as a constant below.
         proc cf_frame_set_field from LCtx with frame, 32, index_alloca
         proc cf_frame_set_field from LCtx with frame, 40, collection_value
 
@@ -749,14 +822,34 @@ Process called "lower_hir_for_statement_child_exit" that takes ctx as Integer, h
             proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
         End If
 
+        Note: The header (index-test) block is the target of the entry jump
+        Note: above and the back-edge jump after the body. Emit its label
+        Note: marker so CFG construction adopts header_label as its id.
+        Let header_marker be proc create_mir_label from MIRNodes with header_label
+        If header_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, header_marker
+        End If
+
         Let current_index be proc allocate_temp_value from MIRBuilder with builder_ctx
         Let load_index be proc create_mir_load from MIRNodes with current_index, index_alloca, 0, 0, 0
         If load_index is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, load_index
         End If
 
+        Note: Read the iteration length from the collection's length-prefixed
+        Note: header: the list value points to [count(0)][elem0(8)][elem1(16)]...
+        Note: so the element count is the int64 at the collection base. The
+        Note: collection pointer is NOT itself the length; using it as the
+        Note: bound (the prior behaviour) compared the index against a stack
+        Note: address and never terminated.
+        Let len_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let len_load be proc create_mir_load from MIRNodes with len_value, collection_value, 0, 0, 0
+        If len_load is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, len_load
+        End If
+
         Let cond_value be proc allocate_temp_value from MIRBuilder with builder_ctx
-        Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20102, cond_value, current_index, collection_value, 0
+        Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20102, cond_value, current_index, len_value, 0
         If cmp_inst is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, cmp_inst
         End If
@@ -766,7 +859,7 @@ Process called "lower_hir_for_statement_child_exit" that takes ctx as Integer, h
             proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
         End If
 
-        Let body_marker be proc create_mir_jump from MIRNodes with body_label
+        Let body_marker be proc create_mir_label from MIRNodes with body_label
         If body_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, body_marker
         End If
@@ -806,7 +899,7 @@ Process called "lower_hir_for_statement_child_exit" that takes ctx as Integer, h
             proc emit_instruction from MIRBuilder with builder_ctx, back_jump
         End If
 
-        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        Let exit_marker be proc create_mir_label from MIRNodes with exit_label
         If exit_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
         End If
@@ -993,7 +1086,7 @@ Process called "lower_hir_match_statement_child_enter" that takes ctx as Integer
     Let base_offset be arm_index multiplied by 24
     Let check_label be proc memory_get_int64 from Layout with labels_array, base_offset
 
-    Let check_marker be proc create_mir_jump from MIRNodes with check_label
+    Let check_marker be proc create_mir_label from MIRNodes with check_label
     If check_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, check_marker
     End If
@@ -1070,7 +1163,7 @@ Process called "lower_hir_match_statement_child_exit" that takes ctx as Integer,
         proc emit_instruction from MIRBuilder with builder_ctx, merge_jump
     End If
 
-    Let next_marker be proc create_mir_jump from MIRNodes with next_label
+    Let next_marker be proc create_mir_label from MIRNodes with next_label
     If next_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, next_marker
     End If
@@ -1121,7 +1214,7 @@ Process called "lower_hir_match_statement_post" that takes ctx as Integer, hir_n
     If default_jump is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, default_jump
     End If
-    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    Let merge_marker be proc create_mir_label from MIRNodes with merge_label
     If merge_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
     End If
@@ -1233,7 +1326,7 @@ Process called "lower_hir_when_clause_child_exit" that takes ctx as Integer, hir
         proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
     End If
 
-    Let case_marker be proc create_mir_jump from MIRNodes with case_label
+    Let case_marker be proc create_mir_label from MIRNodes with case_label
     If case_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, case_marker
     End If
@@ -1306,7 +1399,7 @@ Process called "lower_hir_try_statement_pre" that takes ctx as Integer, hir_node
     proc cf_frame_set_field from LCtx with frame, 40, exception_var_id
     proc cf_frame_push from LCtx with ctx, frame
 
-    Let try_marker be proc create_mir_jump from MIRNodes with try_label
+    Let try_marker be proc create_mir_label from MIRNodes with try_label
     If try_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, try_marker
     End If
@@ -1363,7 +1456,7 @@ Process called "lower_hir_try_statement_child_exit" that takes ctx as Integer, h
             proc emit_instruction from MIRBuilder with builder_ctx, try_jump
         End If
 
-        Let catch_marker be proc create_mir_jump from MIRNodes with catch_label
+        Let catch_marker be proc create_mir_label from MIRNodes with catch_label
         If catch_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, catch_marker
         End If
@@ -1424,7 +1517,7 @@ Process called "lower_hir_try_statement_post" that takes ctx as Integer, hir_nod
     End If
 
     Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
-    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    Let merge_marker be proc create_mir_label from MIRNodes with merge_label
     If merge_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
     End If
@@ -1553,9 +1646,16 @@ Process called "lower_hir_loop_statement_pre" that takes ctx as Integer, hir_nod
     If entry_jump is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
     End If
-    Let body_marker be proc create_mir_jump from MIRNodes with body_label
-    If body_marker is not equal to 0:
-        proc emit_instruction from MIRBuilder with builder_ctx, body_marker
+
+    Note: For a plain (unconditional) loop the loop-top block IS the body:
+    Note: the entry jump, the back-edge jump, and Continue all target
+    Note: header_label. Emit a single header label marker so that block
+    Note: adopts header_label as its id and the body instructions flow
+    Note: straight into it. body_label is unused for this construct (no
+    Note: branch targets it), so no separate body marker is emitted.
+    Let header_marker be proc create_mir_label from MIRNodes with header_label
+    If header_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, header_marker
     End If
     Return 1
 End Process
@@ -1587,7 +1687,7 @@ Process called "lower_hir_loop_statement_child_exit" that takes ctx as Integer, 
         If back_jump is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, back_jump
         End If
-        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        Let exit_marker be proc create_mir_label from MIRNodes with exit_label
         If exit_marker is not equal to 0:
             proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
         End If
@@ -1723,7 +1823,7 @@ Process called "lower_hir_finally_clause_pre" that takes ctx as Integer, hir_nod
     proc cf_frame_set_field from LCtx with frame, 8, finally_label
     proc cf_frame_push from LCtx with ctx, frame
 
-    Let finally_marker be proc create_mir_jump from MIRNodes with finally_label
+    Let finally_marker be proc create_mir_label from MIRNodes with finally_label
     If finally_marker is not equal to 0:
         proc emit_instruction from MIRBuilder with builder_ctx, finally_marker
     End If

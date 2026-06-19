@@ -108,7 +108,7 @@ Leaders are identified by these rules:
 This algorithm runs in O(n) time where n is the number of instructions.
 @End Reasoning
 
-Process called "build_cfg_from_instructions" that takes function_ptr as Integer returns Integer:
+Process called "build_cfg_from_instructions" that takes function_ptr as Integer, inst_list as Integer returns Integer:
     @Reasoning
     The public entry point for translating a linear MIR instruction stream into
     a structured Control Flow Graph. We delegate to three single-purpose helpers
@@ -158,9 +158,16 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
         Return 0
     End If
 
-    Note: Get the instruction list from the function
-    Let inst_list be proc get_mir_function_instructions with func
-
+    Note: inst_list is the linear MIR emission stream accumulated by the MIR
+    Note: builder (builder context offset 16) across this function's lowering -
+    Note: entry marker, parameter allocas/stores, and the lowered body. CFG
+    Note: construction is precisely the pass that partitions this flat stream
+    Note: into the function's basic blocks, so the stream must be supplied as an
+    Note: input here. (It must NOT be re-derived from the function via
+    Note: get_mir_function_instructions: that accessor re-linearizes from the
+    Note: CFG's already-populated blocks and is the correct source only for
+    Note: later passes that consume a built CFG. At this point the CFG is empty,
+    Note: so reading it back would yield nothing and the body would be dropped.)
     If inst_list is equal to 0:
         Note: No instructions to process
         Return cfg_ptr
@@ -313,6 +320,22 @@ Process called "identify_basic_block_leaders" that takes inst_list as Integer re
                 If next_idx is less than inst_count:
                     list_append(leaders, next_idx)
                 End If
+            End If
+
+            Note: A MIR_LABEL marker begins a labeled region. The marker is
+            Note: emitted at the start of every block that is a branch/jump
+            Note: target, and carries that block's label id. Marking the
+            Note: marker index as a leader guarantees the labeled region
+            Note: becomes its own basic block, whose id is then derived from
+            Note: the marker's label in create_basic_blocks_from_leaders.
+            Note: This reconciles the branch-target label namespace with the
+            Note: block-id namespace. (Markers already fall after a
+            Note: terminator in well-formed streams, but marking explicitly
+            Note: is robust against any future emission that places a marker
+            Note: after a non-terminator.)
+            Let inst_opcode be proc get_mir_node_opcode with inst_ptr
+            If inst_opcode is equal to MIR_LABEL:
+                list_append(leaders, i)
             End If
         End If
 
@@ -470,7 +493,41 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
     End If
 
     Let inst_count be proc list_length with inst_list
-    Let block_id be 0
+
+    Note: ----------------------------------------------------------------
+    Note: Block-id derivation from label markers
+    Note: ----------------------------------------------------------------
+    Note: Branch / jump targets are allocate_label values; a labeled region
+    Note: carries its label in a leading MIR_LABEL marker. A block's
+    Note: canonical id is therefore the label of its leading marker, so that
+    Note: a target (label value) resolves to the block that owns it.
+    Note: Blocks with no leading marker (e.g. a fall-through block right
+    Note: after a terminator that no branch targets, or any future
+    Note: marker-less region) must NOT collide with any label. We first scan
+    Note: every marker to find the maximum label, then hand marker-less
+    Note: blocks ids from max_label + 1 upward. The function-entry block
+    Note: carries label 0 via its entry marker and thus keeps canonical id 0,
+    Note: which get_or_create_lir_block relies on to flag the entry block.
+    Note: ----------------------------------------------------------------
+    Let max_label be negative 1
+    Let scan_idx be 0
+    While scan_idx is less than inst_count:
+        Let scan_inst be proc list_get with inst_list, scan_idx
+        If scan_inst is not equal to 0:
+            Let scan_opcode be proc get_mir_node_opcode with scan_inst
+            If scan_opcode is equal to MIR_LABEL:
+                Let scan_label be proc get_mir_label_id with scan_inst
+                If scan_label is greater than max_label:
+                    Set max_label to scan_label
+                End If
+            End If
+        End If
+        Set scan_idx to scan_idx plus 1
+    End While
+
+    Note: Next free id for marker-less blocks, guaranteed above every label.
+    Let next_unlabeled_id be max_label plus 1
+
     Let i be 0
 
     While i is less than leader_count:
@@ -490,6 +547,33 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
             Set end_idx to inst_count minus 1
         End If
 
+        Note: Derive this block's canonical id. If the first instruction in
+        Note: the range is a MIR_LABEL marker, the block id is the marker's
+        Note: label and the marker is stripped from the block body (it is a
+        Note: pure positional/identity annotation with no runtime effect).
+        Note: Otherwise the block has no marker and is assigned a fresh id
+        Note: above every label so it cannot collide with a branch target.
+        Let block_id be 0
+        Let body_start be start_idx
+
+        Let first_inst be 0
+        If start_idx is less than inst_count:
+            Set first_inst to proc list_get with inst_list, start_idx
+        End If
+
+        Let first_opcode be negative 1
+        If first_inst is not equal to 0:
+            Set first_opcode to proc get_mir_node_opcode with first_inst
+        End If
+
+        If first_opcode is equal to MIR_LABEL:
+            Set block_id to proc get_mir_label_id with first_inst
+            Set body_start to start_idx plus 1
+        Otherwise:
+            Set block_id to next_unlabeled_id
+            Set next_unlabeled_id to next_unlabeled_id plus 1
+        End If
+
         Note: Create basic block for this range
         Let block_ptr be proc create_mir_basic_block with block_id, 0
 
@@ -503,8 +587,10 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
         Note: List (MIRBasicBlock offset 16), maintains the cached count
         Note: (offset 24), and sets the instruction's parent_block back
         Note: pointer, so the block's first/last instructions are derivable
-        Note: from the List itself.
-        Let inst_idx be start_idx
+        Note: from the List itself. The leading label marker (if any) is
+        Note: skipped via body_start so it never reaches the block body or
+        Note: any downstream consumer (LIR lowering, verifier, printer).
+        Let inst_idx be body_start
 
         While inst_idx is less than or equal to end_idx:
             If inst_idx is less than inst_count:
@@ -521,7 +607,6 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
         Note: Add block to CFG
         add_block_to_cfg(cfg_ptr, block_ptr)
 
-        Set block_id to block_id plus 1
         Set i to i plus 1
     End While
 
