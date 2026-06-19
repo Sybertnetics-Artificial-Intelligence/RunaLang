@@ -198,9 +198,22 @@ Process called "get_or_create_lir_block" that takes builder as Integer, mir_bloc
     End If
 
     Let block_mapping be proc memory_get_int64 from Layout with builder, 24
-    Let existing_block be proc omap_get from OrderedMap with block_mapping, mir_block_id
 
-    If existing_block is not equal to 0:
+    Note:
+    Membership must be tested with omap_contains, NOT with "omap_get != 0".
+    The entry block (MIR id 0) maps to LIR block id 0, and lir_add_block
+    returns 0 as the first valid block id, so its stored value is literally 0
+    — indistinguishable from omap_get's not-found sentinel. A value-against-0
+    test therefore mistakes the already-created entry block for an absent one
+    and creates a SECOND block on every re-reference, which strands the real
+    entry block (and the scrutinee/parameter setup emitted into it) inside a
+    duplicate block.
+    omap_contains distinguishes "key present with value 0" from "key absent",
+    so a block mapped to LIR id 0 is returned rather than re-created.
+    :End Note
+    Let already_mapped be proc omap_contains from OrderedMap with block_mapping, mir_block_id
+    If already_mapped is equal to 1:
+        Let existing_block be proc omap_get from OrderedMap with block_mapping, mir_block_id
         Return existing_block
     End If
 
@@ -2626,6 +2639,44 @@ Process called "lower_mir_function_to_lir" that takes mir_function as Integer, c
     Note: Create stack frame for function
     Let lir_function be proc memory_get_int64 from Layout with builder, 8
     Let stack_frame be proc lir_create_stack_frame from LIR with lir_function
+
+    Note:
+    Pre-create every LIR block in MIR CFG order BEFORE lowering any
+    instruction. lir_add_block assigns each block an id equal to the current
+    block count and appends it to the function's block List, so the order in
+    which blocks are first created is simultaneously their id order AND their
+    physical position in the block List the assembler emits sequentially.
+
+    Without this pass blocks are created lazily on first reference. A Match (or
+    any) arm body whose terminator is a forward "jmp merge" creates the merge
+    block EARLY — between two arms — so the merge block lands physically before
+    the later arms, the false/fall path of arm 0 runs into the merge, and arms
+    1+ are emitted after the merge and become unreachable. If/While/For-Each
+    escaped this only because they happen to reference both branch targets
+    before any body jump, making lazy creation order coincide with CFG order.
+
+    Creating the blocks here in mir_blocks order (which the CFG builder already
+    materializes with the entry block first and the remaining blocks in
+    program order) makes creation order == id order == List/emission order ==
+    CFG order for ALL control-flow shapes. Because lir_get_block (used by
+    liveness/regalloc to resolve a successor by its block id) indexes the block
+    List by id, keeping id == List position is mandatory; pre-creating in CFG
+    order satisfies that invariant exactly while also giving the assembler the
+    correct fall-through order. The subsequent lowering loop's
+    get_or_create_lir_block calls become cache hits, so a forward jump can no
+    longer append a block out of order. The entry block (mir id 0) is created
+    first and thus keeps LIR id 0 with its is_entry flag, so no setup or
+    parameter-binding instruction can be displaced into a later block.
+    :End Note
+    Let pre be 0
+    While pre is less than block_count:
+        Let pre_block be proc get from List with mir_blocks, pre
+        If pre_block is not equal to 0:
+            Let pre_block_id be proc memory_get_int64 from Layout with pre_block, 0
+            proc get_or_create_lir_block with builder, pre_block_id
+        End If
+        Set pre to pre plus 1
+    End While
 
     Note: Lower all basic blocks. The entry block (index 0) additionally
     Note: receives the calling-convention parameter-binding prologue, emitted as
