@@ -1712,110 +1712,177 @@ Process called "parse_function_pointer_expression" takes parser as Integer retur
 End Process
 
 Process called "parse_proc_call_expression" takes parser as Integer returns Integer:
-    Note: Parse an indirect function call expression (proc variable with arg1, arg2, ...)
-    Note: .
-    Note: Parameters:
-    Note:   parser - Pointer to ParserState
-    Note: .
-    Note: Returns:
-    Note:   Pointer to indirect call AST node
-    Note:   Returns 0 on parsing error
-    Note: .
-    Note: Syntax: proc variable with arg1, arg2, ...
-    Note: OR: proc variable (no arguments)
-    Note: .
-    Note: Algorithm:
-    Note: 1. Expect and consume proc keyword
-    Note: 2. Parse expression for function value (variable holding function pointer)
-    Note: 3. Check for "with" keyword
-    Note: 4. If "with" present: parse comma-separated argument list
-    Note: 5. Create indirect call expression AST node
-    Note: 6. Return indirect call AST node
+    @Reasoning
+    The `proc` keyword introduces a NAMED function call, optionally qualified by
+    the defining module: `proc func [.field | from Module] [with arg, ...]`. This
+    is the dominant cross-module call surface in the self-hosting compiler source
+    (e.g. `proc allocate from Layout`, `proc memory_get_int64 from Layout with t,
+    0`). It is NOT an indirect call through a function-pointer variable -- the
+    monolith stage1 (parser.runa::parser_parse_proc_expression) reads the callee
+    as a bare NAME token and always emits a direct function call, never an
+    indirect dispatch. Replicating that here is required for self-host: the
+    previous implementation parsed the callee as a primary expression, never
+    consumed the `from Module` qualifier, and built an AST_INDIRECT_CALL node.
+    That left the `from Module ...` tail unparsed, so the whole enclosing Process
+    failed to parse and was dropped; and even the unqualified `proc f with a` form
+    lowered to an indirect node that produced no call instruction at all.
+    @End Reasoning
+
+    @Implementation
+    1. Consume the `proc` keyword.
+    2. Read the function-NAME token's value (any token type may name a function;
+       keyword/type tokens carry their lexeme as the value), then consume it.
+    3. Optional dot qualifier `proc Module.func`: when the next token is TOKEN_DOT,
+       the first name was the module alias -- consume the dot and read the real
+       function-name token as the callee name.
+    4. Optional `from Module` qualifier: when the next token is TOKEN_FROM, consume
+       it and the following module-name token. Module qualifiers are source-level
+       only; the import system flattens every imported function into the program
+       table under its PLAIN name, so resolution (and the emitted symbol) keys off
+       the plain function name exactly as the monolith's EXPR_QUALIFIED_CALL codegen
+       resolves by offset-16 plain name. The module token is therefore consumed but
+       does not change the callee symbol.
+    5. Optional `with` argument clause: parse the canonical comma/and-separated
+       argument sequence into a List, reusing parse_with_single_argument so each
+       argument parses at the with-argument precedence floor (trailing comparisons
+       and logical operators bind to the whole call, not the last argument).
+    6. Build a plain AST_CALL_EXPRESSION whose callee is a fresh identifier node
+       carrying the plain function name -- the same node shape the canonical
+       `callee with args` and paren-call forms produce, so it shares the existing
+       direct-call HIR lowering and emits `callq <func>`.
+    @End Implementation
+
+    @Performance_Hints
+    A handful of token reads/consumes plus one List allocation and a linear
+    argument scan. Cold relative to the per-token Pratt loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    Every name token's value is read defensively; a null callee name aborts the
+    parse (returns 0) rather than fabricating an unnamed call. A null argument
+    parse aborts the whole call so no partially built node with dangling arguments
+    escapes.
+    @End Security_Scope
 
     If parser is equal to 0:
         Return 0
     End If
 
-    Note: Get current token position for error reporting
-    Let current_token be proc parser_current_token from Parser with parser
-    Let line be proc token_get_line from Parser with current_token
-    Let column be proc token_get_column from Parser with current_token
+    Note: Capture the call position from the 'proc' keyword token.
+    Let proc_token be proc parser_current_token from Parser with parser
+    Let line be proc token_get_line from Parser with proc_token
+    Let column be proc token_get_column from Parser with proc_token
 
-    Note: Expect and consume proc keyword
+    Note: 1. Expect and consume 'proc' keyword.
     Let result be proc parser_expect_token from Parser with parser, TOKEN_PROC
     If result is equal to 0:
         Return 0
     End If
 
-    Note: Parse expression for function value (variable, member access, etc.)
-    Let function_value be proc parse_primary_expression with parser
+    Note: 2. Read the function-name token (any token type may name a function;
+    Note: keyword/type tokens carry their lexeme as the value), then consume it.
+    Let name_token be proc parser_current_token from Parser with parser
+    If name_token is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected function name after 'proc' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+    Let func_name be proc token_get_value from Parser with name_token
+    Let name_line be proc token_get_line from Parser with name_token
+    Let name_column be proc token_get_column from Parser with name_token
+    proc parser_consume_token from Parser with parser
 
-    If function_value is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after 'proc' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+    Note: 3. Optional dot qualifier: `proc Module.func`. The first name was the
+    Note: module alias; the real callee name follows the dot.
+    Let qual_token be proc parser_current_token from Parser with parser
+    Let qual_type be proc token_get_type from Parser with qual_token
+    If qual_type is equal to TOKEN_DOT:
+        proc parser_consume_token from Parser with parser
+        Let dot_name_token be proc parser_current_token from Parser with parser
+        If dot_name_token is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected function name after '.' in qualified proc call", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+        Set func_name to proc token_get_value from Parser with dot_name_token
+        proc parser_consume_token from Parser with parser
+    End If
+
+    Note: 4. Optional `from Module` qualifier. The module name is source-level only
+    Note: -- imported functions are flattened under their plain name, so the module
+    Note: token is consumed but does not change the callee symbol.
+    Set qual_token to proc parser_current_token from Parser with parser
+    Set qual_type to proc token_get_type from Parser with qual_token
+    If qual_type is equal to TOKEN_FROM:
+        proc parser_consume_token from Parser with parser
+        Let module_token be proc parser_current_token from Parser with parser
+        If module_token is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected module name after 'from' in qualified proc call", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+        proc parser_consume_token from Parser with parser
+    End If
+
+    If func_name is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Missing function name in proc call", name_line, name_column
         Return 0
     End If
 
-    Note: Check for "with" keyword indicating arguments
-    Set current_token to proc parser_current_token from Parser with parser
-    Let token_type be proc token_get_type from Parser with current_token
+    Note: Build the callee identifier carrying the plain function name.
+    Let callee be proc build_identifier_node from ASTBuilder with func_name, name_line, name_column
+    If callee is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create proc-call callee identifier AST node", name_line, name_column
+        Return 0
+    End If
 
-    Let arguments be 0
+    Note: Allocate the argument list (empty when there is no `with` clause).
+    Let arguments be proc create from List
+    If arguments is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create proc-call argument list", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
     Let argument_count be 0
 
-    If token_type is equal to TOKEN_WITH:
-        Note: Consume "with" keyword
+    Note: 5. Optional `with` argument clause.
+    Let with_token be proc parser_current_token from Parser with parser
+    Let with_type be proc token_get_type from Parser with with_token
+    If with_type is equal to TOKEN_WITH:
         proc parser_consume_token from Parser with parser
 
-        Note: Create list for arguments
-        Set arguments to proc create from List
-        If arguments is equal to 0:
-            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create argument list", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
-            Return 0
-        End If
-
-        Note: Parse comma-separated argument list
         Loop forever:
-            Note: Parse argument expression
-            Let arg be proc parse_expression with parser
-
+            Let arg be proc parse_with_single_argument with parser
             If arg is equal to 0:
-                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression in argument list", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected argument expression after 'with' in proc call", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
                 Return 0
             End If
 
-            Note: Add argument to list
             proc list_append from List with arguments, arg
             Set argument_count to argument_count plus 1
 
-            Note: Check for comma (more arguments)
-            Set current_token to proc parser_current_token from Parser with parser
-            Set token_type to proc token_get_type from Parser with current_token
+            Note: Continue on an "and" or "," separator introducing another argument.
+            Let sep_token be proc parser_current_token from Parser with parser
+            Let sep_type be proc token_get_type from Parser with sep_token
 
-            If token_type is equal to TOKEN_COMMA:
-                Note: Consume comma and continue to next argument
+            If sep_type is equal to TOKEN_AND:
                 proc parser_consume_token from Parser with parser
                 Continue
             End If
 
-            Note: No comma, done with arguments
+            If sep_type is equal to TOKEN_COMMA:
+                proc parser_consume_token from Parser with parser
+                Continue
+            End If
+
             Break
         End While
     End If
 
-    Note: If no arguments, create empty list
-    If arguments is equal to 0:
-        Set arguments to proc create from List
-    End If
-
-    Note: Build indirect call expression AST node
-    Let indirect_call_node be proc build_indirect_call_expression from ASTBuilder with function_value, arguments, argument_count, line, column
-
-    If indirect_call_node is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create indirect call AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+    Note: 6. Build the direct call node (shared AST_CALL_EXPRESSION shape).
+    Let call_node be proc build_call_expression from ASTBuilder with callee, arguments, argument_count, line, column
+    If call_node is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create proc-call expression AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
     End If
 
-    Return indirect_call_node
+    Return call_node
 End Process
 
 Note: ============================================================================
