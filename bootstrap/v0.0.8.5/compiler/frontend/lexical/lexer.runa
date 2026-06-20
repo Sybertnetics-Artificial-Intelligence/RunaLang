@@ -683,20 +683,42 @@ Process called "lexer_next_token" takes lexer as Integer returns Integer:
         Set start_line to proc memory_get_qword from Layout with lexer, 24
         Set start_column to proc memory_get_qword from Layout with lexer, 32
 
+        Note: Tokenize the operator. The operator tokenizers classify the
+        Note: character (and any second character for multi-char operators) and
+        Note: record the operator length in the token's length field (offset 32),
+        Note: but they do NOT move the lexer cursor. The cursor must be advanced
+        Note: here by exactly the operator length, otherwise the main lexer loop
+        Note: re-reads the same operator character forever (unbounded token
+        Note: allocation -> process killed). This mirrors the delimiter branch
+        Note: above.
+        Set token to 0
+
         Note: Try @ operator first (type annotation marker)
         If current_char is equal to 64:  Note: @ symbol
             Set token to proc tokenize_at_operator from Operators with lexer, current_char, start_line, start_column
-            Return token
-        End If
-
-        Note: Try $ operator (function pointer operator)
-        If current_char is equal to 36:  Note: $ symbol
+        Otherwise If current_char is equal to 36:  Note: $ symbol (function pointer operator)
             Set token to proc tokenize_dollar_operator from Operators with lexer, current_char, start_line, start_column
-            Return token
+        Otherwise:
+            Note: Mathematical, comparison, logical, and bitwise operators
+            Set token to proc tokenize_math_operator from MathSymbols with lexer, current_char, start_line, start_column
         End If
 
-        Note: Try mathematical operators
-        Set token to proc tokenize_math_operator from MathSymbols with lexer, current_char, start_line, start_column
+        If token is equal to 0:
+            Return 0  Note: Unrecognized operator or allocation failure
+        End If
+
+        Note: Advance the lexer cursor past the consumed operator. The operator
+        Note: length (1 for single-char operators, 2 for multi-char operators
+        Note: such as **, ==, !=, <=, >=, <<, >>) is stored at token offset 32.
+        Let op_token_length be proc memory_get_qword from Layout with token, 32
+        If op_token_length is less than 1:
+            Set op_token_length to 1  Note: Guarantee forward progress
+        End If
+        Let op_position be proc memory_get_qword from Layout with lexer, 16
+        Let op_column be proc memory_get_qword from Layout with lexer, 32
+        proc memory_set_qword from Layout with lexer, 16, op_position plus op_token_length
+        proc memory_set_qword from Layout with lexer, 32, op_column plus op_token_length
+
         Return token
     End If
 
@@ -722,6 +744,18 @@ Process called "lexer_next_token" takes lexer as Integer returns Integer:
     Let ascii_str be proc integer_to_string from StringPrimitive with current_char
     Set error_msg to proc string_concat from StringPrimitive with error_msg, ascii_str
     Set error_msg to proc string_concat from StringPrimitive with error_msg, ")"
+
+    Note: Advance the lexer cursor past the unrecognized character BEFORE
+    Note: producing the error token. lexer_create_error_token records the error
+    Note: at the current position but does NOT move the cursor; without this
+    Note: advance the main lexer loop re-reads the same unrecognized character
+    Note: forever (unbounded error-token allocation -> process killed). Skipping
+    Note: exactly one byte guarantees forward progress and lets lexing continue
+    Note: past the offending character for error recovery.
+    Let err_position be proc memory_get_qword from Layout with lexer, 16
+    Let err_column be proc memory_get_qword from Layout with lexer, 32
+    proc memory_set_qword from Layout with lexer, 16, err_position plus 1
+    proc memory_set_qword from Layout with lexer, 32, err_column plus 1
 
     Let error_token be proc lexer_create_error_token with lexer, error_msg
     Return error_token
@@ -1001,84 +1035,120 @@ Process called "lexer_handle_comment" takes lexer as Integer returns Integer:
     Let source be proc memory_get_qword from Layout with lexer, 0
     Let length be proc memory_get_qword from Layout with lexer, 8
 
-    Note: Track whether this is multi-line comment
+    Note:
+    Disambiguate single-line vs block comment.
+
+    Runa has two comment forms. A single-line comment is the Note keyword and
+    colon followed by text on the SAME line; it ends at the next newline, and
+    that newline is NOT consumed (it is left for whitespace skipping and line
+    tracking). A block comment is the Note keyword and colon alone on its line
+    (only whitespace after the colon up to the newline), followed by body lines,
+    terminated by the End-Note marker, which is consumed.
+
+    The opening line is examined first: if any non-whitespace character appears
+    after the opener before the newline, the comment is single-line; otherwise
+    it is a block comment. This matches the reference compiler semantics exactly.
+    :End Note
     Let is_multiline be 0
     Let end_found be 0
 
-    Note: Scan to end of line or ":End Note"
+    Note: Scan the remainder of the opening line to classify the comment form.
+    Let probe be position
+    Let opener_has_content be 0
     Loop forever:
-        If position is greater than or equal to length:
-            Break  Note: End of source
+        If probe is greater than or equal to length:
+            Break  Note: End of source on opening line
         End If
-
-        Let current_char be proc string_char_at from StringCore with source, position
-
-        Note: Check for newline
-        If current_char is equal to 10:  Note: Newline
-            Note: Check if multi-line comment continues
-            Let next_pos be position plus 1
-            If next_pos is less than length:
-                Note: Peek ahead - if not at ":End Note", it's multi-line
-                Let peek_char be proc string_char_at from StringCore with source, next_pos
-                If peek_char is not equal to 58:  Note: Not starting with ':'
-                    Set is_multiline to 1
-                    Set position to next_pos
-                    Set line to line plus 1
-                    Set column to 1
-                    Note: Continue scanning
-                Otherwise:
-                    Note: Might be ":End Note", check further
-                    Break  Note: End of line, check for terminator
-                End If
-            Otherwise:
-                Break  Note: End of source
-            End If
+        Let probe_char be proc string_char_at from StringCore with source, probe
+        If probe_char is equal to 10:  Note: Newline ends the opening line
+            Break
+        End If
+        Note: Treat space (32) and tab (9) as whitespace; anything else is content
+        If probe_char is equal to 32:
+            Set probe to probe plus 1
+        Otherwise If probe_char is equal to 9:
+            Set probe to probe plus 1
         Otherwise:
-            Note: Check for ":End Note" terminator (multi-line comment)
-            If current_char is equal to 58:  Note: Colon ':'
-                Note: Check if followed by "End Note"
-                Let check_pos be position plus 1
-                Let matches_end be 1
-
-                Note: Check "End Note" (8 characters: "End Note")
-                Let expected_end be "End Note"
-                Let check_index be 0
-                Loop forever:
-                    If check_index is greater than or equal to 8:
-                        Break
-                    End If
-
-                    If check_pos plus check_index is greater than or equal to length:
-                        Set matches_end to 0
-                        Break
-                    End If
-
-                    Let check_char be proc string_char_at from StringCore with source, check_pos plus check_index
-                    Let expected_char be proc string_char_at from StringCore with expected_end, check_index
-
-                    If check_char is not equal to expected_char:
-                        Set matches_end to 0
-                        Break
-                    End If
-
-                    Set check_index to check_index plus 1
-                End While
-
-                If matches_end is equal to 1:
-                    Note: Found ":End Note" terminator
-                    Set is_multiline to 1
-                    Set end_found to 1
-                    Set position to position plus 9  Note: Skip ":End Note" (9 chars)
-                    Set column to column plus 9
-                    Break
-                End If
-            End If
-
-            Note: Regular character in comment
-            Set position to position plus 1
-            Set column to column plus 1
+            Set opener_has_content to 1
+            Break
         End If
     End While
+
+    If opener_has_content is equal to 1:
+        Note: SINGLE-LINE comment: consume up to (but not including) the newline.
+        Loop forever:
+            If position is greater than or equal to length:
+                Break  Note: End of source
+            End If
+            Let sl_char be proc string_char_at from StringCore with source, position
+            If sl_char is equal to 10:  Note: Newline terminates the comment
+                Break
+            End If
+            Set position to position plus 1
+            Set column to column plus 1
+        End While
+    Otherwise:
+        Note: BLOCK comment: scan subsequent lines until ":End Note".
+        Set is_multiline to 1
+        Loop forever:
+            If position is greater than or equal to length:
+                Break  Note: End of source (unterminated block; recovered)
+            End If
+
+            Let current_char be proc string_char_at from StringCore with source, position
+
+            If current_char is equal to 10:  Note: Newline
+                Note: Advance onto the first character of the next line and keep
+                Note: scanning. Every iteration advances position, guaranteeing
+                Note: forward progress regardless of the body characters.
+                Set position to position plus 1
+                Set line to line plus 1
+                Set column to 1
+            Otherwise:
+                Note: Check for ":End Note" terminator
+                If current_char is equal to 58:  Note: Colon ':'
+                    Let check_pos be position plus 1
+                    Let matches_end be 1
+
+                    Note: Check "End Note" (8 characters)
+                    Let expected_end be "End Note"
+                    Let check_index be 0
+                    Loop forever:
+                        If check_index is greater than or equal to 8:
+                            Break
+                        End If
+
+                        If check_pos plus check_index is greater than or equal to length:
+                            Set matches_end to 0
+                            Break
+                        End If
+
+                        Let check_char be proc string_char_at from StringCore with source, check_pos plus check_index
+                        Let expected_char be proc string_char_at from StringCore with expected_end, check_index
+
+                        If check_char is not equal to expected_char:
+                            Set matches_end to 0
+                            Break
+                        End If
+
+                        Set check_index to check_index plus 1
+                    End While
+
+                    If matches_end is equal to 1:
+                        Note: Found ":End Note" terminator
+                        Set end_found to 1
+                        Set position to position plus 9  Note: Skip ":End Note" (9 chars)
+                        Set column to column plus 9
+                        Break
+                    End If
+                End If
+
+                Note: Regular character in block comment body
+                Set position to position plus 1
+                Set column to column plus 1
+            End If
+        End While
+    End If
 
     Note: Update lexer position, line, and column (offsets 16, 24, 32)
     proc memory_set_qword from Layout with lexer, 16, position
