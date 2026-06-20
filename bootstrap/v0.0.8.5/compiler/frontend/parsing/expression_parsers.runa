@@ -745,6 +745,20 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
                     Return proc parse_canonical_list_literal with parser
                 End If
             End If
+
+            Note: Struct constructor form: "a value of type TypeName [with ...]". The
+            Note: word "value" lexes as an identifier; the following "of" confirms the
+            Note: constructor rather than a plain variable named "value". Without this
+            Note: the article path falls through to the generic identifier branch and
+            Note: "value of type T" is left dangling, dropping the whole statement.
+            Let cl_next_is_value be proc primary_token_value_is with cl_next, "value"
+            If cl_next_is_value is equal to 1:
+                Let cl_after_value be proc parser_peek_token from Parser with parser, 2
+                Let cl_after_value_type be proc token_get_type from Parser with cl_after_value
+                If cl_after_value_type is equal to TOKEN_OF:
+                    Return proc parse_a_value_of_type_construction with parser
+                End If
+            End If
         End If
     End If
 
@@ -2463,6 +2477,172 @@ Process called "primary_token_value_is" takes token as Integer, literal as Integ
     End If
     Let target be proc create_from_literal from StringCore with literal
     Return proc string_equals from StringCore with token_value, target
+End Process
+
+Process called "parse_a_value_of_type_construction" takes parser as Integer returns Integer:
+    Note: Parse the canonical struct constructor "a value of type TypeName [with field as value, ...]".
+
+    Note: Grammar (caller has confirmed the two-token prefix article/"value"):
+    Note:   a|an value of type TypeName
+    Note:   a|an value of type TypeName[GenericArgs]
+    Note:   a|an value of type TypeName with f1 as e1, f2 as e2, ...
+    Note: The leading article ("a"/"an") is the current token on entry; this parser
+    Note: consumes the article, "value", "of", "type", the type name (and any bracketed
+    Note: generic arguments), and an optional "with" field-initializer clause.
+
+    Note: The result is an AST_RECORD_LITERAL (1013) whose value field carries the type
+    Note: name string and whose children are the field VALUE expressions in source order.
+    Note: This reuses the existing record-literal HIR lowering (lower_record_literal),
+    Note: which allocates the aggregate and stores each field value at its positional
+    Note: slot; a field-less constructor lowers to a bare aggregate allocation, exactly
+    Note: what the "Set obj.field to value" follow-up statements then write into.
+
+    Note: Parameters:
+    Note:   parser - Pointer to ParserState
+
+    Note: Returns:
+    Note:   Pointer to AST_RECORD_LITERAL node, or 0 on parsing error.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Capture the source position of the article token for node anchoring.
+    Let article_token be proc parser_current_token from Parser with parser
+    Let ctor_line be proc token_get_line from Parser with article_token
+    Let ctor_column be proc token_get_column from Parser with article_token
+
+    Note: Consume the article ("a"/"an") and the "value" keyword (lexed as identifier).
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+
+    Note: Consume "of" (TOKEN_OF).
+    Let of_consumed be proc parser_expect_token from Parser with parser, TOKEN_OF
+    If of_consumed is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'of' after 'a value' in struct constructor", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Note: Consume "type". Canonical Runa lexes the declaration keyword as TOKEN_TYPE;
+    Note: accept either that keyword or a bare identifier valued "type" for resilience.
+    Let type_kw_token be proc parser_current_token from Parser with parser
+    Let type_kw_type be proc token_get_type from Parser with type_kw_token
+    Let type_kw_ok be 0
+    If type_kw_type is equal to TOKEN_TYPE:
+        Set type_kw_ok to 1
+    End If
+    If type_kw_ok is equal to 0:
+        Set type_kw_ok to proc primary_token_value_is with type_kw_token, "type"
+    End If
+    If type_kw_ok is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'type' after 'a value of' in struct constructor", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+    proc parser_consume_token from Parser with parser
+
+    Note: Capture the type name token (an identifier).
+    Let type_name_token be proc parser_current_token from Parser with parser
+    If type_name_token is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected type name in struct constructor", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+    Let type_name be proc token_get_value from Parser with type_name_token
+    proc parser_consume_token from Parser with parser
+
+    Note: Skip optional bracketed generic arguments after the type name
+    Note: (e.g. "Dictionary[String, Integer]"). Track nesting so nested generics
+    Note: are consumed fully; bail on EOF to guarantee forward progress.
+    Let gen_token be proc parser_current_token from Parser with parser
+    Let gen_type be proc token_get_type from Parser with gen_token
+    If gen_type is equal to TOKEN_LEFT_BRACKET:
+        proc parser_consume_token from Parser with parser
+        Let gen_depth be 1
+        Loop forever:
+            If gen_depth is equal to 0:
+                Break
+            End If
+            Let gen_inner be proc parser_current_token from Parser with parser
+            If gen_inner is equal to 0:
+                Break
+            End If
+            Let gen_inner_type be proc token_get_type from Parser with gen_inner
+            If gen_inner_type is equal to TOKEN_EOF:
+                Break
+            End If
+            If gen_inner_type is equal to TOKEN_LEFT_BRACKET:
+                Set gen_depth to gen_depth plus 1
+            End If
+            If gen_inner_type is equal to TOKEN_RIGHT_BRACKET:
+                Set gen_depth to gen_depth minus 1
+            End If
+            proc parser_consume_token from Parser with parser
+        End While
+    End If
+
+    Note: Build the record-literal node; the type name rides in the value slot so a
+    Note: later named-field resolution pass can compute real field offsets.
+    Let ctor_node be proc create_ast_node from AST with 1013, ctor_line, ctor_column
+    If ctor_node is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create struct constructor AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+    proc ast_node_set_value from AST with ctor_node, type_name, 1
+
+    Note: Optional "with field as value [, field as value]..." initializer clause.
+    Let with_token be proc parser_current_token from Parser with parser
+    Let with_type be proc token_get_type from Parser with with_token
+    If with_type is equal to TOKEN_WITH:
+        proc parser_consume_token from Parser with parser
+
+        Loop forever:
+            Note: Each initializer is "field_name as value_expression". A field name is
+            Note: an identifier or string literal; anything else ends the clause.
+            Let field_token be proc parser_current_token from Parser with parser
+            If field_token is equal to 0:
+                Break
+            End If
+            Let field_tt be proc token_get_type from Parser with field_token
+            Let field_is_name be 0
+            If field_tt is equal to TOKEN_IDENTIFIER:
+                Set field_is_name to 1
+            End If
+            If field_tt is equal to TOKEN_STRING_LITERAL:
+                Set field_is_name to 1
+            End If
+            If field_is_name is equal to 0:
+                Break
+            End If
+
+            Note: Consume the field name then the mandatory "as".
+            proc parser_consume_token from Parser with parser
+            Let as_consumed be proc parser_expect_token from Parser with parser, TOKEN_AS
+            If as_consumed is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'as' after field name in struct constructor", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            Let field_value be proc parse_expression with parser
+            If field_value is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected field value expression in struct constructor", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+            proc ast_node_add_child from AST with ctor_node, field_value
+
+            Note: A comma (or natural-language "and") continues the field list.
+            Let sep_token be proc parser_current_token from Parser with parser
+            Let sep_type be proc token_get_type from Parser with sep_token
+            If sep_type is equal to TOKEN_COMMA:
+                proc parser_consume_token from Parser with parser
+                Continue
+            End If
+            If sep_type is equal to TOKEN_AND:
+                proc parser_consume_token from Parser with parser
+                Continue
+            End If
+            Break
+        End While
+    End If
+
+    Return ctor_node
 End Process
 
 Process called "parse_canonical_list_literal" takes parser as Integer returns Integer:
