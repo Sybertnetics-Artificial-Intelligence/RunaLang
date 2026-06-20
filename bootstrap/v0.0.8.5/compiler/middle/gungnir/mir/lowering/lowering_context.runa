@@ -56,7 +56,17 @@ Constant LOWERING_DISPATCH_TABLE_BYTES as Integer is 160000
 Note: LoweringContext field offsets (9 fields, 72 bytes total).
 Constant LCTX_OFFSET_BUILDER_CTX as Integer is 0
 Constant LCTX_OFFSET_RESULT_STACK as Integer is 8
-Constant LCTX_OFFSET_INSTRUCTION_ACC as Integer is 16
+Note:
+Offset 16 was an "instruction accumulator" that the design never used
+(emission goes through the builder context's instruction list). It is
+repurposed here as the FUNCTIONS accumulator: the dedicated List into which
+the top-level definition post-handlers (PROCESS_DEFINITION,
+EXTERNAL_DECLARATION) record each completed MIRFunction pointer. Keeping the
+functions in their own List — separate from the result stack, which carries
+small integer MIR value-ids — is what lets lower_hir_program harvest the real
+functions without ever interpreting a leftover value-id as a function pointer.
+:End Note
+Constant LCTX_OFFSET_FUNCTIONS as Integer is 16
 Constant LCTX_OFFSET_CURRENT_BLOCK_LABEL as Integer is 24
 Constant LCTX_OFFSET_DISPATCH_TABLE as Integer is 32
 Constant LCTX_OFFSET_ERROR_FLAG as Integer is 40
@@ -87,7 +97,7 @@ Note: ============================================================
 Type called "LoweringContext":
     builder_ctx as Integer              Note: MIRBuilderContext pointer (state lives there)
     result_stack as Integer             Note: List of lowered MIR value IDs
-    instruction_accumulator as Integer  Note: List of MIR instruction pointers (unused; emit goes via builder)
+    functions as Integer                Note: List of completed MIRFunction pointers (definition post-handlers append here)
     current_block_label as Integer      Note: Active basic-block label for emit cursor
     dispatch_table as Integer           Note: Sparse array of {pre, post, child_enter, child_exit}
     error_flag as Integer               Note: 0 OK, nonzero error code
@@ -141,7 +151,8 @@ Process called "create_lowering_context" that takes builder_ctx as Integer retur
     Let result_stack be proc create from List
     proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK, result_stack
 
-    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_INSTRUCTION_ACC, 0
+    Let functions_acc be proc create from List
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_FUNCTIONS, functions_acc
     proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_CURRENT_BLOCK_LABEL, 0
     proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_DISPATCH_TABLE, 0
     proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_ERROR_FLAG, 0
@@ -207,6 +218,17 @@ Process called "destroy_lowering_context" that takes ctx as Integer returns Inte
     Let result_stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
     If result_stack is not equal to 0:
         proc destroy from List with result_stack
+    End If
+
+    Note:
+    Destroy the functions accumulator List itself. The MIRFunction pointers it
+    held are owned by the MIR program (lower_hir_program copied them into the
+    program's functions list), so only the List wrapper is freed here — not the
+    functions, which outlive the lowering pass.
+    :End Note
+    Let functions_acc be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_FUNCTIONS
+    If functions_acc is not equal to 0:
+        proc destroy from List with functions_acc
     End If
 
     proc deallocate from Layout with ctx
@@ -376,6 +398,105 @@ Process called "lowering_result_depth" that takes ctx as Integer returns Integer
         Return 0
     End If
     Return proc size from List with stack
+End Process
+
+@Reasoning
+Records a completed MIRFunction in the lowering context's dedicated functions
+accumulator. The top-level definition post-handlers (PROCESS_DEFINITION,
+EXTERNAL_DECLARATION) call this once per finalised function instead of stashing
+the pointer on the result stack. This keeps real function pointers on a channel
+that is never confused with the result stack's small-integer MIR value-ids, so
+lower_hir_program can collect every function and never appends a stray value-id
+to the program as a bogus function.
+@End Reasoning
+
+@Implementation
+Appends the function pointer to the List at LCTX_OFFSET_FUNCTIONS. Null-safe on
+context, stack, and a zero function pointer (a zero is silently ignored so a
+failed lowering that produced no function adds nothing).
+@End Implementation
+
+@Performance_Hints
+O(1) amortised — a single List.append.
+@End Performance_Hints
+
+@Security_Scope
+Stores a pointer the caller already owns; performs no dereference.
+@End Security_Scope
+
+@Reasoning
+Empties the result stack in one operation. The per-declaration loop in
+lower_hir_program clears the result stack between top-level declarations so the
+small-integer MIR value-ids a declaration body leaves unconsumed cannot
+accumulate into, or be misread by, the next declaration's lowering.
+@End Reasoning
+
+@Implementation
+Resets the backing List length to zero via List.clear, which retains the
+allocated backing array so the next declaration reuses it with no realloc.
+Null-safe on both the context and the stack pointer.
+@End Implementation
+
+@Performance_Hints
+O(1): clear only zeroes the length field; it does not free or rewrite the
+backing array.
+@End Performance_Hints
+
+@Security_Scope
+Read/reset only; no value is dereferenced.
+@End Security_Scope
+
+Process called "lowering_clear_results" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    proc clear from List with stack
+    Return 1
+End Process
+
+Process called "lowering_add_function" that takes ctx as Integer, mir_function as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If mir_function is equal to 0:
+        Return 0
+    End If
+    Let functions_acc be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_FUNCTIONS
+    If functions_acc is equal to 0:
+        Return 0
+    End If
+    proc append from List with functions_acc, mir_function
+    Return 1
+End Process
+
+@Reasoning
+Returns the lowering context's functions accumulator List so lower_hir_program
+can iterate the completed MIRFunctions and splice them into the MIR program's
+own functions list after the traversal finishes.
+@End Reasoning
+
+@Implementation
+Single int64 load at LCTX_OFFSET_FUNCTIONS. Returns 0 for a null context so the
+caller can guard before iterating.
+@End Implementation
+
+@Performance_Hints
+Accessor; one load.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "lowering_get_functions" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_FUNCTIONS
 End Process
 
 Note: ============================================================

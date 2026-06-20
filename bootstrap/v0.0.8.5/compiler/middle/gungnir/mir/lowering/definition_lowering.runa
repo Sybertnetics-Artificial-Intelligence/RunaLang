@@ -273,12 +273,19 @@ Process called "lower_hir_process_definition_post" that takes ctx as Integer, hi
         Note: this; OD-#463 made the sync explicit).
         proc sync_next_value_id from MIR with mir_function
 
-        Note: Stash the completed MIR function on the result stack so
-        Note: lower_hir_program collects it into the program's functions list
-        Note: after visit_hir_tree returns (mirrors the external-declaration
-        Note: post handler). Without this push the function is built but never
-        Note: appended to the program and no function symbol reaches codegen.
-        proc lowering_push_result from LCtx with ctx, mir_function
+        Note:
+        Record the completed MIR function in the lowering context's dedicated
+        functions accumulator so lower_hir_program / lower_hir_function collect
+        it into the program after visit_hir_tree returns. The function is
+        recorded on this dedicated channel rather than the result stack: the
+        result stack carries small-integer MIR value-ids produced while lowering
+        the body, and any value-id a parent handler did not consume would
+        otherwise be indistinguishable from a function pointer at harvest time
+        and get appended to the program as a bogus function (which the LIR
+        builder then dereferences as a MIRFunction and faults on). Keeping
+        functions on their own list eliminates that ambiguity entirely.
+        :End Note
+        proc lowering_add_function from LCtx with ctx, mir_function
     End If
 
     proc memory_set_int64 from Layout with builder_ctx, 0, 0
@@ -345,9 +352,13 @@ Process called "lower_hir_external_declaration_post" that takes ctx as Integer, 
         proc mir_context_register_external from MIRBuilder with builder_ctx, ext_name, ext_convention_id
     End If
 
-    Note: Stash the MIR function in pending_lvalue so the driver
-    Note: can collect it after visit_hir_tree returns.
-    proc lowering_push_result from LCtx with ctx, mir_function
+    Note:
+    Record the external MIR function in the dedicated functions accumulator
+    (same channel as the PROCESS_DEFINITION post handler), keeping it off the
+    value-id result stack so the program harvest never confuses it with a
+    leftover MIR value-id.
+    :End Note
+    proc lowering_add_function from LCtx with ctx, mir_function
     Return 1
 End Process
 
@@ -745,27 +756,41 @@ Process called "lower_hir_program" that takes hir_program as Integer returns Int
             Note: error paths so the next declaration starts clean.
             proc cf_frame_unwind_to_depth from LCtx with lowering_ctx, saved_depth
 
-            Let error_flag be proc lowering_get_error from LCtx with lowering_ctx
-            If error_flag is equal to 0:
-                Note: For PROCESS_DEFINITION, the post handler
-                Note: cleared current_function; re-read it from the
-                Note: result stack where the post stashed the
-                Note: created function pointer. Drain the result
-                Note: stack.
-                Let result_depth be proc lowering_result_depth from LCtx with lowering_ctx
-                While result_depth is greater than 0:
-                    Let func_ptr be proc lowering_pop_result from LCtx with lowering_ctx
-                    If func_ptr is not equal to 0:
-                        If functions_list is not equal to 0:
-                            proc append from List with functions_list, func_ptr
-                        End If
-                    End If
-                    Set result_depth to proc lowering_result_depth from LCtx with lowering_ctx
-                End While
-            End If
+            Note:
+            The completed MIRFunction (if any) was already recorded in the
+            lowering context's functions accumulator by the definition post
+            handler; it is harvested once after this loop. Here we only need to
+            discard the value-ids the declaration's body left on the result
+            stack so they do not accumulate across declarations. Clearing
+            unconditionally (success or failure) keeps each declaration's
+            traversal starting from an empty value-id stack.
+            :End Note
+            proc lowering_clear_results from LCtx with lowering_ctx
         End If
         Set i to i plus 1
     End While
+
+    Note:
+    Harvest every MIRFunction the definition post handlers recorded during the
+    traversal and splice them into the program's functions list, preserving
+    declaration order. Only genuine function pointers live on this accumulator
+    (the result stack's leftover value-ids never reach it), so no bogus entry
+    can be appended.
+    :End Note
+    Let lowered_functions be proc lowering_get_functions from LCtx with lowering_ctx
+    If lowered_functions is not equal to 0:
+        If functions_list is not equal to 0:
+            Let fn_count be proc length from List with lowered_functions
+            Let fn_i be 0
+            While fn_i is less than fn_count:
+                Let collected_fn be proc get from List with lowered_functions, fn_i
+                If collected_fn is not equal to 0:
+                    proc append from List with functions_list, collected_fn
+                End If
+                Set fn_i to fn_i plus 1
+            End While
+        End If
+    End If
 
     proc destroy_visitor_context from HirVisitor with visitor_ctx
     proc destroy_lowering_dispatch_table from LCtx with dispatch_table
@@ -835,9 +860,17 @@ Process called "lower_hir_function" that takes hir_function as Integer returns I
         proc visit_hir_tree from HirVisitor with hir_function, visitor_ctx
         proc cf_frame_unwind_to_depth from LCtx with lowering_ctx, saved_depth
 
-        Let result_depth be proc lowering_result_depth from LCtx with lowering_ctx
-        If result_depth is greater than 0:
-            Set result_function to proc lowering_pop_result from LCtx with lowering_ctx
+        Note:
+        The definition post handler recorded the completed MIRFunction in the
+        functions accumulator (not the result stack). Read the first recorded
+        function as this single-declaration entry point's result.
+        :End Note
+        Let lowered_functions be proc lowering_get_functions from LCtx with lowering_ctx
+        If lowered_functions is not equal to 0:
+            Let fn_count be proc length from List with lowered_functions
+            If fn_count is greater than 0:
+                Set result_function to proc get from List with lowered_functions, 0
+            End If
         End If
 
         proc destroy_visitor_context from HirVisitor with visitor_ctx
