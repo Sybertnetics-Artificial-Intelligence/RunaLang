@@ -1001,7 +1001,24 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
     While i is less than child_count:
         Let child_ast be proc get from List with ast_children, i
         If child_ast is not equal to 0:
-            Let child_hir be proc lower_ast_node with context, child_ast
+            Note: A top-level Let is a module global, not a function-local. The
+            Note: generic dispatch would route AST_LET_STATEMENT to lower_let_statement,
+            Note: which maps the binding to a fresh stack alloca inside the current
+            Note: function -- but at module scope there is no enclosing function, so
+            Note: the global is never emitted and later uses (e.g. main's `Return g`)
+            Note: resolve to a dangling load. Route it through lower_constant_statement
+            Note: instead, which interns the symbol in the program scope and emits the
+            Note: HIR_DEFINE_STATEMENT global form (identical to Constant). The Let and
+            Note: Define AST node layouts are byte-identical ([identifier, type?, expr]).
+            Let child_kind be proc memory_get_int64 from Layout with child_ast, 0
+            Let child_hir be 0
+            If child_kind is equal to AST_LET_STATEMENT from AST:
+                Let child_line be proc memory_get_int64 from Layout with child_ast, 8
+                Let child_column be proc memory_get_int64 from Layout with child_ast, 16
+                Set child_hir to proc lower_constant_statement with context, child_ast, child_line, child_column
+            Otherwise:
+                Set child_hir to proc lower_ast_node with context, child_ast
+            End If
             If child_hir is not equal to 0:
                 proc append from List with hir_declarations, child_hir
             End If
@@ -3240,8 +3257,21 @@ Process called "lower_constant_statement" takes context as Integer, ast_node as 
     Note: Scan index points at the first non-name child. For 2002 the name is
     Note: child 0, so the type/expression scan starts at child 1; for 9011 the
     Note: name is in the value slot and the scan starts at child 0.
-    Let scan_start be 0
+    Note: AST_LET_STATEMENT (2000) shares build_define_statement's exact child
+    Note: layout [identifier, type?, expression]; a TOP-LEVEL Let is a global and is
+    Note: routed here by lower_program so it lowers to the same HIR_DEFINE_STATEMENT
+    Note: global form Constants use (the local-alloca lower_let_statement path has no
+    Note: enclosing function at module scope, leaving the binding unresolved).
+    Let is_child0_name_form be 0
     If node_kind is equal to AST_DEFINE_STATEMENT from AST:
+        Set is_child0_name_form to 1
+    End If
+    If node_kind is equal to AST_LET_STATEMENT from AST:
+        Set is_child0_name_form to 1
+    End If
+
+    Let scan_start be 0
+    If is_child0_name_form is equal to 1:
         If child_count is greater than 0:
             Let name_node be proc ast_node_get_child from AST with ast_node, 0
             Set const_name to proc ast_node_get_value from AST with name_node
@@ -3930,13 +3960,19 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
     @End Reasoning
 
     @Implementation
-    Read name/body from offsets 80/104 of the TypeDefinitionNode (the
-    body holds field or variant declarations as its children). Create a
-    SYMBOL_TYPE binding in the current scope so subsequent references
-    resolve, then construct an HIR_TYPE_DEFINITION node. Each field
-    becomes a SYMBOL_FIELD with its lowered HIRTypeInfo; fields are
-    appended to the HIR type definition via add_type_field for codegen
-    layout calculation later.
+    The modular parser's build_type_definition produces a generic 80-byte
+    AST node (AST_TYPE_DEFINITION 3001) whose name is child 0 (an
+    AST_IDENTIFIER) and whose body is the LAST child (a block-statement
+    whose own children are the field / variant member nodes). It does NOT
+    use a specialized struct with name@80 / body@104 -- those offsets lie
+    PAST the 80-byte allocation, so reading them returned adjacent heap
+    garbage (benign for a single type, a wild pointer once a second type
+    shifted the heap, crashing in the field loop). Read name from child 0's
+    value and body from the last child. Create a SYMBOL_TYPE binding in the
+    current scope so subsequent references resolve, then construct an
+    HIR_TYPE_DEFINITION node. Each field becomes a SYMBOL_FIELD with its
+    lowered HIRTypeInfo; fields are appended to the HIR type definition via
+    add_type_field for codegen layout calculation later.
     @End Implementation
 
     @Performance_Hints
@@ -3952,11 +3988,26 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
     variables of the same name elsewhere.
     @End Security_Scope
 
-    Note: Get type information from TypeDefinitionNode specialized structure
-    Note: name at offset 80, generic_parameters at offset 88, generic_count at offset 96
-    Note: body at offset 104 (contains fields/variants)
-    Let type_name be proc memory_get_int64 from Layout with ast_node, 80
-    Let body_node be proc memory_get_int64 from Layout with ast_node, 104
+    Note: build_type_definition lays the type node out as a generic AST node with
+    Note: children [name, generic_parameters?, body]: name is child 0 (an
+    Note: AST_IDENTIFIER whose value is the name string) and body is the LAST child
+    Note: (a block-statement carrying the field/variant member nodes). Reading the
+    Note: long-gone "specialized struct" offsets 80/104 dereferenced past the
+    Note: 80-byte node allocation and crashed once a second type shifted the heap.
+    Let td_children be proc memory_get_int64 from Layout with ast_node, 24
+    Let td_child_count be proc memory_get_int64 from Layout with ast_node, 32
+    Let type_name be 0
+    Let body_node be 0
+    If td_children is not equal to 0:
+        If td_child_count is greater than 0:
+            Let td_name_node be proc get from List with td_children, 0
+            If td_name_node is not equal to 0:
+                Set type_name to proc ast_node_get_value from AST with td_name_node
+            End If
+            Let td_last_index be td_child_count minus 1
+            Set body_node to proc get from List with td_children, td_last_index
+        End If
+    End If
 
     Note: Determine type kind from the body node's AST node_type
     Note: (offset 0). A union-form body (AST_UNION_TYPE = 4002, the ADT
