@@ -251,6 +251,23 @@ Let the result should be be 42
 Note: Variable name is "the result should be", value is 42
 ```
 
+**Last-be-wins name capture (DEC-0018).** At a binder slot (after `Let`/`Set`, and
+in definition/named-argument name positions) the identifier name is the run of
+words from the slot start to the **last `be`** within the current statement; in
+canonical mode the statement boundary is the physical end of line. The name/value
+split at the last `be` is confirmed by **RHS-completeness**: the tokens after the
+last `be` must form exactly one complete expression to the end of the statement.
+An `as` (or `of type`) occurring before the last `be` ends the name and begins a
+type annotation. This disambiguation is **positional and scope-free** — it consults
+no symbol table and rescans no source, so it preserves parallel and incremental
+parsing.
+
+**Ratified invariant:** `be` is never a legal bare expression atom. This is what
+makes the last-`be` split unique. Consequently a binder name that is empty or
+consists only of `be` is a decidable error (`E-LEX-BINDER-WORD-IN-NAME`): for
+example `Let be be be` is rejected rather than mis-parsed. To bind a name that must
+literally contain `be`/`to`/`as`, encase it in backticks (e.g. `` `be be` ``).
+
 **Standard Declaration Forms:**
 
 ```ebnf
@@ -762,6 +779,14 @@ filter_condition       ::= expression
 aggregation_expression ::= aggregation_function "of" field_reference "from" expression
                           | aggregation_function "of" expression
 aggregation_function   ::= "average" | "sum" | "count" | "minimum" | "maximum"
+Note: Contextual aggregation (DEC-0018): the five aggregation words are NOT
+Note: reserved. A bare aggregation word reads as the aggregation operator only
+Note: when it is immediately followed by "of" AND the token after "of" begins an
+Note: expression (a fixed, 2-token, scope-free lookahead). Otherwise the word is
+Note: an ordinary identifier — so "Let count be 3", "Return sum", and a field or
+Note: variable named "count"/"sum" all work. To force an aggregation-shaped phrase
+Note: such as "count of items" to be a variable at a use site, encase it in
+Note: backticks.
 
 sort_expression        ::= expression ("sorted" "by" field_reference)?
 

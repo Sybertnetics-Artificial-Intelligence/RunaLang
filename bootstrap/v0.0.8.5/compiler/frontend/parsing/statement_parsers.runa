@@ -4612,15 +4612,229 @@ Note: ==========================================================================
 Note: Helper Functions
 Note: ============================================================================
 
+Note: ============================================================================
+Note: DEC-0018 Layer 2 — Binder name-span capture (statement-bounded last-be-wins)
+Note: ============================================================================
+
+Process called "find_last_be_index" takes parser as Integer returns Integer:
+    Note:
+    DEC-0018 Layer 2 helper. Scan the current statement's source-line window
+    (starting at the current token, relative index 0) and return the relative
+    lookahead index of the LAST `be` keyword token within that window. Returns
+    -1 if there is no `be` in the window.
+
+    The window is the physical source line: in canonical mode the statement
+    boundary is end-of-line. The lexer emits no NEWLINE token (it folds `\n`
+    into whitespace), so the window is bounded by a CHANGE in the token's
+    1-indexed line number (offset 16) relative to the first token's line, or
+    by EOF / a null token. The scan is O(line) and consumes nothing.
+    :End Note
+
+    If parser is equal to 0:
+        Return -1
+    End If
+
+    Let first_token be proc parser_peek_token from Parser with parser, 0
+    If first_token is equal to 0:
+        Return -1
+    End If
+
+    Let base_line be proc token_get_line from Parser with first_token
+
+    Let last_be_index be -1
+    Let rel_index be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let probe be proc parser_peek_token from Parser with parser, rel_index
+        If probe is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Let probe_type be proc token_get_type from Parser with probe
+            If probe_type is equal to TOKEN_EOF:
+                Set scanning to 0
+            Otherwise:
+                Let probe_line be proc token_get_line from Parser with probe
+                If probe_line is not equal to base_line:
+                    Note: Crossed the statement (physical line) boundary.
+                    Set scanning to 0
+                Otherwise:
+                    If probe_type is equal to TOKEN_BE:
+                        Set last_be_index to rel_index
+                    End If
+                    Set rel_index to rel_index plus 1
+                End If
+            End If
+        End If
+    End While
+
+    Return last_be_index
+End Process
+
+Process called "find_name_end_index" takes parser as Integer, last_be_index as Integer returns Integer:
+    Note:
+    DEC-0018 Layer 2 helper. Given the relative index of the binder's last
+    `be`, determine where the binder NAME ends. The name runs from the slot
+    start (relative index 0) up to — but not including — the first `as` (or
+    `of type`) inside the pre-`be` span, which ends the name and begins a type
+    annotation; absent any such marker the name runs right up to the last `be`.
+
+    Returns the relative index ONE PAST the last name token (i.e. the count of
+    name tokens to materialize and consume). The `as` / `of type` marker and
+    the last `be` are left for the caller to handle.
+    :End Note
+
+    If parser is equal to 0:
+        Return 0
+    End If
+    If last_be_index is less than 0:
+        Return 0
+    End If
+
+    Let name_end be last_be_index
+    Let scan_index be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If scan_index is greater than or equal to last_be_index:
+            Set scanning to 0
+        Otherwise:
+            Let probe be proc parser_peek_token from Parser with parser, scan_index
+            If probe is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Let probe_type be proc token_get_type from Parser with probe
+                If probe_type is equal to TOKEN_AS:
+                    Set name_end to scan_index
+                    Set scanning to 0
+                Otherwise:
+                    Note: `of type` — TOKEN_OF immediately followed by TOKEN_TYPE
+                    Note: also ends the name and begins a type annotation.
+                    If probe_type is equal to TOKEN_OF:
+                        Let next_probe be proc parser_peek_token from Parser with parser, scan_index plus 1
+                        If next_probe is not equal to 0:
+                            Let next_type be proc token_get_type from Parser with next_probe
+                            If next_type is equal to TOKEN_TYPE:
+                                Set name_end to scan_index
+                                Set scanning to 0
+                            End If
+                        End If
+                    End If
+                    If scanning is equal to 1:
+                        Set scan_index to scan_index plus 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Return name_end
+End Process
+
+Process called "materialize_name_span" takes parser as Integer, name_token_count as Integer returns Integer:
+    Note:
+    DEC-0018 Layer 2 helper. Build the multi-word binder name string from the
+    token span [0 .. name_token_count) WITHOUT rescanning source and with a
+    SINGLE heap allocation. Words are joined by exactly one canonical space.
+
+    Two bounded passes over the recorded token span:
+      Pass 1 — sum each token-value length plus a separating space between
+               consecutive words to size the buffer.
+      Pass 2 — copy each token's value bytes into the single buffer, inserting
+               one space between words, and NUL-terminate.
+
+    Returns a pointer to the freshly allocated NUL-terminated name string, or 0
+    on error (null parser, empty span, or a name token with no value).
+    :End Note
+
+    If parser is equal to 0:
+        Return 0
+    End If
+    If name_token_count is less than 1:
+        Return 0
+    End If
+
+    Note: Pass 1 — compute total byte length.
+    Let total_length be 0
+    Let i be 0
+    Let pass1_ok be 1
+    While i is less than name_token_count:
+        Let tok be proc parser_peek_token from Parser with parser, i
+        If tok is equal to 0:
+            Set pass1_ok to 0
+            Set i to name_token_count
+        Otherwise:
+            Let tok_value be proc token_get_value from Parser with tok
+            If tok_value is equal to 0:
+                Set pass1_ok to 0
+                Set i to name_token_count
+            Otherwise:
+                Let word_len be proc string_length from StringCore with tok_value
+                Set total_length to total_length plus word_len
+                If i is greater than 0:
+                    Note: one separating space between words
+                    Set total_length to total_length plus 1
+                End If
+                Set i to i plus 1
+            End If
+        End If
+    End While
+
+    If pass1_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate one buffer (length + NUL).
+    Let name_buffer be proc allocate from Layout with total_length plus 1
+    If name_buffer is equal to 0:
+        Return 0
+    End If
+
+    Note: Pass 2 — copy bytes with single-space separators.
+    Let write_pos be 0
+    Let j be 0
+    While j is less than name_token_count:
+        Let tok2 be proc parser_peek_token from Parser with parser, j
+        Let tok2_value be proc token_get_value from Parser with tok2
+        Let word_len2 be proc string_length from StringCore with tok2_value
+
+        If j is greater than 0:
+            proc memory_set_byte from Layout with name_buffer, write_pos, 32
+            Set write_pos to write_pos plus 1
+        End If
+
+        Let k be 0
+        While k is less than word_len2:
+            Let b be proc memory_get_byte from Layout with tok2_value, k
+            proc memory_set_byte from Layout with name_buffer, write_pos, b
+            Set write_pos to write_pos plus 1
+            Set k to k plus 1
+        End While
+
+        Set j to j plus 1
+    End While
+
+    proc memory_set_byte from Layout with name_buffer, write_pos, 0
+    Return name_buffer
+End Process
+
 Process called "parse_identifier" takes parser as Integer returns Integer:
-    Note: Parse an identifier
-    
+    Note: Parse an identifier — DEC-0018 Layer 2 multi-word binder name capture.
+
+    Note: DEC-0018: at a binder slot the identifier name is the run of words
+    Note: from slot-start to the LAST `be` within the current statement (physical
+    Note: source line), where an `as` / `of type` inside that span ends the name
+    Note: and begins a type annotation. The split at the last `be` is confirmed by
+    Note: RHS-completeness: the tokens after the last `be` must begin a complete
+    Note: expression (the ratified invariant — `be` is never a bare expression
+    Note: atom — makes the last-`be` split unique). When no binder `be` is present
+    Note: in the window, or RHS-completeness fails, this falls back to the
+    Note: single-token capture used by all ~11 non-binder callers (loop variables,
+    Note: parameter names, exception variables, type / process / protocol / external
+    Note: names, import aliases).
+
     Note: Parameters:
     Note:   parser - Pointer to ParserState
-    
     Note: Returns:
-    Note:   Pointer to identifier AST node
-    Note:   Returns 0 on parsing error
+    Note:   Pointer to identifier AST node, or 0 on parsing error
 
     If parser is equal to 0:
         Return 0
@@ -4634,6 +4848,76 @@ Process called "parse_identifier" takes parser as Integer returns Integer:
 
     Let token_type be proc token_get_type from Parser with current_token
 
+    Note: --- DEC-0018 Layer 2: attempt multi-word binder name capture ---
+    Let last_be_index be proc find_last_be_index with parser
+    If last_be_index is greater than or equal to 0:
+        Let name_end be proc find_name_end_index with parser, last_be_index
+
+        Note: RHS-completeness gate. The token immediately after the last `be`
+        Note: must be an expression head; if so, the caller's parse_expression
+        Note: will consume exactly one complete expression to statement end. This
+        Note: is a scope-free, allocation-free, non-destructive check (no trial
+        Note: parse, no diagnostics pollution).
+        Let after_be be proc parser_peek_token from Parser with parser, last_be_index plus 1
+        Let rhs_complete be 0
+        If after_be is not equal to 0:
+            Let after_be_kind be proc token_get_type from Parser with after_be
+            Set rhs_complete to proc is_expression_head from ExpressionParsers with after_be_kind
+        End If
+
+        If rhs_complete is equal to 1:
+            Note: R-1 diagnostic: a trailing-`be` / empty binder name is a
+            Note: decidable reject, not a mis-parse. name_end == 0 means there is
+            Note: no name word before the last `be` (e.g. `Let be be be`).
+            If name_end is equal to 0:
+                Let r1_line be proc token_get_line from Parser with current_token
+                Let r1_column be proc token_get_column from Parser with current_token
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "E-LEX-BINDER-WORD-IN-NAME: a binder name cannot be empty or consist only of the keyword 'be'; to bind a name containing 'be'/'to'/'as' literally, encase it in backticks", r1_line, r1_column
+                Return 0
+            End If
+
+            Note: Capture the multi-word name from the token span [0 .. name_end).
+            Let name_string be proc materialize_name_span with parser, name_end
+            If name_string is equal to 0:
+                Return 0
+            End If
+
+            Let binder_line be proc token_get_line from Parser with current_token
+            Let binder_column be proc token_get_column from Parser with current_token
+
+            Let binder_node be proc build_identifier_node from ASTBuilder with name_string, binder_line, binder_column
+            If binder_node is equal to 0:
+                Return 0
+            End If
+
+            Note: Consume exactly the name tokens; the `as` / `of type` marker (if
+            Note: any) and the last `be` remain for the caller to handle.
+            Let consume_index be 0
+            While consume_index is less than name_end:
+                proc parser_consume_token from Parser with parser
+                Set consume_index to consume_index plus 1
+            End While
+
+            Return binder_node
+        End If
+
+        Note: R-1 (trailing-`be` / no valid split): a `be` is present in the
+        Note: window but the tokens after the LAST `be` do not begin a complete
+        Note: expression, so no last-be-wins split exists (e.g. `Let be be be`).
+        Note: When the binder slot itself opens with the keyword `be`, this is the
+        Note: decidable R-1 reject — not a mis-parse — steering the author to
+        Note: backticks. (If the slot opens with a normal identifier and merely
+        Note: has no trailing `be` binder on the line, control falls through to the
+        Note: single-token path used by non-binder callers.)
+        If token_type is equal to TOKEN_BE:
+            Let r1b_line be proc token_get_line from Parser with current_token
+            Let r1b_column be proc token_get_column from Parser with current_token
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "E-LEX-BINDER-WORD-IN-NAME: a binder name cannot be empty or consist only of the keyword 'be'; to bind a name containing 'be'/'to'/'as' literally, encase it in backticks", r1b_line, r1b_column
+            Return 0
+        End If
+    End If
+
+    Note: --- Single-token fallback (non-binder callers) ---
     Note: Check if token is identifier
     If token_type is not equal to TOKEN_IDENTIFIER:
         Return 0

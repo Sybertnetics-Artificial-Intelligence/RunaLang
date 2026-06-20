@@ -213,7 +213,27 @@ block                 ::= ':' INDENT statement* DEDENT
 ## Variable Declarations and Assignments
 
 ```ebnf
-let_statement         ::= "Let" (identifier | pattern) "be" expression trailing_type_annotation?
+let_statement         ::= "Let" binder_name type_annotation? "be" expression trailing_type_annotation?
+                        | "Let" pattern "be" expression trailing_type_annotation?
+
+binder_name           ::= word+
+                        Note: DEC-0018 statement-bounded last-be-wins capture. The binder
+                        Note: name is the run of words from the slot start to the LAST `be`
+                        Note: within the current statement (canonical mode: the physical
+                        Note: source line). `word` is any token usable as a name word,
+                        Note: INCLUDING reserved words such as `to`, `or`, and `be` itself
+                        Note: (so `Let to be or not to be be 42` binds the name
+                        Note: `to be or not to be`). The split at the last `be` is confirmed
+                        Note: by RHS-completeness: the tokens after it must form exactly one
+                        Note: complete expression to end-of-statement. An `as` (or `of type`)
+                        Note: inside the pre-`be` span ends the name and begins a type
+                        Note: annotation. Capture is positional and SCOPE-FREE (no symbol
+                        Note: table, no source rescan): it preserves parallel/incremental
+                        Note: parsing. Decidability rests on the ratified invariant that
+                        Note: `be` is never a legal bare expression atom, which makes the
+                        Note: last-`be` split unique. A binder name that is empty or consists
+                        Note: only of `be` (e.g. `Let be be be`) is the decidable error
+                        Note: `E-LEX-BINDER-WORD-IN-NAME`; backticks force a literal name.
 
 define_statement      ::= "Define" ["constant"] identifier type_annotation? "as" expression
 
