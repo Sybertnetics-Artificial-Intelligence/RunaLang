@@ -54,6 +54,13 @@ Import "compiler/frontend/parsing/parser.runa" as Parser
 Import "compiler/frontend/parsing/program.runa" as Program
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Note: AST + List providers — process_imports operates on the AST_PROGRAM node
+Note: returned by parser_parse_program (top-level declarations live in the
+Note: children List at AST offset 24), so the driver's bare calls to the AST node
+Note: accessors (ast_node_get_*) and the List primitives (get/size/append/create)
+Note: resolve to the modules' module-qualified symbols at link time.
+Import "compiler/frontend/parsing/ast.runa" as AST
+Import "compiler/frontend/primitives/collections/list.runa" as List
 
 Note: Process to read entire file contents into memory
 Process called "read_file_internal" takes filename as Integer returns Integer:
@@ -74,102 +81,204 @@ Process called "read_file_internal" takes filename as Integer returns Integer:
     Return content
 End Process
 
-Note: Process imports: load and merge imported files
-Note: Takes program pointer, returns 0 on success, 1 on failure
-Process called "process_imports" takes program as Integer returns Integer:
-    Note: Get import count and imports array
-    Let import_count be memory_get_int32(program, 40)  Note: PROGRAM_IMPORT_COUNT
+Note: AST_IMPORT_STATEMENT discriminant as emitted by build_import_statement
+Note: (compiler/frontend/parsing/ast_builder.runa). The import path string is
+Note: stored in the node's value slot (AST offset 40) and the optional alias is a
+Note: child identifier; the path is therefore read with ast_node_get_value.
+Constant DRIVER_AST_IMPORT_STATEMENT as Integer is 2016
 
-    If import_count is equal to 0:
-        Return 0  Note: No imports to process
+Note: Process imports: load, parse, and merge imported modules' declarations
+Note: into the importing program's top-level declaration list.
+Note: .
+Note: parser_parse_program returns an AST_PROGRAM node (discriminant 3500) whose
+Note: top-level declarations -- imports, constants, processes, types -- all live
+Note: in the children List at AST offset 24 (count at offset 32). An imported
+Note: module's Constants must therefore be appended to the importing program's
+Note: children List so lower_program lowers them as siblings: lower_constant_statement
+Note: interns each imported Constant and records its literal value on the symbol's
+Note: const slots, and lower_identifier then inlines a bare reference (e.g.
+Note: TOKEN_LET) to that value. Merging only functions/types -- and via the wrong
+Note: (Program-record) offsets at that -- left imported Constants invisible, so a
+Note: bare reference resolved to symbol id 0 and silently dropped the enclosing
+Note: function. Appending ALL children fixes constants, functions, and types
+Note: uniformly through the single mechanism lower_program already consumes.
+Note: .
+Note: visited holds the resolved path of every module already merged so a diamond
+Note: or cyclic import graph merges each module exactly once (no duplicate symbols,
+Note: no infinite recursion). Returns 0 on success, 1 on failure.
+Process called "process_imports" takes program as Integer returns Integer:
+    Let visited be list_create()
+    Note: insert_pos threads the front-insertion cursor through the recursion so
+    Note: imported declarations land BEFORE the importing module's own declarations
+    Note: (a constant must be interned before the function that references it lowers;
+    Note: lower_program's forward-declaration pre-pass covers processes only, not
+    Note: Constants). A return value < 0 signals a fatal import error.
+    Let result be process_imports_into(program, program, visited, 0)
+    If result is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: Recursive worker. root is the AST_PROGRAM whose children list accumulates
+Note: every merged declaration; current is the AST_PROGRAM whose imports are being
+Note: processed this level (root on the first call). visited records merged paths.
+Note: insert_pos is the index in root's children List at which the next imported
+Note: declaration is inserted. Returns the updated insert_pos on success, or -1 on
+Note: a fatal import error.
+Process called "process_imports_into" takes root as Integer, current as Integer, visited as Integer, insert_pos as Integer returns Integer:
+    If current is equal to 0:
+        Return insert_pos
     End If
 
-    Let imports be memory_get_pointer(program, 32)  Note: PROGRAM_IMPORTS
+    Note: Top-level declarations of `current` are its AST children (offset 24).
+    Let children be ast_node_get_children(current)
+    If children is equal to 0:
+        Return insert_pos
+    End If
+    Let child_count be list_length(children)
 
-    Note: Iterate through each import
+    Note: The root's children List receives every merged declaration; on recursion
+    Note: the imported module's declarations are inserted into the original root so
+    Note: they become siblings of the importing program's own top-level declarations.
+    Let root_children be ast_node_get_children(root)
+    If root_children is equal to 0:
+        Return insert_pos
+    End If
+
+    Let cursor be insert_pos
     Let i be 0
-    While i is less than import_count:
-        Note: Get import statement pointer
-        Let ptr_size be 8
-        Let import_offset be i multiplied by ptr_size
-        Let import_ptr be imports plus import_offset
-        Let import_stmt be memory_get_pointer(import_ptr, 0)
+    While i is less than child_count:
+        Let child be list_get(children, i)
+        If child is not equal to 0:
+            Let child_kind be ast_node_get_type(child)
+            If child_kind is equal to DRIVER_AST_IMPORT_STATEMENT:
+                Note: Import path is the raw string stored in the node value slot.
+                Let import_filename be ast_node_get_value(child)
+                If import_filename is equal to 0:
+                    Alert "[IMPORT ERROR] Import statement has no path"
+                    Return -1
+                End If
 
-        Note: Get filename from import statement (offset 0 is filename)
-        Let import_filename be memory_get_pointer(import_stmt, 0)
+                Note: Merge each module exactly once.
+                Let already be import_already_visited(visited, import_filename)
+                If already is equal to 0:
+                    list_append(visited, import_filename)
 
-        Note: Read the imported file
-        Let import_source be read_file_internal(import_filename)
-        If import_source is equal to 0:
-            Let read_err_msg be string_concat("[IMPORT ERROR] Failed to read import file: ", import_filename)
-            Alert read_err_msg
-            deallocate(read_err_msg)
-            Return 1
+                    Let import_source be read_file_internal(import_filename)
+                    If import_source is equal to 0:
+                        Let read_err_msg be string_concat("[IMPORT ERROR] Failed to read import file: ", import_filename)
+                        Alert read_err_msg
+                        deallocate(read_err_msg)
+                        Return -1
+                    End If
+
+                    Note: Modular frontend pipeline: tokenize then parse the
+                    Note: imported source. The modular parser_create takes
+                    Note: (token_stream, arena); the legacy one-arg form is gone.
+                    Let import_source_length be string_length(import_source)
+                    Let import_token_stream be quick_tokenize_string(import_source, import_source_length)
+                    If import_token_stream is equal to 0:
+                        Let tok_err_msg be string_concat("[IMPORT ERROR] Failed to tokenize import file: ", import_filename)
+                        Alert tok_err_msg
+                        deallocate(tok_err_msg)
+                        deallocate(import_source)
+                        Return -1
+                    End If
+
+                    Let import_arena be arena_create(65536)
+                    Let import_parser be parser_create(import_token_stream, import_arena)
+                    Let import_program be parser_parse_program(import_parser)
+
+                    If import_program is equal to 0:
+                        Let parse_err_msg be string_concat("[IMPORT ERROR] Failed to parse import file: ", import_filename)
+                        Alert parse_err_msg
+                        deallocate(parse_err_msg)
+                        parser_destroy(import_parser)
+                        deallocate(import_source)
+                        Return -1
+                    End If
+
+                    Note: Transitively merge the imported module's OWN imports
+                    Note: first (depth-first) so a constant defined two modules
+                    Note: deep is interned before this module's declarations, which
+                    Note: are in turn interned before the importing program's.
+                    Let nested_cursor be process_imports_into(root, import_program, visited, cursor)
+                    If nested_cursor is less than 0:
+                        parser_destroy(import_parser)
+                        deallocate(import_source)
+                        Return -1
+                    End If
+                    Set cursor to nested_cursor
+
+                    Note: Insert every top-level declaration of the imported module
+                    Note: (constants, functions, types) into the root children list at
+                    Note: the running cursor so imported declarations precede the
+                    Note: importing module's own; skip nested Import statements (already
+                    Note: processed above).
+                    Let import_children be ast_node_get_children(import_program)
+                    If import_children is not equal to 0:
+                        Let import_child_count be list_length(import_children)
+                        Let m be 0
+                        While m is less than import_child_count:
+                            Let imported_decl be list_get(import_children, m)
+                            If imported_decl is not equal to 0:
+                                Let imported_kind be ast_node_get_type(imported_decl)
+                                If imported_kind is not equal to DRIVER_AST_IMPORT_STATEMENT:
+                                    list_insert(root_children, cursor, imported_decl)
+                                    Set cursor to cursor plus 1
+                                End If
+                            End If
+                            Set m to m plus 1
+                        End While
+                    End If
+
+                    Note: The merged AST nodes are now owned by the root program.
+                    Note: parser_destroy recursively destroys the parser's ast_root
+                    Note: tree (destroy_ast_node), which would FREE the very declaration
+                    Note: nodes just spliced into root_children -- lower_program would
+                    Note: then read freed memory and silently drop the using function.
+                    Note: Null the import parser's ast_root (offset 40) first so
+                    Note: parser_destroy releases only its own bookkeeping (errors list,
+                    Note: context stack, token stream) and leaves the shared AST intact.
+                    Note: The import source buffer is retained: identifier name strings
+                    Note: referenced by the merged nodes are heap-owned by the lexer and
+                    Note: survive, but string-literal token values may alias the source,
+                    Note: so the source stays alive for the remainder of the compile.
+                    memory_set_qword(import_parser, 40, 0)
+                    parser_destroy(import_parser)
+                End If
+            End If
         End If
-
-        Note: Modular frontend pipeline: tokenize the imported source into a
-        Note: token stream, then create a parser over that stream with a parse
-        Note: arena. (The legacy parser_create(lexer) one-arg form is gone; the
-        Note: modular parser_create takes (token_stream, arena).)
-        Let import_source_length be string_length(import_source)
-        Let import_token_stream be quick_tokenize_string(import_source, import_source_length)
-        If import_token_stream is equal to 0:
-            Let tok_err_msg be string_concat("[IMPORT ERROR] Failed to tokenize import file: ", import_filename)
-            Alert tok_err_msg
-            deallocate(tok_err_msg)
-            deallocate(import_source)
-            Return 1
-        End If
-
-        Note: Create parser for imported file over the token stream
-        Let import_arena be arena_create(65536)
-        Let import_parser be parser_create(import_token_stream, import_arena)
-
-        Note: Parse the imported file
-        Let import_program be parser_parse_program(import_parser)
-
-        If import_program is equal to 0:
-            Let parse_err_msg be string_concat("[IMPORT ERROR] Failed to parse import file: ", import_filename)
-            Alert parse_err_msg
-            deallocate(parse_err_msg)
-            parser_destroy(import_parser)
-            deallocate(import_source)
-            Return 1
-        End If
-
-        Note: Merge functions from imported program into main program
-        Let import_func_count be memory_get_int32(import_program, 8)  Note: function_count
-        Let import_functions be memory_get_pointer(import_program, 0)  Note: functions array
-
-        Let j be 0
-        While j is less than import_func_count:
-            Let func_offset be j multiplied by ptr_size
-            Let func_ptr be import_functions plus func_offset
-            Let func be memory_get_pointer(func_ptr, 0)
-            program_add_function(program, func)
-            Set j to j plus 1
-        End While
-
-        Note: Merge types from imported program into main program
-        Let import_type_count be memory_get_int32(import_program, 24)  Note: type_count (Program record offset 24)
-        Let import_types be memory_get_pointer(import_program, 16)  Note: types array (Program record offset 16)
-
-        Let k be 0
-        While k is less than import_type_count:
-            Let type_offset be k multiplied by ptr_size
-            Let type_ptr be import_types plus type_offset
-            Let type_def be memory_get_pointer(type_ptr, 0)
-            program_add_type(program, type_def)
-            Set k to k plus 1
-        End While
-
-        Note: Cleanup import parsing resources (but not the AST nodes - they're now in main program)
-        parser_destroy(import_parser)
-        deallocate(import_source)
-
         Set i to i plus 1
     End While
 
+    Note: Refresh the root program's child_count (offset 32) to reflect every
+    Note: declaration inserted so lower_program iterates them all.
+    Let new_root_count be list_length(root_children)
+    memory_set_qword(root, 32, new_root_count)
+
+    Return cursor
+End Process
+
+Note: Linear scan of the visited-path list for an already-merged module path.
+Note: Returns 1 if path is present, 0 otherwise.
+Process called "import_already_visited" takes visited as Integer, path as Integer returns Integer:
+    If visited is equal to 0:
+        Return 0
+    End If
+    Let count be list_length(visited)
+    Let i be 0
+    While i is less than count:
+        Let seen be list_get(visited, i)
+        If seen is not equal to 0:
+            Let same be string_equals(seen, path)
+            If same is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
     Return 0
 End Process
 
