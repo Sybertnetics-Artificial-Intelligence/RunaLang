@@ -953,6 +953,50 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
     End If
 
     Let child_count be proc size from List with ast_children
+
+    Note: Forward-declaration pre-pass. A process body may reference a sibling
+    Note: process that is declared LATER in the source (e.g. `Return other`
+    Note: where `other` follows `main`). Symbol resolution walks the scope chain
+    Note: at lowering time, so without pre-interning the later process its name
+    Note: is unresolved when the earlier body lowers, and a bare reference to it
+    Note: fails. Intern every top-level process name as a SYMBOL_FUNCTION in the
+    Note: program scope up front, recording its declared parameter count at the
+    Note: symbol's func_param_count slot (offset 112). This makes all top-level
+    Note: processes mutually visible regardless of declaration order and lets a
+    Note: bare identifier that names a zero-parameter process lower as a call.
+    Let program_scope be proc get_current_scope with context
+    Let pre_i be 0
+    While pre_i is less than child_count:
+        Let pre_child be proc get from List with ast_children, pre_i
+        If pre_child is not equal to 0:
+            Let pre_kind be proc memory_get_int64 from Layout with pre_child, 0
+            If pre_kind is equal to AST_PROCESS_DEFINITION from AST:
+                Note: Name node at offset 80 (an AST_IDENTIFIER); unwrap its value
+                Note: (offset 40) to the actual name string. Parameter count at 96.
+                Let pre_name_node be proc memory_get_int64 from Layout with pre_child, 80
+                Let pre_name be pre_name_node
+                If pre_name_node is not equal to 0:
+                    Let pre_unwrapped be proc ast_node_get_value from AST with pre_name_node
+                    If pre_unwrapped is not equal to 0:
+                        Set pre_name to pre_unwrapped
+                    End If
+                End If
+                If pre_name is not equal to 0:
+                    Let pre_existing be proc resolve_symbol with context, pre_name, program_scope
+                    If pre_existing is equal to 0:
+                        Let pre_param_count be proc memory_get_int64 from Layout with pre_child, 96
+                        Let pre_symbol be proc create_hir_symbol_info from HIR with pre_name, SYMBOL_FUNCTION from HIR, program_scope
+                        If pre_symbol is not equal to 0:
+                            proc memory_set_int64 from Layout with pre_symbol, 112, pre_param_count
+                            proc add_symbol_to_scope with program_scope, pre_symbol
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set pre_i to pre_i plus 1
+    End While
+
     Let i be 0
     While i is less than child_count:
         Let child_ast be proc get from List with ast_children, i
@@ -1089,6 +1133,41 @@ Process called "lower_identifier" takes context as Integer, ast_node as Integer,
     Let current_scope be proc get_current_scope with context
     Let symbol be proc resolve_symbol with context, name, current_scope
 
+    Note: Compile-time literal constant inlining. lower_constant_statement
+    Note: records the value (and value_type tag) of a literal-initialized
+    Note: constant on the symbol's const slots (88 = is_literal flag, 96 = value,
+    Note: 104 = value_type) and emits no define node. A use of such a constant
+    Note: must therefore materialize a fresh HIR_LITERAL carrying the recorded
+    Note: payload rather than an HIR_IDENTIFIER, because there is no MIR storage
+    Note: slot to load from. The flag is 0 for every non-constant symbol, so this
+    Note: branch is skipped for ordinary variables/parameters/functions.
+    If symbol is not equal to 0:
+        Let const_is_literal be proc memory_get_int64 from Layout with symbol, 88
+        If const_is_literal is equal to 1:
+            Let const_value be proc memory_get_int64 from Layout with symbol, 96
+            Let const_value_type be proc memory_get_int64 from Layout with symbol, 104
+            Let literal_node be proc create_hir_node from HIR with HIR_LITERAL from HIR, line, column
+            If literal_node is equal to 0:
+                Return hir_node
+            End If
+            proc memory_set_int64 from Layout with literal_node, 40, const_value
+            proc memory_set_int64 from Layout with literal_node, 48, const_value_type
+            Let inferred_const_type be proc infer_literal_type with context, const_value_type
+            If inferred_const_type is not equal to 0:
+                proc set_hir_node_type_info from HIR with literal_node, inferred_const_type
+            End If
+            Note: HIR_LITERAL MIR contract (see lower_literal): lower_hir_literal_post
+            Note: reads the literal value at offset 8 and its type at offset 16 to emit
+            Note: MIR_CONST. Mirror both slots so the inlined constant lowers to the
+            Note: same MIR_CONST a written literal would; without this the post handler
+            Note: reads the base node's line/column as value/type and produces a corrupt
+            Note: constant.
+            proc memory_set_int64 from Layout with literal_node, 8, const_value
+            proc memory_set_int64 from Layout with literal_node, 16, inferred_const_type
+            Return literal_node
+        End If
+    End If
+
     If symbol is not equal to 0:
         Note: Attach resolved symbol to HIR node
         Let symbol_id be proc get_symbol_id with symbol
@@ -1106,6 +1185,47 @@ Process called "lower_identifier" takes context as Integer, ast_node as Integer,
         Note: Get type from symbol
         Let symbol_type be proc get_symbol_type with symbol
         proc set_hir_node_type_info from HIR with hir_node, symbol_type
+
+        Note: Bare no-argument process call. Runa allows `Return other` to call a
+        Note: zero-parameter process `other` by naming it -- the bare identifier in
+        Note: value position resolves to a CALL, not a variable load. We synthesize
+        Note: that call here when ALL of the following hold:
+        Note:   - the resolved symbol is a SYMBOL_FUNCTION (kind at offset 16),
+        Note:   - its recorded parameter count (offset 112) is exactly 0,
+        Note:   - we are NOT lowering a call's callee (context flag at offset 72 is 0;
+        Note:     in that position the identifier is the call target and the explicit
+        Note:     arguments complete the call, so it must stay a bare identifier).
+        Note: A bare identifier that is a local/parameter/variable is SYMBOL_VARIABLE
+        Note: or SYMBOL_PARAMETER, never SYMBOL_FUNCTION, so variable reads are
+        Note: unaffected. The synthesized HIR_CALL_EXPRESSION mirrors the flat-node
+        Note: contract lower_call_expression produces: callee@8 = this identifier,
+        Note: arguments@16 = empty list, arg_count@24 = 0, resolved_function@32 =
+        Note: symbol id, return_type@40 = the function's return type. The MIR call
+        Note: post handler resolves the direct call by the callee identifier's name.
+        Let symbol_kind be proc memory_get_int64 from Layout with symbol, 16
+        If symbol_kind is equal to SYMBOL_FUNCTION from HIR:
+            Let callee_suppressed be proc memory_get_int64 from Layout with context, 72
+            If callee_suppressed is equal to 0:
+                Let fn_param_count be proc memory_get_int64 from Layout with symbol, 112
+                If fn_param_count is equal to 0:
+                    Let noarg_call be proc create_hir_node from HIR with HIR_CALL_EXPRESSION from HIR, line, column
+                    If noarg_call is equal to 0:
+                        Return hir_node
+                    End If
+                    Let noarg_args be proc create from List
+                    Let noarg_return_type be proc get_function_return_type with context, symbol_type
+                    proc memory_set_int64 from Layout with noarg_call, 8, hir_node
+                    proc memory_set_int64 from Layout with noarg_call, 16, noarg_args
+                    proc memory_set_int64 from Layout with noarg_call, 24, 0
+                    proc memory_set_int64 from Layout with noarg_call, 32, symbol_id
+                    proc memory_set_int64 from Layout with noarg_call, 40, noarg_return_type
+                    If noarg_return_type is not equal to 0:
+                        proc set_hir_node_type_info from HIR with noarg_call, noarg_return_type
+                    End If
+                    Return noarg_call
+                End If
+            End If
+        End If
     End If
 
     Return hir_node
@@ -1341,8 +1461,16 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
         End If
     End If
 
-    Note: Lower callee
+    Note: Lower callee. Set the callee-suppression flag (context offset 72) so
+    Note: that if the callee is a bare identifier naming a zero-arg process,
+    Note: lower_identifier does NOT rewrite it into a synthesized no-arg call --
+    Note: here the identifier is the call target and the explicit arguments below
+    Note: complete the call. The flag is saved and restored to support nested
+    Note: calls in argument position.
+    Let saved_callee_flag be proc memory_get_int64 from Layout with context, 72
+    proc memory_set_int64 from Layout with context, 72, 1
     Let callee_hir be proc lower_ast_node with context, callee_ast
+    proc memory_set_int64 from Layout with context, 72, saved_callee_flag
 
     If callee_hir is equal to 0:
         Return 0
@@ -2537,17 +2665,33 @@ Process called "lower_match_statement" takes context as Integer, ast_node as Int
         Set i to i plus 1
     End While
 
-    Note: Perform exhaustiveness checking on match statement
-    Let is_exhaustive be proc check_match_exhaustiveness with context, match_stmt, expression_type, when_clauses, clause_count
+    Note: The has_otherwise flag is stored in the AST node value slot (offset 40)
+    Note: by ast_builder.build_match_statement. A present Otherwise/default arm is
+    Note: a catch-all that covers every residual value, so it makes the match
+    Note: exhaustive on its own regardless of the literal When arms.
+    Let has_otherwise be proc memory_get_int64 from Layout with ast_node, 40
+
+    Note: Perform exhaustiveness checking on match statement. An explicit
+    Note: Otherwise arm short-circuits the type-directed coverage analysis: it
+    Note: matches all remaining values, so the match is exhaustive by construction.
+    Let is_exhaustive be 0
+    If has_otherwise is not equal to 0:
+        Set is_exhaustive to 1
+    Otherwise:
+        Set is_exhaustive to proc check_match_exhaustiveness with context, match_stmt, expression_type, when_clauses, clause_count
+    End If
 
     Note: Set exhaustiveness flag in match statement (offset 40 in HIRMatchStatement - is_exhaustive field)
     proc memory_set_int64 from Layout with match_stmt, 40, is_exhaustive
 
-    If is_exhaustive is equal to 0:
-        Note: Match is not exhaustive - add warning/error
-        Let error_msg be proc create_from_literal from StringCore with "Match statement is not exhaustive: not all cases are covered"
-        proc add_error with context, error_msg, line, column
-    End If
+    Note: A non-exhaustive match is well-defined in Runa: when no arm pattern
+    Note: matches the scrutinee, control falls through past End Match to the
+    Note: statements that follow. The MIR control-flow lowering models this with
+    Note: an unconditional default jump to the merge block (see
+    Note: lower_hir_match_statement_post), so non-exhaustiveness is not a hard
+    Note: compile error. The computed is_exhaustive flag above is recorded on the
+    Note: HIR node for downstream consumers (optimization passes, diagnostics
+    Note: tooling) without aborting lowering.
 
     Note: Publish the match payload onto the BASE HIR node and return the base
     Note: node (not the specialized struct). The HIR tree must carry the base
@@ -3104,7 +3248,22 @@ Process called "lower_constant_statement" takes context as Integer, ast_node as 
         End If
         Set scan_start to 1
     Otherwise:
-        Set const_name to proc ast_node_get_value from AST with ast_node
+        Note: AST_CONSTANT_STATEMENT (9011): build_constant_statement stores the
+        Note: identifier AST NODE (not its name string) in the value slot. Read the
+        Note: node, then read that node's value to recover the name string so the
+        Note: interned symbol's name matches what resolve_symbol compares a use
+        Note: against. Guard the node-vs-string distinction: if the value slot
+        Note: already holds a bare string (no identifier node), use it directly.
+        Let name_value be proc ast_node_get_value from AST with ast_node
+        Let name_value_node_type be 0
+        If name_value is not equal to 0:
+            Set name_value_node_type to proc memory_get_int64 from Layout with name_value, 0
+        End If
+        If name_value_node_type is equal to AST_IDENTIFIER from AST:
+            Set const_name to proc ast_node_get_value from AST with name_value
+        Otherwise:
+            Set const_name to name_value
+        End If
         Set scan_start to 0
     End If
 
@@ -3162,6 +3321,33 @@ Process called "lower_constant_statement" takes context as Integer, ast_node as 
     End If
 
     proc add_symbol_to_scope with current_scope, const_symbol
+
+    Note: Compile-time literal constant inlining. When the initializer is a
+    Note: bare literal, the constant carries a fully-known value that is
+    Note: independent of any runtime location. We record that value (and its
+    Note: value_type tag) on the symbol's const slots (offsets 88/96/104) and
+    Note: return 0 so NO HIR_DEFINE_STATEMENT is produced. lower_identifier then
+    Note: substitutes a fresh literal node at every use of the constant.
+    Note: This is the correct lowering for a TOP-LEVEL constant: such a
+    Note: declaration is a program child, not a function-body statement, so it
+    Note: has no enclosing MIR function to allocate a stack slot in -- emitting
+    Note: an alloca/store there fails MIR lowering and drops the whole program.
+    Note: Inlining sidesteps that entirely. For a function-local constant with a
+    Note: literal initializer, inlining is equally correct and strictly leaner
+    Note: (no stack slot, no load). A constant whose initializer is a computed
+    Note: expression (not a literal) is NOT inlinable here; it retains the
+    Note: HIR_DEFINE_STATEMENT path below, which lowers inside its function body.
+    If initializer_hir is not equal to 0:
+        Let init_node_type be proc memory_get_int64 from Layout with initializer_hir, 0
+        If init_node_type is equal to HIR_LITERAL from HIR:
+            Let literal_value be proc memory_get_int64 from Layout with initializer_hir, 40
+            Let literal_value_type be proc memory_get_int64 from Layout with initializer_hir, 48
+            proc memory_set_int64 from Layout with const_symbol, 88, 1
+            proc memory_set_int64 from Layout with const_symbol, 96, literal_value
+            proc memory_set_int64 from Layout with const_symbol, 104, literal_value_type
+            Return 0
+        End If
+    End If
 
     Note: Build the flat HIR_DEFINE_STATEMENT. node_type@0 drives dispatch;
     Note: type_info@8 sizes the alloca; const_id@16 is the symbol id a use
@@ -3607,12 +3793,30 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
         Set return_type_hir to proc lower_type_annotation with context, return_type_ast
     End If
 
-    Note: Create function symbol
+    Note: Create (or reuse) the function symbol. lower_program's
+    Note: forward-declaration pre-pass already interned every top-level process
+    Note: name in the program scope so sibling references resolve regardless of
+    Note: order; reuse that symbol rather than interning a second one under the
+    Note: same name. Only intern fresh when no pre-declared symbol exists (e.g. a
+    Note: nested/local process not seen by the program pre-pass). The recorded
+    Note: parameter count (offset 112) is kept in sync so a no-arg-call use sees
+    Note: the correct arity.
     Let current_scope be proc get_current_scope with context
-    Let process_symbol be proc create_hir_symbol_info from HIR with process_name, SYMBOL_FUNCTION from HIR, current_scope
-
-    Note: Add function to current scope
-    proc add_symbol_to_scope with current_scope, process_symbol
+    Let process_symbol be proc resolve_symbol with context, process_name, current_scope
+    Let process_symbol_is_function be 0
+    If process_symbol is not equal to 0:
+        Let resolved_kind be proc memory_get_int64 from Layout with process_symbol, 16
+        If resolved_kind is equal to SYMBOL_FUNCTION from HIR:
+            Set process_symbol_is_function to 1
+        End If
+    End If
+    If process_symbol_is_function is equal to 0:
+        Set process_symbol to proc create_hir_symbol_info from HIR with process_name, SYMBOL_FUNCTION from HIR, current_scope
+        proc add_symbol_to_scope with current_scope, process_symbol
+    End If
+    If process_symbol is not equal to 0:
+        proc memory_set_int64 from Layout with process_symbol, 112, param_count
+    End If
 
     Note: Create new scope for function body
     Let function_scope be proc create_hir_scope_info from HIR with SCOPE_FUNCTION from HIR, current_scope
