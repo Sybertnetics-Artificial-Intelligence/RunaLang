@@ -1557,6 +1557,69 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
         Set i to i plus 1
     End While
 
+    Note: Indirect-call divert. A call whose callee is a bare identifier that
+    Note: resolves to a SYMBOL_VARIABLE or SYMBOL_PARAMETER (i.e. a local holding
+    Note: a function pointer, e.g. `proc handler_addr with ...`) must lower to an
+    Note: indirect call, not a direct call to an undefined symbol named after the
+    Note: variable. We resolve the callee name in the current scope and, only when
+    Note: the resolved symbol's kind (offset 16) is explicitly variable/parameter,
+    Note: build the FLAT HIR_INDIRECT_CALL node here. SYMBOL_FUNCTION callees,
+    Note: unresolved names (imported/local functions), and non-identifier callees
+    Note: all fall through to the unchanged direct-call construction below.
+    If callee_ast is not equal to 0:
+        Let divert_callee_kind be proc memory_get_int64 from Layout with callee_ast, 0
+        If divert_callee_kind is equal to AST_IDENTIFIER from AST:
+            Let divert_callee_name be proc ast_node_get_value from AST with callee_ast
+            If divert_callee_name is not equal to 0:
+                Let divert_scope be proc get_current_scope with context
+                Let divert_sym be proc resolve_symbol with context, divert_callee_name, divert_scope
+                If divert_sym is not equal to 0:
+                    Let divert_sym_kind be proc memory_get_int64 from Layout with divert_sym, 16
+                    Let divert_is_var be 0
+                    If divert_sym_kind is equal to SYMBOL_VARIABLE from HIR:
+                        Set divert_is_var to 1
+                    End If
+                    If divert_sym_kind is equal to SYMBOL_PARAMETER from HIR:
+                        Set divert_is_var to 1
+                    End If
+                    If divert_is_var is equal to 1:
+                        Note: Derive the return type the same way lower_indirect_call_expression
+                        Note: does: from the function-value's HIRTypeInfo (offset 32 of the
+                        Note: function type) when it is a HIR_FUNCTION_TYPE; otherwise leave it
+                        Note: unknown (0) rather than fabricate a type.
+                        Let divert_return_type be 0
+                        Let divert_fn_type be proc get_hir_node_type_info from HIR with callee_hir
+                        If divert_fn_type is not equal to 0:
+                            Let divert_type_kind be proc memory_get_int64 from Layout with divert_fn_type, 0
+                            If divert_type_kind is equal to HIR_FUNCTION_TYPE from HIR:
+                                Set divert_return_type to proc memory_get_int64 from Layout with divert_fn_type, 32
+                            End If
+                        End If
+
+                        Note: Build the FLAT HIR_INDIRECT_CALL node per the locked layout:
+                        Note: function_value@8 = the lowered variable reference (callee_hir),
+                        Note: arguments@16, arg_count@24, return_type@32.
+                        Let divert_node be proc create_hir_node from HIR with HIR_INDIRECT_CALL from HIR, line, column
+                        If divert_node is equal to 0:
+                            Return 0
+                        End If
+
+                        proc memory_set_int64 from Layout with divert_node, 8, callee_hir
+                        proc memory_set_int64 from Layout with divert_node, 16, arguments_hir
+                        proc memory_set_int64 from Layout with divert_node, 24, arg_count
+                        proc memory_set_int64 from Layout with divert_node, 32, divert_return_type
+
+                        If divert_return_type is not equal to 0:
+                            proc set_hir_node_type_info from HIR with divert_node, divert_return_type
+                        End If
+
+                        Return divert_node
+                    End If
+                End If
+            End If
+        End If
+    End If
+
     Note: Build the HIR_CALL_EXPRESSION as a FLAT node (node_type @0). The
     Note: create_hir_call_expression WRAPPER stored a base-node POINTER at
     Note: offset 0, so the HIR visitor read that pointer as the node_type tag,
@@ -1752,13 +1815,6 @@ Process called "lower_indirect_call_expression" takes context as Integer, ast_no
         Set i to i plus 1
     End While
 
-    Note: Create base HIR node
-    Let base_hir be proc create_hir_node from HIR with HIR_INDIRECT_CALL from HIR, line, column
-
-    If base_hir is equal to 0:
-        Return 0
-    End If
-
     Note: Get function type from function value expression
     Let function_type be proc get_hir_node_type_info from HIR with function_value_hir
 
@@ -1776,19 +1832,36 @@ Process called "lower_indirect_call_expression" takes context as Integer, ast_no
     Note: Get return type from function type signature (offset 32)
     Let return_type be proc memory_get_int64 from Layout with function_type, 32
 
-    Note: Create specialized indirect call HIR node
-    Let indirect_call_expr be proc create_hir_indirect_call from HIRNodes with base_hir, function_value_hir, arguments_hir, arg_count, return_type
+    Note: Build the HIR_INDIRECT_CALL as a FLAT node (node_type @0), mirroring the
+    Note: HIR_CALL_EXPRESSION flat-node contract built by lower_call_expression.
+    Note: The create_hir_indirect_call WRAPPER stored a base-node POINTER at
+    Note: offset 0, which the HIR visitor would read as the node_type tag and
+    Note: never match HIR_INDIRECT_CALL (10018), so the function-value/argument
+    Note: children were never recursed and the call produced no MIR. The
+    Note: consumer contract (visitor + MIR lowering) is:
+    Note:   node_type      @0  (visitor dispatch),
+    Note:   function_value @8  (visitor child_index 0; MIR post pops it as callee),
+    Note:   arguments      @16 (visitor child_index 1..N),
+    Note:   arg_count      @24 (visitor loop bound; MIR pre records it),
+    Note:   return_type    @32 (MIR post reads it for the result type).
+    Let base be proc create_hir_node from HIR with HIR_INDIRECT_CALL from HIR, line, column
 
-    If indirect_call_expr is equal to 0:
+    If base is equal to 0:
         Return 0
     End If
 
-    Note: Set return type on base HIR node
+    proc memory_set_int64 from Layout with base, 8, function_value_hir
+    proc memory_set_int64 from Layout with base, 16, arguments_hir
+    proc memory_set_int64 from Layout with base, 24, arg_count
+    proc memory_set_int64 from Layout with base, 32, return_type
+
+    Note: Also record the result type in the base header type-info slot for
+    Note: passes that read get_hir_node_type_info.
     If return_type is not equal to 0:
-        proc set_hir_node_type_info from HIR with base_hir, return_type
+        proc set_hir_node_type_info from HIR with base, return_type
     End If
 
-    Return indirect_call_expr
+    Return base
 End Process
 
 Process called "lower_member_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
