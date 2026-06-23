@@ -68,6 +68,7 @@ Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
 Import "compiler/frontend/diagnostics/diagnostics_engine.runa" as Diagnostics
 Import "compiler/frontend/diagnostics/errors.runa" as Errors
 Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 
 Note: ============================================================================
 Note: Parser State Structure
@@ -378,8 +379,45 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
             Break
         End If
 
+        Note: First-class annotation blocks (@Reasoning ... @End Reasoning, etc.)
+        Note: appear at top level between declarations. They are NOT comments —
+        Note: they are machine-parseable constructs that the parser must consume
+        Note: and attach to the construct they govern. The annotation parser fully
+        Note: handles single and sequential blocks; we parse the run here, then
+        Note: attach it to the NEXT declaration. Without this, a leading "@" fails
+        Note: both the declaration and statement parse, "Unexpected token" fires,
+        Note: and panic-mode synchronization skips across the following Process
+        Note: header — dropping every declaration after the annotation. See the
+        Note: monolith's equivalent declaration-position annotation handling.
+        Let pending_annotations be 0
+        Let anno_kind be proc parser_at_annotation_block from AnnotationParser with parser
+        If anno_kind is not equal to 0:
+            Set pending_annotations to proc parse_annotation_blocks from AnnotationParser with parser
+            Note: A parse error inside an annotation block returns 0; recover and
+            Note: continue rather than silently dropping the rest of the file.
+            If pending_annotations is equal to 0:
+                proc parser_synchronize with parser
+                Continue
+            End If
+
+            Note: After consuming the annotation run we may be at EOF (trailing
+            Note: annotations) — re-check the stream end before parsing a construct.
+            Let anno_at_end be proc parser_is_at_end with parser
+            If anno_at_end is equal to 1:
+                Break
+            End If
+        End If
+
         Note: Try to parse declaration
         Let decl_node be proc parser_parse_declaration with parser
+
+        Note: Attach any preceding annotation blocks to the parsed declaration so
+        Note: downstream tooling can locate the intent governing this construct.
+        If decl_node is not equal to 0:
+            If pending_annotations is not equal to 0:
+                proc attach_annotations_to_node from AnnotationParser with decl_node, pending_annotations
+            End If
+        End If
 
         If decl_node is not equal to 0:
             Note: Macro driver splice (task #498). A macro definition returns an
@@ -436,6 +474,74 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                     Let line be proc memory_get_qword from Layout with current_token, 16
                     Let column be proc memory_get_qword from Layout with current_token, 24
                     proc parser_report_error with parser, 1, proc create_from_literal from StringCore with "Unexpected token", line, column
+
+                    Note:
+                    PHASE 2 — this is the TOP-LEVEL silent-drop site. When BOTH
+                    parser_parse_declaration AND parser_parse_statement return 0,
+                    the construct here cannot be parsed; parser_report_error only
+                    COLLECTS into the diagnostics engine (no stderr in a
+                    standalone compile), then parser_synchronize panic-skips past
+                    the next declaration header — silently dropping every
+                    following top-level Process. This is where the modular
+                    self-host function-drop cascade is actually CONTAINED (the
+                    instrumented body-statement site in statement_parsers only
+                    sees failures that reach parse_single_statement; a failure in
+                    a declaration header or a body statement that the block
+                    parser cannot even start lands HERE instead). Mirror the
+                    body-statement diagnostic exactly so the top-level cascade
+                    names the construct + line it derails on. Same proven path:
+                    token_type_to_string (operators/keywords/"<token>" fallback)
+                    + integer_to_string for the line, each its own Alert — never
+                    `Display X joined with <Integer>` (SEGV) or the comma
+                    desugar (miscompiled integer_to_string in this hot path).
+                    :End Note
+                    Note:
+                    Diagnostic string operands are bound `as String`: the type
+                    names / line number come from token_type_to_string and
+                    integer_to_string, and integer_to_string is a QUALIFIED
+                    imported call whose return type codegen cannot infer under
+                    separate compilation (the imported body is absent from this
+                    module's local function table). Without the annotation the
+                    variable defaults to Integer and `Alert <var>` prints the
+                    string POINTER as a decimal. The explicit `as String` (honored
+                    by the STMT_LET codegen path) pins the type so print_string is
+                    selected and the text renders — the supported substitute for
+                    the miscompiling `joined with` / comma-concat desugar.
+                    :End Note
+                    Let drop_type be proc memory_get_qword from Layout with current_token, 0
+                    Let drop_value be proc memory_get_qword from Layout with current_token, 8
+
+                    Note:
+                    Suppress the diagnostic at end-of-stream. A trailing
+                    TOKEN_EOF (type 0) can reach this fallback when
+                    parser_is_at_end has not yet latched on the synthetic
+                    end token (line 0); reporting it would emit one spurious
+                    `UNKNOWN at line 0` per file. Every real dropped construct
+                    carries a non-EOF type and a real source line, so guarding on
+                    TOKEN_EOF removes only the end-of-input noise.
+                    :End Note
+                    If drop_type is not equal to TOKEN_EOF:
+                        Let drop_type_name as String be proc token_type_to_string with drop_type
+                        Let drop_line_str as String be proc integer_to_string from StringPrimitive with line
+                        Note:
+                        One clear line per dropped top-level construct: the
+                        leading Alerts use `continuing` (no-newline _nonl helpers)
+                        so the type name, optional spelling, and line render on a
+                        single line ended by the final newline Alert.
+                        :End Note
+                        Alert "[PARSE ERROR] top-level declaration: " continuing
+                        Alert drop_type_name continuing
+                        If drop_type is equal to TOKEN_IDENTIFIER:
+                            If drop_value is not equal to 0:
+                                Let drop_value_str as String be drop_value
+                                Alert "/" continuing
+                                Alert drop_value_str continuing
+                            End If
+                        End If
+                        Alert " at line " continuing
+                        Alert drop_line_str continuing
+                        Alert "\n"
+                    End If
                 End If
 
                 Note: Synchronize to next statement boundary
@@ -940,6 +1046,171 @@ Process called "token_get_value" takes token as Integer returns Integer:
 
     Let value be proc memory_get_qword from Layout with token, 8
     Return value
+End Process
+
+Process called "token_can_be_identifier" takes token_type as Integer returns Integer:
+    Note:
+    Liberal identifier-eligibility predicate. Returns 1 when a token of the
+    given type is permitted to stand in for a plain identifier at an
+    identifier-EXPECTING position (the first word of a binder name, a parameter
+    name, a field name, or the head of a primary expression). Returns 0
+    otherwise.
+
+    This mirrors the monolith parser's token_can_be_identifier
+    (v0.0.8.4.5.3.5/src/parser.runa:43). Several natural-language words double as
+    contextual keywords AND as legitimate variable / parameter / field names:
+    e.g. `left`, `right`, `shifted`, `xor`, `bitwise` (the bit-operator words),
+    `count`, `index`, `key`, `length`, `error`, `pointer`, `loop`, `forever`,
+    `list`, `count`, the articles `a`/`an`, and so on. The lexer classifies each
+    by its keyword token TYPE (the source spelling is still carried in the token
+    value at offset 8), so a parser that only accepts TOKEN_IDENTIFIER rejects
+    `Let left be 5` / `Return left` / a parameter named `left`, fails the parse,
+    and panic-mode recovery then drops every following declaration.
+
+    The predicate is intentionally LIBERAL: it is consulted ONLY where the
+    grammar already expects an identifier, never in operator position, so
+    accepting operator-spelled keywords here cannot mis-bind an arithmetic
+    expression (the operator dispatch runs in a different position).
+    :End Note
+
+    Note: Always an identifier.
+    If token_type is equal to TOKEN_IDENTIFIER:
+        Return 1
+    End If
+
+    Note: Bit-operator words usable as names: bitwise / xor / shifted / left / right.
+    If token_type is equal to TOKEN_BITWISE:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_XOR:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SHIFTED:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LEFT:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RIGHT:
+        Return 1
+    End If
+
+    Note: Other context-sensitive nouns/words legal as names.
+    If token_type is equal to TOKEN_NEGATIVE:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_COUNT:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_POINTER:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ERROR:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CONTAINS:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ALERT:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LOOP:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FOREVER:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_JOINED:
+        Return 1
+    End If
+
+    Note: Natural-language suffix/clause nouns also usable as names.
+    If token_type is equal to TOKEN_INDEX:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_KEY:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_WHERE:
+        Return 1
+    End If
+
+    Note: Collection-name nouns.
+    If token_type is equal to TOKEN_LIST:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_DICTIONARY:
+        Return 1
+    End If
+
+    Note: Other variable-name-eligible keywords mirrored from the monolith.
+    If token_type is equal to TOKEN_CONSTANT:
+        Return 1
+    End If
+
+    Note:
+    Collection / sizing / selection nouns. The MONOLITH lexer
+    (v0.0.8.4.5.3.5/src/lexer.runa) does NOT register `size`, `sorted`, `item`,
+    `items`, `first`, `last`, `timeout` or the aggregation words (`average`,
+    `sum`, `minimum`, `maximum`) as keywords at all — it lexes each as a
+    plain TOKEN_IDENTIFIER, so they are universally legal as variable,
+    parameter, and field names there. The v0.0.8.5 modular lexer promoted them
+    to dedicated keyword tokens to drive the new collection / selection
+    expression grammar (`first N items`, `x sorted by f`, `count of xs`, ...),
+    which broke their identifier sense. They remain valid names because every
+    keyword dispatch that consumes them (the aggregation two-token gate, the
+    first/last selection gate, the postfix `sorted by`, the Receive `timeout`
+    clause) runs BEFORE the identifier fallback reaches this predicate; only a
+    bare occurrence in a name slot lands here. Accepting them restores the
+    monolith's identifier acceptance without re-enabling any operator misparse.
+    :End Note
+    If token_type is equal to TOKEN_SIZE:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SORTED:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ITEM:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ITEMS:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FIRST:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LAST:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_TIMEOUT:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_AVERAGE:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SUM:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MINIMUM:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MAXIMUM:
+        Return 1
+    End If
+    Note:
+    `power` is registered as TOKEN_POWER to drive the `to the power of`
+    exponentiation operator, which the precedence table consumes in infix
+    expression context only. A bare `power` in a name slot (e.g. the
+    `power as Integer` parameter in softfloat's float128_multiply_power_of_2)
+    reaches this predicate after every operator gate has declined it, exactly
+    like the aggregation/selection keywords above. Accepting it restores the
+    monolith's identifier sense without re-enabling any exponentiation misparse.
+    :End Note
+    If token_type is equal to TOKEN_POWER:
+        Return 1
+    End If
+
+    Return 0
 End Process
 
 Process called "token_get_line" takes token as Integer returns Integer:

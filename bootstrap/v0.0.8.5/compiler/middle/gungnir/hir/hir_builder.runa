@@ -787,6 +787,11 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
         Return proc lower_record_literal with context, ast_node, line, column
     End If
 
+    Note: Struct construction: `a value of type T [with f as v, ...]`
+    If node_type is equal to AST_NEW_EXPRESSION from AST:
+        Return proc lower_new_expression with context, ast_node, line, column
+    End If
+
     Note: Statements (2000-2999)
     If node_type is equal to AST_LET_STATEMENT from AST:
         Return proc lower_let_statement with context, ast_node, line, column
@@ -810,6 +815,12 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
 
     If node_type is equal to AST_RETURN_STATEMENT from AST:
         Return proc lower_return_statement with context, ast_node, line, column
+    End If
+
+    Note: Alert/Display print statement -- desugars to a direct print_string /
+    Note: print_integer (or _nonl) runtime call, mirroring monolith codegen.
+    If node_type is equal to AST_PRINT_STATEMENT from AST:
+        Return proc lower_print_statement with context, ast_node, line, column
     End If
 
     If node_type is equal to AST_MATCH_STATEMENT from AST:
@@ -844,6 +855,14 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
     Note: Unsafe Block (P2-D Q4 — CEO amendment 2026-05-24)
     If node_type is equal to AST_UNSAFE_BLOCK from AST:
         Return proc lower_unsafe_block with context, ast_node, line, column
+    End If
+
+    Note: Inline Assembly block. AST_INLINE_ASSEMBLY (9008) carries the verbatim
+    Note: target assembly text in its value slot and the dialect in value_type.
+    Note: Lowered to HIR_INLINE_ASSEMBLY which the MIR/LIR pipeline carries down
+    Note: to the backend emit_inline_asm leaf.
+    If node_type is equal to AST_INLINE_ASSEMBLY from AST:
+        Return proc lower_inline_assembly with context, ast_node, line, column
     End If
 
     Note: Declarations (3000-3999)
@@ -1011,13 +1030,38 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
             Note: HIR_DEFINE_STATEMENT global form (identical to Constant). The Let and
             Note: Define AST node layouts are byte-identical ([identifier, type?, expr]).
             Let child_kind be proc memory_get_int64 from Layout with child_ast, 0
+            Note: Sep-comp Stage 5: an imported process definition is present in the
+            Note: merged AST only so the pre-lowering mangle-resolve pass (already run by
+            Note: the driver before this lowering) can see it as part of the function
+            Note: table and resolve cross-module calls to its module-mangled @PLT symbol.
+            Note: Its BODY must NOT be emitted into this object — otherwise every object
+            Note: would carry the whole inlined import closure and the same definitions
+            Note: would collide at link time (the multiple-definition failure Stage 5
+            Note: eliminates). Skip lowering it entirely so no HIR_PROCESS_DEFINITION ->
+            Note: MIR function -> backend label/.globl is produced for it; the call sites
+            Note: still resolve because (a) resolution already stamped their @PLT symbols
+            Note: and (b) lower_program's forward-declaration pre-pass above interned every
+            Note: top-level process name (imported included) into the program scope as a
+            Note: SYMBOL_FUNCTION, so a bare-name reference to an imported function still
+            Note: lowers as a call to that external symbol. The definition itself is
+            Note: emitted by the object compiled FROM the imported module's own file.
+            Let child_is_imported be 0
+            If child_kind is equal to AST_PROCESS_DEFINITION from AST:
+                Set child_is_imported to proc process_def_get_imported from AST with child_ast
+            End If
             Let child_hir be 0
-            If child_kind is equal to AST_LET_STATEMENT from AST:
-                Let child_line be proc memory_get_int64 from Layout with child_ast, 8
-                Let child_column be proc memory_get_int64 from Layout with child_ast, 16
-                Set child_hir to proc lower_constant_statement with context, child_ast, child_line, child_column
+            If child_is_imported is equal to 1:
+                Note: Imported body suppressed -- leave child_hir at 0 so nothing is
+                Note: appended to this object's HIR declarations.
+                Set child_hir to 0
             Otherwise:
-                Set child_hir to proc lower_ast_node with context, child_ast
+                If child_kind is equal to AST_LET_STATEMENT from AST:
+                    Let child_line be proc memory_get_int64 from Layout with child_ast, 8
+                    Let child_column be proc memory_get_int64 from Layout with child_ast, 16
+                    Set child_hir to proc lower_constant_statement with context, child_ast, child_line, child_column
+                Otherwise:
+                    Set child_hir to proc lower_ast_node with context, child_ast
+                End If
             End If
             If child_hir is not equal to 0:
                 proc append from List with hir_declarations, child_hir
@@ -1546,6 +1590,18 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
     proc memory_set_int64 from Layout with call_expr, 32, resolved_function
     proc memory_set_int64 from Layout with call_expr, 40, return_type
 
+    Note: Sep-comp stages 3c+4: carry the AST call's resolved module-mangled symbol
+    Note: (AST CallExpressionNode offset 104) and @PLT cross-object flag (offset 112)
+    Note: onto free slots of the flat HIR call node so the HIR->MIR->LIR chain can
+    Note: thread them to emit_call. The HIR call uses offsets 8/16/24/32/40; offset 48
+    Note: (base value_type, unused for a call) carries the mangled symbol and offset 96
+    Note: (base ast_node, unused for a call) carries the flag. A 0 symbol / flag means
+    Note: "no resolution" and the existing plain-name path runs unchanged.
+    Let ast_resolved_symbol be proc memory_get_int64 from Layout with ast_node, 104
+    Let ast_cross_module be proc memory_get_int64 from Layout with ast_node, 112
+    proc memory_set_int64 from Layout with call_expr, 48, ast_resolved_symbol
+    proc memory_set_int64 from Layout with call_expr, 96, ast_cross_module
+
     Note: Also record the result type in the base header type-info slot for
     Note: passes that read get_hir_node_type_info.
     If return_type is not equal to 0:
@@ -1788,7 +1844,15 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
     Note: Get property name from property AST node
     Let property_name be proc ast_node_get_value from AST with property_ast
 
-    Note: Create base HIR node
+    Note: Build the member-access node as a FLAT HIR node so node_type (10007) is
+    Note: at offset 0. The MIR visitor (visit_node_children) dispatches on offset 0
+    Note: and walks the object at offset 8; lower_hir_member_expression_post reads
+    Note: the field byte-offset at offset 24 and the field type at offset 32. The
+    Note: previous code returned the create_hir_member_expression WRAPPER, whose
+    Note: offset 0 holds a base-node POINTER (not 10007) and whose offset 24 holds
+    Note: a field INDEX (not a byte offset) -- the visitor never recognised the node
+    Note: and the post handler never fired, mirroring the binary-expression flat-node
+    Note: fix in lower_binary_expression.
     Let base_hir be proc create_hir_node from HIR with HIR_MEMBER_EXPRESSION from HIR, line, column
 
     If base_hir is equal to 0:
@@ -1808,18 +1872,33 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
         Set member_index to 0  Note: Use 0 as fallback
     End If
 
-    Note: Create specialized member expression HIR node
-    Let member_expr be proc create_hir_member_expression from HIRNodes with base_hir, object_hir, property_name, member_index, member_type
+    Note: Field byte offset: index * 8 (one 8-byte slot per field), matching the
+    Note: record-construction layout in lower_record_literal / lower_new_expression.
+    Let field_offset be member_index multiplied by 8
 
-    If member_expr is equal to 0:
-        Return 0
-    End If
+    Note: A record-typed local variable is stored INLINE in its alloca (the record
+    Note: literal post handler pushes the alloca ADDRESS and the Let maps the
+    Note: variable's symbol id to it). Field access therefore needs the BASE ADDRESS
+    Note: of that storage plus the field offset -- not a loaded value. The
+    Note: HIR_IDENTIFIER rvalue handler emits a LOAD and pushes the loaded word, so
+    Note: the member MIR handler cannot use the auto-walked object value as a base.
+    Note: Capture the object identifier's resolved symbol id (stored at
+    Note: HIR_IDENTIFIER offset 16 by lower_identifier) so the member MIR handler can
+    Note: look up the alloca address directly, exactly as the Set lvalue path does.
+    Let object_symbol_id be proc memory_get_int64 from Layout with object_hir, 16
+
+    Note: Flat HIR_MEMBER_EXPRESSION contract: node_type@0 (set by create_hir_node),
+    Note: object@8, object_symbol_id@16, field_offset@24, field_type@32.
+    proc memory_set_int64 from Layout with base_hir, 8, object_hir
+    proc memory_set_int64 from Layout with base_hir, 16, object_symbol_id
+    proc memory_set_int64 from Layout with base_hir, 24, field_offset
+    proc memory_set_int64 from Layout with base_hir, 32, member_type
 
     If member_type is not equal to 0:
         proc set_hir_node_type_info from HIR with base_hir, member_type
     End If
 
-    Return member_expr
+    Return base_hir
 End Process
 
 Process called "lower_index_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
@@ -2635,6 +2714,230 @@ Process called "lower_return_statement" takes context as Integer, ast_node as In
     proc memory_set_int64 from Layout with base_hir, 8, return_value_hir
 
     Return base_hir
+End Process
+
+Process called "lower_inline_assembly" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower an Inline Assembly block (AST_INLINE_ASSEMBLY, 9008) to HIR.
+
+    @Reasoning
+    An inline-assembly block carries verbatim target assembly text that the
+    compiler must emit unchanged. There is nothing to type-check or transform:
+    the body is opaque machine code. The AST node carries the raw text in its
+    value slot (offset 40, set by build_inline_assembly via ast_node_set_value)
+    and the dialect flag in its value_type slot (offset 48, set by the parser).
+    We mirror those two fields onto a HIR_INLINE_ASSEMBLY node so the MIR and
+    LIR lowering can carry the text down to the backend emit_inline_asm leaf
+    without re-parsing it.
+    @End Reasoning
+
+    @Implementation
+    The HIR node uses the generic-value slot at offset 8 for the raw text
+    pointer (the slot the MIR lowering reads, paralleling HIR_RETURN_STATEMENT's
+    return value at offset 8) and offset 16 for the dialect flag (0=intel,
+    1=att). Both are read straight from the AST node: value at offset 40,
+    value_type at offset 48.
+    @End Implementation
+
+    @Performance_Hints
+    O(1): two field reads and two field writes. No body scanning, no allocation
+    beyond the single HIR node.
+    @End Performance_Hints
+
+    @Security_Scope
+    The assembly text is emitted verbatim; the compiler performs no validation
+    of its contents. This is by design -- inline assembly is an explicit escape
+    hatch used only by the low-level memory/intrinsic primitives, which are
+    audited at the source level.
+    @End Security_Scope
+
+    Let raw_text be proc ast_node_get_value from AST with ast_node
+    Let dialect be proc memory_get_int64 from Layout with ast_node, 48
+
+    Let base_hir be proc create_hir_node from HIR with HIR_INLINE_ASSEMBLY from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    Note: Carry the raw asm text (offset 8) and dialect flag (offset 16) for the
+    Note: MIR/LIR lowering chain.
+    proc memory_set_int64 from Layout with base_hir, 8, raw_text
+    proc memory_set_int64 from Layout with base_hir, 16, dialect
+
+    Return base_hir
+End Process
+
+Process called "print_expr_is_string" takes expr_ast as Integer returns Integer:
+    Note:
+    Type-directed dispatch helper for print statements. Returns 1 when the
+    print expression should be routed through print_string, 0 when it
+    should be routed through print_integer. This mirrors the stage1
+    monolith codegen's AST-level type dispatch (codegen.runa:8612-8717):
+      - a string literal,
+      - a call whose callee names a string-returning function
+        (string_concat, string_duplicate, string_substring,
+         integer_to_string, string_replace, string_trim, read_file,
+         char_to_string),
+    all print as strings; everything else (integer literals, arithmetic,
+    integer-returning calls, untyped variables) prints as an integer.
+    :End Note
+    If expr_ast is equal to 0:
+        Return 0
+    End If
+
+    Let expr_kind be proc memory_get_int64 from Layout with expr_ast, 0
+
+    Note: String literal: AST_LITERAL (1000) with value_type TOKEN_STRING_LITERAL (100).
+    If expr_kind is equal to AST_LITERAL from AST:
+        Let lit_value_type be proc ast_node_get_value_type from AST with expr_ast
+        If lit_value_type is equal to 100:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Note: Call expression: inspect the callee identifier name against the
+    Note: set of string-returning runtime/library functions.
+    If expr_kind is equal to AST_CALL_EXPRESSION from AST:
+        Let callee_ast be proc memory_get_int64 from Layout with expr_ast, 80
+        If callee_ast is equal to 0:
+            Return 0
+        End If
+        Let callee_kind be proc memory_get_int64 from Layout with callee_ast, 0
+        If callee_kind is not equal to AST_IDENTIFIER from AST:
+            Return 0
+        End If
+        Let callee_name be proc ast_node_get_value from AST with callee_ast
+        If callee_name is equal to 0:
+            Return 0
+        End If
+        If proc string_equals from StringCore with callee_name, "string_concat" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "string_duplicate" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "string_substring" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "integer_to_string" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "string_replace" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "string_trim" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "read_file" is equal to 1:
+            Return 1
+        End If
+        If proc string_equals from StringCore with callee_name, "char_to_string" is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Process called "lower_print_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note:
+    Lower an Alert/Display print statement (AST_PRINT_STATEMENT = 9015) to
+    HIR. The modular CPU pipeline has no dedicated print HIR node; instead
+    we desugar the print into a direct call to the appropriate runtime
+    helper, exactly as the stage1 monolith codegen emits `call print_string`
+    / `call print_integer` (codegen.runa:8594). The HIR call then flows
+    unchanged through MIR -> LIR -> emit_call, which emits
+    `callq <helper>` against the codegen-emitted helper stubs documented in
+    runtime/integration/runtime_api.runa.
+
+    Helper selection mirrors the monolith:
+      - print_expr_is_string decides print_string vs print_integer by
+        inspecting the expression's AST shape/type,
+      - the continuing (no-trailing-newline) flag, stored in the AST node
+        value slot by build_print_statement, routes through the _nonl
+        helper variant (Task #428).
+
+    Rather than hand-construct the HIR call node, this handler synthesizes a
+    normal AST_CALL_EXPRESSION (`print_string(expr)` / `print_integer(expr)`)
+    and lowers it through lower_call_expression -- the exact path every other
+    call statement takes. This guarantees the produced HIR call carries the
+    same callee/argument wiring (and the same type-info / symbol slots) that
+    the MIR statement-lowering and the rest of the pipeline expect, which a
+    hand-built node did not.
+    :End Note
+    If context is equal to 0:
+        Return 0
+    End If
+    If ast_node is equal to 0:
+        Return 0
+    End If
+
+    Note: The print expression is child 0; the continuing flag is in the value slot.
+    Let expr_ast be 0
+    Let child_count be proc memory_get_int64 from Layout with ast_node, 32
+    If child_count is greater than 0:
+        Set expr_ast to proc ast_node_get_child from AST with ast_node, 0
+    End If
+    If expr_ast is equal to 0:
+        Return 0
+    End If
+
+    Let continuing be proc ast_node_get_value from AST with ast_node
+
+    Note: Select the runtime helper name by type-directed dispatch.
+    Let is_string be proc print_expr_is_string with expr_ast
+    Let helper_name be 0
+    If is_string is equal to 1:
+        If continuing is equal to 1:
+            Set helper_name to proc create_from_literal from StringCore with "print_string_nonl"
+        Otherwise:
+            Set helper_name to proc create_from_literal from StringCore with "print_string"
+        End If
+    Otherwise:
+        If continuing is equal to 1:
+            Set helper_name to proc create_from_literal from StringCore with "print_integer_nonl"
+        Otherwise:
+            Set helper_name to proc create_from_literal from StringCore with "print_integer"
+        End If
+    End If
+
+    Note:
+    Desugar the print into a normal call AST node `print_string(expr)` /
+    `print_integer(expr)` and lower it through the SAME lower_call_expression
+    path every other call statement takes. Synthesizing the HIR call node by
+    hand here produced a call whose callee identifier was not lowered through
+    lower_identifier, so the MIR statement-lowering dropped the enclosing
+    function entirely. Routing through an AST_CALL_EXPRESSION + the canonical
+    lowering yields byte-identical HIR to a hand-written `proc print_string
+    with expr`, which the MIR/LIR chain lowers to `callq print_string` against
+    the codegen-emitted helper stubs (runtime/integration/runtime_api.runa).
+
+    The callee is a bare AST_IDENTIFIER (node type 1001, name in the value
+    slot with value_type tag 1 = string), and the single argument is the
+    original print expression AST node. create_call_expression_node attaches
+    the callee plus the argument as children and records callee@80 /
+    arguments@88 / argument_count@96 — the layout lower_call_expression reads.
+    :End Note
+    Let callee_ast be proc create_ast_node from AST with 1001, line, column
+    If callee_ast is equal to 0:
+        Return 0
+    End If
+    proc ast_node_set_value from AST with callee_ast, helper_name, 1
+
+    Let call_args be proc create from List
+    If call_args is equal to 0:
+        Return 0
+    End If
+    proc append from List with call_args, expr_ast
+
+    Let call_ast be proc create_call_expression_node from AST with callee_ast, call_args, 1, line, column
+    If call_ast is equal to 0:
+        Return 0
+    End If
+
+    Note: Lower the synthesized call through the canonical call-expression path.
+    Return proc lower_call_expression with context, call_ast, line, column
 End Process
 
 Process called "lower_match_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
@@ -3706,6 +4009,25 @@ Process called "lower_record_literal" takes context as Integer, ast_node as Inte
 
     Let field_count be proc memory_get_int64 from Layout with ast_node, 32
 
+    Note: The canonical struct constructor `a value of type T [with f as v, ...]`
+    Note: parses to an AST_RECORD_LITERAL (parse_a_value_of_type_construction) whose
+    Note: value slot carries the type NAME string. Resolve it to the record
+    Note: HIRTypeInfo registered by lower_type_definition (field roster at offset 72)
+    Note: so the constructed value -- and the variable a Let binds it to -- carries the
+    Note: full field layout. Without this, member access against the value fails type
+    Note: resolution and aborts HIR lowering for the whole program. A null name (a
+    Note: bare/anonymous record literal) leaves record_type 0, preserving the prior
+    Note: untyped behaviour for that form.
+    Let record_type be 0
+    Let record_type_name be proc ast_node_get_value from AST with ast_node
+    If record_type_name is not equal to 0:
+        Let rl_scope be proc get_current_scope with context
+        Let rl_type_symbol be proc resolve_symbol with context, record_type_name, rl_scope
+        If rl_type_symbol is not equal to 0:
+            Set record_type to proc get_symbol_type with rl_type_symbol
+        End If
+    End If
+
     Let values_list be proc create from List
     Let fields_list be proc create from List
     Let lowered_count be 0
@@ -3741,12 +4063,127 @@ Process called "lower_record_literal" takes context as Integer, ast_node as Inte
 
     proc memory_set_int64 from Layout with base_hir, 8, fields_list
     proc memory_set_int64 from Layout with base_hir, 16, lowered_count
-    proc memory_set_int64 from Layout with base_hir, 24, 0
+    proc memory_set_int64 from Layout with base_hir, 24, record_type
 
     Note: The lowered field VALUES are stored in a parallel list at offset
     Note: 40 so the visitor can surface them as children for the MIR post
     Note: handler to consume; the fields_list at offset 8 carries offsets.
     proc memory_set_int64 from Layout with base_hir, 40, values_list
+
+    Note: Attach the resolved user type so lower_let_statement infers the
+    Note: variable's type (hence its field layout) from this construction and a
+    Note: subsequent member access resolves.
+    If record_type is not equal to 0:
+        proc set_hir_node_type_info from HIR with base_hir, record_type
+    End If
+
+    Return base_hir
+End Process
+
+Process called "lower_new_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Lower the canonical struct constructor `a value of type T [with f as v, ...]`
+
+    @Reasoning:
+    build_new_expression (ast_builder.runa) produces an AST_NEW_EXPRESSION
+    (9110) whose value field carries the type name string and whose children
+    are the field-initializer VALUE expressions in source order. There was no
+    lowering arm for this node, so lower_ast_node returned 0 for every
+    construction: the enclosing Let received no initializer HIR and the
+    variable was bound with no type, which made every subsequent member
+    access (c.field) fail type resolution and abort HIR lowering for the
+    whole program. This lowering resolves the named type to its record
+    HIRTypeInfo (registered by lower_type_definition) and produces the same
+    HIR_RECORD_LITERAL node shape the MIR record post handler consumes, while
+    additionally stamping the resolved type so the variable inference in
+    lower_let_statement recovers the field layout.
+    @End Reasoning
+
+    @Implementation
+    Resolve the type name (AST value, offset 40) against the scope's type
+    symbols to obtain the record HIRTypeInfo. Lower each field-initializer
+    child to HIR, building a parallel values list (offset 40) and a per-field
+    info list (offset 8) carrying the 8-byte-slotted declared offset, exactly
+    as lower_record_literal does so lower_hir_record_literal_post allocates
+    and stores correctly. Emit a flat HIR_RECORD_LITERAL (10013):
+    node_type@0, fields_list@8, field_count@16, record_type@24,
+    values_list@40. Attach the resolved HIRTypeInfo to the base node's
+    type_info slot via set_hir_node_type_info so the construction expression
+    carries the user type forward to the binding.
+    @End Implementation
+
+    @Performance_Hints
+    One type-symbol lookup plus N recursive field lowerings and N field-info
+    allocations. Construction is far rarer than member access, so this is a
+    cold path; correctness over micro-optimisation.
+    @End Performance_Hints
+
+    @Security_Scope
+    An unresolved type name yields a null record_type, which leaves the
+    construction untyped; downstream member access then surfaces the missing
+    type as a diagnostic rather than dereferencing a wild pointer. Each field
+    value is independently lowered and a null field value is skipped so it is
+    never propagated to the MIR layer.
+    @End Security_Scope
+
+    Note: Resolve the named type to its record HIRTypeInfo (field roster at
+    Note: offset 72). lower_type_definition attached this to the SYMBOL_TYPE.
+    Let type_name be proc ast_node_get_value from AST with ast_node
+    Let record_type be 0
+    If type_name is not equal to 0:
+        Let current_scope be proc get_current_scope with context
+        Let type_symbol be proc resolve_symbol with context, type_name, current_scope
+        If type_symbol is not equal to 0:
+            Set record_type to proc get_symbol_type with type_symbol
+        End If
+    End If
+
+    Note: Field-initializer values are the AST node's children, in source order.
+    Let field_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    Let values_list be proc create from List
+    Let fields_list be proc create from List
+    Let lowered_count be 0
+
+    Let i be 0
+    While i is less than field_count:
+        Let value_ast be proc ast_node_get_child from AST with ast_node, i
+        If value_ast is not equal to 0:
+            Let value_hir be proc lower_ast_node with context, value_ast
+            If value_hir is not equal to 0:
+                proc append from List with values_list, value_hir
+
+                Note: Field-info record: declared byte offset at offset 8 (8-byte
+                Note: slot per field), matching lower_record_literal and the index*8
+                Note: offset convention used by member access.
+                Let field_info be proc allocate from Layout with 16
+                If field_info is not equal to 0:
+                    Let declared_offset be lowered_count multiplied by 8
+                    proc memory_set_int64 from Layout with field_info, 0, 0
+                    proc memory_set_int64 from Layout with field_info, 8, declared_offset
+                    proc append from List with fields_list, field_info
+                End If
+
+                Set lowered_count to lowered_count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let base_hir be proc create_hir_node from HIR with HIR_RECORD_LITERAL from HIR, line, column
+    If base_hir is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with base_hir, 8, fields_list
+    proc memory_set_int64 from Layout with base_hir, 16, lowered_count
+    proc memory_set_int64 from Layout with base_hir, 24, record_type
+    proc memory_set_int64 from Layout with base_hir, 40, values_list
+
+    Note: Attach the resolved user type so lower_let_statement infers the
+    Note: variable's type (and thus its field layout) from this construction.
+    If record_type is not equal to 0:
+        proc set_hir_node_type_info from HIR with base_hir, record_type
+    End If
 
     Return base_hir
 End Process
@@ -4009,6 +4446,16 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
     proc memory_set_int64 from Layout with process_def, 32, return_type_hir
     proc memory_set_int64 from Layout with process_def, 40, body_hir
 
+    Note: Sep-comp stage 3b: carry the AST definition's stamped origin source_file
+    Note: (AST ProcessDefinitionNode offset 136) onto the HIR process_def node so the
+    Note: MIR->LIR chain can derive this definition's module-mangled label. The flat
+    Note: HIR process_def node overlays the base header at 8-40 and uses symbol_id@88;
+    Note: offset 96 (the base ast_node slot) is unused for this node shape, so it is
+    Note: the free carrier. A 0 origin (unstamped, e.g. no input path) flows down and
+    Note: yields a plain label, preserving the legacy build.
+    Let ast_source_file be proc memory_get_int64 from Layout with ast_node, 136
+    proc memory_set_int64 from Layout with process_def, 96, ast_source_file
+
     Return process_def
 End Process
 
@@ -4094,6 +4541,21 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
     Let current_scope be proc get_current_scope with context
     Let type_symbol be proc create_hir_symbol_info from HIR with type_name, SYMBOL_TYPE from HIR, current_scope
 
+    Note: Build the resolved HIRTypeInfo for this user-defined type and attach it
+    Note: to the type symbol so a later `Let x be a value of type Ctx` (or an
+    Note: explicit `as Ctx` annotation) resolves the name to a record type that
+    Note: carries the field roster. resolve_member_index/resolve_member_type read
+    Note: the field_types list at HIRTypeInfo offset 72 (count at offset 80); a
+    Note: type with no attached HIRTypeInfo would make every member access fail
+    Note: type resolution and abort HIR lowering for the whole program. The same
+    Note: HIRTypeInfo is the value lower_new_expression stamps onto the
+    Note: construction node and lower_let_statement infers onto the variable.
+    Let record_type_info be proc create_hir_type_info from HIR with HIR_RECORD_TYPE from HIR
+    If record_type_info is not equal to 0:
+        proc memory_set_int64 from Layout with record_type_info, 8, type_name  Note: type_name
+        proc set_symbol_type with type_symbol, record_type_info
+    End If
+
     Note: Add type to current scope
     proc add_symbol_to_scope with current_scope, type_symbol
 
@@ -4110,6 +4572,14 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
     If type_def is equal to 0:
         Return 0
     End If
+
+    Note: Field-symbol roster for the resolved HIRTypeInfo. resolve_member_index
+    Note: walks this list (field name at HIRSymbolInfo offset 8) and
+    Note: resolve_member_type reads the matched symbol's type at offset 24, so the
+    Note: same SYMBOL_FIELD records added to the HIR type definition are also
+    Note: collected here in declaration order and stored on record_type_info.
+    Let type_field_list be proc create from List
+    Let lowered_field_count be 0
 
     Note: Lower fields
     Let i be 0
@@ -4140,8 +4610,29 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
         Note: Add field to type definition
         proc add_type_field from HIRNodes with type_def, field_symbol
 
+        Note: Record the field symbol on the resolved type's field roster so member
+        Note: access against a value of this type resolves the field index and type.
+        If field_symbol is not equal to 0:
+            proc append from List with type_field_list, field_symbol
+            Set lowered_field_count to lowered_field_count plus 1
+        End If
+
         Set i to i plus 1
     End While
+
+    Note: Publish the field roster on the resolved HIRTypeInfo (offset 72 =
+    Note: field_types list, offset 80 = field_count). Done after the loop so the
+    Note: list reflects only successfully created field symbols.
+    If record_type_info is not equal to 0:
+        proc memory_set_int64 from Layout with record_type_info, 72, type_field_list
+        proc memory_set_int64 from Layout with record_type_info, 80, lowered_field_count
+        Note: Record total instance size (8-byte word per field, matching the
+        Note: index*8 field-offset convention used by lower_member_expression and
+        Note: lower_record_literal) so allocation of a value of this type reserves
+        Note: the right amount of storage.
+        Let record_size be lowered_field_count multiplied by 8
+        proc set_type_size_and_alignment from HIR with record_type_info, record_size, 8
+    End If
 
     Return type_def
 End Process
@@ -4192,7 +4683,21 @@ Process called "lower_type_annotation" takes context as Integer, type_ast as Int
     Note: Handle basic types
     If type_kind is equal to AST_BASIC_TYPE from AST:
         Let type_name be proc ast_node_get_value from AST with type_ast
-        Return proc resolve_basic_type with context, type_name
+        Let basic_type be proc resolve_basic_type with context, type_name
+        If basic_type is not equal to 0:
+            Return basic_type
+        End If
+        Note: Not a built-in: resolve a user-defined type by name. lower_type_definition
+        Note: registers each `Type called "T"` as a SYMBOL_TYPE in scope carrying the
+        Note: resolved record HIRTypeInfo (field roster at offset 72) on its type slot.
+        Note: Returning that HIRTypeInfo lets an explicit `as T` annotation attach the
+        Note: full field layout so member access against the annotated value resolves.
+        Let current_scope be proc get_current_scope with context
+        Let type_symbol be proc resolve_symbol with context, type_name, current_scope
+        If type_symbol is not equal to 0:
+            Return proc get_symbol_type with type_symbol
+        End If
+        Return 0
     End If
 
     Note: Handle generic types (e.g., List[Integer], Dictionary[String, Integer])

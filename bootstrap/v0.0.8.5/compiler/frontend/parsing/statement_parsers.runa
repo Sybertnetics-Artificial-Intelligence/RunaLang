@@ -53,6 +53,7 @@ Import "compiler/frontend/parsing/expression_parsers.runa" as ExpressionParsers
 Import "compiler/frontend/parsing/ast_builder.runa" as ASTBuilder
 Import "compiler/frontend/parsing/type_annotations.runa" as TypeAnnotations
 Import "compiler/frontend/parsing/ast.runa" as AST
+Import "compiler/frontend/parsing/annotation_parser.runa" as AnnotationParser
 Import "compiler/frontend/lexical/keywords.runa" as Keywords
 Import "compiler/frontend/lexical/operators.runa" as Operators
 Import "compiler/frontend/lexical/delimiters.runa" as Delimiters
@@ -60,6 +61,7 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/lexical/token_constants.runa" as TokenConstants
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 
 Note: ============================================================================
 Note: Parser-side token and ownership-operation constants referenced by statement
@@ -471,8 +473,101 @@ Process called "parse_constant_statement" takes parser as Integer returns Intege
         Return 0
     End If
 
-    Note: 5. Parse value expression
-    Let value_expr be proc parse_expression from ExpressionParsers with parser
+    Note:
+    5. Parse value expression. Detect the typed array-literal constant form
+    first: Constant NAME as T is Array[ElemType, N] is [ v0, v1, ... ]. This is
+    a second surface form for the value side: after the first "is" the value
+    opens with the bare identifier "Array" (the modular lexer has no TOKEN_ARRAY
+    keyword, so "Array" lexes as TOKEN_IDENTIFIER), followed by a bracketed
+    [ElemType, N] type clause and a second "is" that introduces the bracketed
+    element list. That element list is an ordinary bracketed array literal
+    (negative integers, interspersed comment lines, multi-line, optional
+    trailing comma), so we consume the "Array[ElemType, N] is" prefix here and
+    parse the bracketed list via parse_expression. parse_expression dispatches
+    the element list (whether the lexer kept it as a bracketed literal or
+    rewrote it into the canonical "a list containing ..." collection form) to
+    the array/list-literal path, yielding an AST array-literal node that becomes
+    the constant's value expression and lowers through the existing
+    array-literal to HIR list-literal pipeline exactly as "Let xs be [ ... ]".
+    :End Note
+    Let value_expr be 0
+    Let const_array_form be 0
+    Let const_value_token be proc parser_current_token from Parser with parser
+    If const_value_token is not equal to 0:
+        Let const_value_type be proc token_get_type from Parser with const_value_token
+        If const_value_type is equal to TOKEN_IDENTIFIER:
+            Let const_value_name be proc token_get_value from Parser with const_value_token
+            If const_value_name is not equal to 0:
+                Let array_keyword be proc create_from_literal from StringCore with "Array"
+                Let const_name_is_array be proc string_equals from StringCore with const_value_name, array_keyword
+                If const_name_is_array is equal to 1:
+                    Set const_array_form to 1
+                End If
+            End If
+        End If
+    End If
+
+    If const_array_form is equal to 1:
+        Note:
+        Consume the "Array[ElemType, N] is" type-and-shape prefix, then parse
+        the bracketed element list as a value expression. The lexer rewrites a
+        postfix `Identifier[...]` into the canonical `Identifier at ...` index
+        form, so the bracket of the `[ElemType, N]` clause does NOT survive as a
+        standalone TOKEN_LEFT_BRACKET after "Array"; the surviving tokens are the
+        rewritten index words (`at`, the element type, the comma, the size) up to
+        the matching close. Rather than depend on that postfix-index token shape,
+        we skip every token from just after "Array" up to (and consuming) the
+        SECOND "is" keyword, which unambiguously terminates the type-and-shape
+        prefix and introduces the element list. A bounded skip guards against a
+        malformed prefix that never reaches a second "is".
+        :End Note
+        Note: Consume the "Array" identifier.
+        proc parser_consume_token from Parser with parser
+
+        Note: Skip the [ElemType, N] type-and-shape prefix up to the second "is".
+        Let arr_prefix_done be 0
+        Let arr_prefix_guard be 0
+        Loop forever:
+            If arr_prefix_done is equal to 1:
+                Break
+            End If
+            If arr_prefix_guard is greater than 4096:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Unterminated 'Array[Type, N] is' prefix in typed array-literal constant", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+            Let arr_prefix_tok be proc parser_current_token from Parser with parser
+            If arr_prefix_tok is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Unexpected end of input in 'Array[Type, N] is' prefix", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+            Let arr_prefix_type be proc token_get_type from Parser with arr_prefix_tok
+            If arr_prefix_type is equal to TOKEN_EOF:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Unexpected end of input in 'Array[Type, N] is' prefix", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+            proc parser_consume_token from Parser with parser
+            If arr_prefix_type is equal to TOKEN_IS:
+                Set arr_prefix_done to 1
+            End If
+            Set arr_prefix_guard to arr_prefix_guard plus 1
+        End While
+
+        Note:
+        Parse the element list as an ordinary value expression. At value-start
+        position the lexer rewrites the bracketed `[ v0, v1, ... ]` into the
+        canonical collection literal "a list containing v0, v1, ...", so the
+        leading "[" does NOT reach the parser as a TOKEN_LEFT_BRACKET; routing
+        through parse_expression picks up that canonical collection-literal form
+        (and equally a surviving bracketed literal, which parse_expression also
+        dispatches to parse_array_literal). The interspersed comment lines inside
+        the original brackets are stripped by the lexer and never appear in the
+        token stream, so the element list is a clean comma-separated sequence of
+        (optionally negated) integer literals.
+        :End Note
+        Set value_expr to proc parse_expression from ExpressionParsers with parser
+    Otherwise:
+        Set value_expr to proc parse_expression from ExpressionParsers with parser
+    End If
     If value_expr is equal to 0:
         proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression for constant value in Constant statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
@@ -618,8 +713,114 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Note: 5. Parse optional Otherwise clause
-    Let else_block be proc parse_otherwise_clause with parser
+    Note:
+    5. Parse the else chain.
+
+    Runa allows a chained else-if construct of the form
+
+        If c0: ...
+        Otherwise If c1: ...
+        Otherwise If c2: ...
+        Otherwise: ...
+        End If
+
+    where a SINGLE trailing `End If` closes the whole chain. The If AST node
+    (AST_IF_STATEMENT) carries at most one else child, so the chain is
+    represented exactly as the monolith oracle represents it
+    (src/parser.runa parser_parse_if_statement): each `Otherwise If` becomes a
+    nested If statement placed in the else branch of the level above it, and the
+    final plain `Otherwise:` block (if present) is the innermost else branch.
+
+    We collect every `Otherwise If` branch (its condition and its block) into two
+    parallel lists in source order, then capture the optional final `Otherwise:`
+    block. The nested If chain is assembled bottom-up: starting from the final
+    else block, each elif (last to first) wraps the accumulated else branch in a
+    fresh If node. The resulting node is this statement's else child. Because the
+    elif blocks terminate on the next `Otherwise`/`End` (parse_statement_sequence
+    breaks on TOKEN_OTHERWISE and TOKEN_END), no elif consumes the shared
+    closing `End If` — that is consumed once below for the entire chain.
+    :End Note
+    Let elif_conditions be proc create from List
+    Let elif_blocks be proc create from List
+    Let final_else_block be 0
+
+    Loop forever:
+        Let chain_token be proc parser_current_token from Parser with parser
+        Let chain_token_type be proc token_get_type from Parser with chain_token
+
+        Note: The chain only continues while we are sitting on an `Otherwise`.
+        If chain_token_type is not equal to TOKEN_OTHERWISE:
+            Break
+        End If
+
+        Note:
+        Distinguish `Otherwise If <cond>:` (else-if) from a plain `Otherwise:`
+        (final else) by peeking one token past the `Otherwise` keyword without
+        consuming it.
+        :End Note
+        Let after_otherwise be proc parser_peek_token from Parser with parser, 1
+        Let after_otherwise_type be proc token_get_type from Parser with after_otherwise
+
+        If after_otherwise_type is equal to TOKEN_IF:
+            Note: Else-if branch: consume `Otherwise` then `If`, parse condition,
+            Note: colon, and block, recording the branch for bottom-up assembly.
+            proc parser_consume_token from Parser with parser
+            Let elif_if_consumed be proc parser_expect_token from Parser with parser, TOKEN_IF
+            If elif_if_consumed is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'If' after 'Otherwise' in else-if clause", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            Let elif_condition be proc parse_expression from ExpressionParsers with parser
+            If elif_condition is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected condition expression after 'Otherwise If'", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            Let elif_colon_consumed be proc parser_expect_token from Parser with parser, TOKEN_COLON
+            If elif_colon_consumed is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected ':' after 'Otherwise If' condition", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            Let elif_block be proc parse_block_statement with parser
+            If elif_block is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected block after 'Otherwise If' condition", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            proc list_append from List with elif_conditions, elif_condition
+            proc list_append from List with elif_blocks, elif_block
+        Otherwise:
+            Note: Plain final `Otherwise:` clause ends the chain. parse_otherwise_clause
+            Note: consumes the `Otherwise`, colon and block.
+            Set final_else_block to proc parse_otherwise_clause with parser
+            Break
+        End If
+    End Loop
+
+    Note:
+    Assemble the else chain bottom-up. The accumulated else branch starts as the
+    final `Otherwise:` block (0 when absent). Each recorded elif, processed from
+    the last back to the first, becomes an If node whose else child is the
+    accumulated branch; that node then becomes the new accumulated branch. The
+    final accumulated branch is the top-level If statement's else child.
+    :End Note
+    Let else_block be final_else_block
+    Let elif_count be proc list_length from List with elif_conditions
+    Let elif_index be elif_count minus 1
+    While elif_index is greater than or equal to 0:
+        Let chained_condition be proc get from List with elif_conditions, elif_index
+        Let chained_block be proc get from List with elif_blocks, elif_index
+        Let chained_line be proc token_get_line from Parser with proc parser_current_token from Parser with parser
+        Let chained_if be proc build_if_statement from ASTBuilder with chained_condition, chained_block, else_block, chained_line
+        If chained_if is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create else-if statement AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+        Set else_block to chained_if
+        Set elif_index to elif_index minus 1
+    End While
 
     Note: Expect End If
     Let end_if be proc parser_expect_token from Parser with parser, TOKEN_END
@@ -1474,6 +1675,19 @@ Process called "parse_loop_statement" takes parser as Integer returns Integer:
         Return 0
     End If
 
+    Note: 1b. Optionally consume the 'forever' modifier. Canonical Runa writes the
+    Note: infinite loop as "Loop forever:"; 'forever' lexes as TOKEN_FOREVER and sits
+    Note: between the Loop keyword and the colon. The monolith (parser_parse_loop_forever)
+    Note: eats this token unconditionally when present, then the colon. Mirror that here
+    Note: so the colon expectation below does not fire on a perfectly valid
+    Note: "Loop forever:" header (which otherwise fails the body parse and drops every
+    Note: following declaration via panic-mode recovery).
+    Let forever_token be proc parser_current_token from Parser with parser
+    Let forever_type be proc token_get_type from Parser with forever_token
+    If forever_type is equal to TOKEN_FOREVER:
+        proc parser_consume_token from Parser with parser
+    End If
+
     Note: 2. Expect and consume colon
     Let colon_consumed be proc parser_expect_token from Parser with parser, TOKEN_COLON
     If colon_consumed is equal to 0:
@@ -1488,27 +1702,69 @@ Process called "parse_loop_statement" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Note: 4. Expect End While
+    Note: 4. Expect the 'End' keyword.
     Let end_consumed be proc parser_expect_token from Parser with parser, TOKEN_END
     If end_consumed is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'End While' to close Loop statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'End Loop' or 'End While' to close Loop statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
     End If
 
-    Let loop_keyword be proc parser_expect_token from Parser with parser, TOKEN_LOOP
-    If loop_keyword is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Loop' after 'End' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+    Note: Accept either 'End Loop' or 'End While' as the closer. The monolith
+    Note: (parser_parse_loop_forever) eats whichever closer keyword follows 'End'
+    Note: for backward compatibility — "Loop forever:" desugars to a While(true),
+    Note: so both spellings are legal. Consuming the actual closer keyword (rather
+    Note: than rigidly demanding TOKEN_LOOP) prevents a valid "End While" closer
+    Note: from failing and dropping every following declaration.
+    Let closer_token be proc parser_current_token from Parser with parser
+    Let closer_type be proc token_get_type from Parser with closer_token
+    If closer_type is equal to TOKEN_LOOP:
+        proc parser_consume_token from Parser with parser
+    Otherwise:
+        If closer_type is equal to TOKEN_WHILE:
+            proc parser_consume_token from Parser with parser
+        Otherwise:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Loop' or 'While' after 'End' to close Loop statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+    End If
+
+    Note: 5. Desugar `Loop forever:` to a While loop with an always-true condition
+    Note: (Part C). The dedicated AST_LOOP_STATEMENT (2009) produced by
+    Note: build_loop_statement has NO lowering case anywhere in compiler/middle/
+    Note: (hir_builder.runa:808 handles only AST_WHILE_STATEMENT 2008), so a 2009
+    Note: node silently drops its body during HIR lowering. The monolith never emits
+    Note: 2009: parser_parse_loop_forever (src/parser.runa:7458-7462) builds a While
+    Note: with a literal `1 == 1` condition via statement_create_while, reusing the
+    Note: existing While lowering. We mirror that exactly here so the loop body is
+    Note: lowered and emitted. The equality operator code 400 (EQUAL) matches what
+    Note: expression_parsers.runa:1164 produces for a plain "is equal to" comparison,
+    Note: which expression_lowering.runa:188 already handles. Integer literals carry
+    Note: line/column >= 1 so validate_ast_node accepts the synthesized condition.
+    Let true_left be proc build_integer_literal from ASTBuilder with 1, stmt_line, 1
+    If true_left is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to synthesize Loop-forever condition (left operand)", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
     End If
 
-    Note: 5. Create Loop statement AST node
-    Let loop_stmt be proc build_loop_statement from ASTBuilder with body, stmt_line
+    Let true_right be proc build_integer_literal from ASTBuilder with 1, stmt_line, 1
+    If true_right is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to synthesize Loop-forever condition (right operand)", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Let true_condition be proc build_binary_expression from ASTBuilder with 400, true_left, true_right, stmt_line, 1
+    If true_condition is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to synthesize Loop-forever condition (comparison)", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Let loop_stmt be proc build_while_statement from ASTBuilder with true_condition, body, stmt_line
     If loop_stmt is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create Loop statement AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create While statement AST node for Loop-forever", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
     End If
 
-    Note: 6. Return Loop statement AST node
+    Note: 6. Return the desugared While statement AST node
     Return loop_stmt
 End Process
 
@@ -2255,106 +2511,60 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Let stmt_line be proc parser_get_current_line from Parser with parser
+    Note:
+    The lexer captures an entire `Inline Assembly: ... End Assembly` block as a
+    SINGLE TOKEN_INLINE token (lexer.runa lexer_capture_raw_assembly): the body
+    is verbatim target assembly text, not Runa source, so it is never tokenized.
+    The token carries the raw asm text in its VALUE slot (offset 8) and the
+    dialect flag in its metadata slot (offset 40; 0=intel default, 1=att). This
+    parser consumes that one token and builds the AST_INLINE_ASSEMBLY node with
+    the raw text as its value and the dialect as its value_type, mirroring the
+    monolith's STMT_INLINE_ASSEMBLY (parser.runa:8254-8319) which stored
+    raw_text + dialect on the statement.
+    :End Note
 
-    Note: 1. Expect and consume Inline keyword
-    Let inline_consumed be proc parser_expect_token from Parser with parser, TOKEN_INLINE
-    If inline_consumed is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Inline' keyword at start of Inline Assembly block", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+    Let inline_token be proc parser_current_token from Parser with parser
+    If inline_token is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Inline Assembly' block", 0, 0
         Return 0
     End If
 
-    Note: 2. Expect and consume Assembly keyword
-    Let assembly_consumed be proc parser_expect_token from Parser with parser, TOKEN_ASSEMBLY
-    If assembly_consumed is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Assembly' keyword after 'Inline'", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+    Let inline_type be proc token_get_type from Parser with inline_token
+    If inline_type is not equal to TOKEN_INLINE:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Inline' keyword at start of Inline Assembly block", proc token_get_line from Parser with inline_token, proc token_get_column from Parser with inline_token
         Return 0
     End If
 
-    Note: 3. Expect and consume colon
-    Let colon_consumed be proc parser_expect_token from Parser with parser, TOKEN_COLON
-    If colon_consumed is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected ':' after 'Inline Assembly'", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
-        Return 0
-    End If
+    Let stmt_line be proc token_get_line from Parser with inline_token
 
-    Note: 4. Parse assembly instruction strings
-    Let instructions be proc create from List
-    Loop forever:
-        Let current_token be proc parser_current_token from Parser with parser
-        If current_token is equal to 0:
-            Break
-        End If
+    Note: Raw assembly text (lexer-captured verbatim) lives in the token VALUE.
+    Let raw_text be proc token_get_value from Parser with inline_token
 
-        Let token_type be proc token_get_type from Parser with current_token
-        If token_type is equal to TOKEN_STRING:
-            Let instruction be proc parse_literal_expression from ExpressionParsers with parser
-            proc list_append from List with instructions, instruction
-        Otherwise:
-            If token_type is equal to TOKEN_COLON:
-                Break
-            End If
-            If token_type is equal to TOKEN_END:
-                Break
-            End If
-            proc parser_consume_token from Parser with parser
-        End If
-    End While
+    Note: Dialect flag lives in the token metadata slot (offset 40): 0=intel,
+    Note: 1=att. Read directly; the token layout is type@0/value@8/line@16/
+    Note: column@24/length@32/metadata@40.
+    Let dialect be proc memory_get_qword from Layout with inline_token, 40
 
-    Note: 5. Parse output constraints (optional)
-    Let output_constraints be 0
-    Set current_token to proc parser_current_token from Parser with parser
-    If current_token is not equal to 0:
-        Set token_type to proc token_get_type from Parser with current_token
-        If token_type is equal to TOKEN_COLON:
-            proc parser_consume_token from Parser with parser
-            Set output_constraints to proc parse_assembly_constraints with parser
-        End If
-    End If
+    Note: Consume the single inline-assembly token; the lexer already advanced
+    Note: the source cursor past `End Assembly`, so the next token is the
+    Note: statement following the block.
+    proc parser_consume_token from Parser with parser
 
-    Note: 6. Parse input constraints (optional)
-    Let input_constraints be 0
-    Set current_token to proc parser_current_token from Parser with parser
-    If current_token is not equal to 0:
-        Set token_type to proc token_get_type from Parser with current_token
-        If token_type is equal to TOKEN_COLON:
-            proc parser_consume_token from Parser with parser
-            Set input_constraints to proc parse_assembly_constraints with parser
-        End If
-    End If
-
-    Note: 7. Parse clobber list (optional)
-    Let clobber_list be 0
-    Set current_token to proc parser_current_token from Parser with parser
-    If current_token is not equal to 0:
-        Set token_type to proc token_get_type from Parser with current_token
-        If token_type is equal to TOKEN_COLON:
-            proc parser_consume_token from Parser with parser
-            Set clobber_list to proc parse_assembly_clobbers with parser
-        End If
-    End If
-
-    Note: 8. Expect and consume End Assembly
-    Let end_consumed be proc parser_expect_token from Parser with parser, TOKEN_END
-    If end_consumed is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'End Assembly' to close Inline Assembly block", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
-        Return 0
-    End If
-
-    Let assembly_keyword be proc parser_expect_token from Parser with parser, TOKEN_ASSEMBLY
-    If assembly_keyword is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Assembly' after 'End' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
-        Return 0
-    End If
-
-    Note: 9. Create Inline Assembly AST node
-    Let asm_block be proc build_inline_assembly from ASTBuilder with instructions, output_constraints, input_constraints, clobber_list, stmt_line
+    Note: Build the AST_INLINE_ASSEMBLY node. The raw text is carried as the
+    Note: node value and the dialect as the node value_type, via
+    Note: build_inline_assembly's (value=instructions, value_type set by the
+    Note: builder) contract. There are no separate output/input/clobber operand
+    Note: lists for raw-text inline assembly.
+    Let asm_block be proc build_inline_assembly from ASTBuilder with raw_text, 0, 0, 0, stmt_line
     If asm_block is equal to 0:
-        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create Inline Assembly AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create Inline Assembly AST node", stmt_line, 0
         Return 0
     End If
 
-    Note: 10. Return Inline Assembly AST node
+    Note: Record the dialect on the node value_type slot (offset 48) so HIR
+    Note: lowering can select the syntax-switch directives.
+    proc memory_set_qword from Layout with asm_block, 48, dialect
+
     Return asm_block
 End Process
 
@@ -4043,8 +4253,19 @@ Process called "parse_type_body" takes parser as Integer returns Integer:
             Continue
         End If
 
-        Note: Struct field: 'field_name as DataType'.
-        If token_type is equal to TOKEN_IDENTIFIER:
+        Note: Struct field: 'field_name as DataType'. The field NAME slot accepts a
+        Note: plain TOKEN_IDENTIFIER OR any identifier-eligible contextual keyword
+        Note: (e.g. `size`, `count`, `item`, `items`, `index`, `key`, `left`, ...).
+        Note: The lexer carries the source spelling in the token value (offset 8)
+        Note: even for keyword tokens, so the field name string is recoverable. This
+        Note: mirrors the monolith, which lexes these words as plain identifiers and
+        Note: therefore accepts them as field names; without it a field named e.g.
+        Note: `count as Integer` falls through to the resilient-skip arm below, the
+        Note: field is silently dropped, and the body parse desyncs. The variant `|`
+        Note: arm, `End`, and `EOF` are all handled above, so broadening the field
+        Note: name set here cannot mis-consume a terminator or a variant introducer.
+        Let field_id_eligible be proc token_can_be_identifier from Parser with token_type
+        If field_id_eligible is equal to 1:
             Let field_name be proc token_get_value from Parser with current_token
             Let field_line be proc token_get_line from Parser with current_token
             Let field_column be proc token_get_column from Parser with current_token
@@ -4369,12 +4590,216 @@ Process called "parse_statement_sequence" takes parser as Integer returns Intege
             Break
         End If
 
+        Note: First-class annotation blocks may appear INSIDE a body between
+        Note: statements (e.g. an @Implementation block documenting the next few
+        Note: lines). They are machine-parseable constructs, NOT comments, so the
+        Note: parser must consume them rather than fail. We parse the block here
+        Note: and attach it as a child of the enclosing block node is not possible
+        Note: at this layer (no block node yet), so the annotation node is appended
+        Note: to the statement list as an ordinary AST_AI_ANNOTATION statement —
+        Note: the block lowering walks statements and ignores annotation-kind nodes
+        Note: (they carry documentation intent only, no executable semantics).
+        Note: Crucially, consuming the block here means the statements FOLLOWING it
+        Note: are NOT dropped. Mirrors the monolith's in-body annotation handling.
+        Let body_anno_kind be proc parser_at_annotation_block from AnnotationParser with parser
+        If body_anno_kind is not equal to 0:
+            Let anno_node be proc parse_annotation_block from AnnotationParser with parser
+            If anno_node is equal to 0:
+                Note: A malformed annotation block is a recoverable error; skip to
+                Note: the next statement boundary rather than nuking the rest of the
+                Note: body, then continue the loop.
+                proc parser_skip_to_next_statement from Parser with parser
+                Continue
+            End If
+            proc list_append from List with statements, anno_node
+            Continue
+        End If
+
         Note: Parse single statement
         Let statement be proc parse_single_statement with parser
         If statement is equal to 0:
-            Note: Skip this statement and continue (error recovery)
-            proc parser_skip_to_next_statement from Parser with parser
-            Continue
+            Note:
+            KEYSTONE — body-statement failure must be CONTAINED and VISIBLE, never
+            silently misplaced (Part A + Part B).
+
+            The previous behaviour here (parser_skip_to_next_statement + Continue) was
+            the ROOT CAUSE of the function-body escape: panic-mode synchronization
+            force-consumed the failing token and scanned forward to the next
+            statement/declaration keyword. For a failure on the LAST body statement
+            that scan walked straight across this block's closing End and the enclosing
+            End Process, landing on the NEXT function's Process header. The body loop
+            then re-entered, the enclosing process parser's End expectation failed,
+            parse_process_definition returned 0, and parser_parse_program's statement
+            fallback re-parsed the leaked body statements as direct children of the
+            PROGRAM ROOT — where HIR lowering saw them at loop_depth 0 (Break outside
+            loop) / wrong type env (Type mismatch) and aborted the whole file.
+
+            The monolith (parser_parse_statement_block, src/parser.runa:7324) simply
+            STOPS the body loop on an unparsed statement; its strict parser_eat then
+            reports the exact mismatch. We mirror that: emit a visible, greppable
+            diagnostic naming the source line through the standard parser_report_error
+            path AND an Alert to stderr (the only reliable standalone-compile signal),
+            then recover by a DEPTH-BALANCED skip to THIS block's own closing
+            terminator. The skip counts nested block openers (If/While/Loop/For/Match/
+            Process/Type) against End tokens so it lands on the End that closes the
+            CURRENT body — never crossing into a sibling declaration. The top-of-loop
+            terminator check then Breaks cleanly and the caller's End-of-kind
+            expectation succeeds, so the partially-parsed body stays attached to its
+            own function and the rest of the file is preserved.
+            :End Note
+            Let fail_token be proc parser_current_token from Parser with parser
+            Let fail_line be proc token_get_line from Parser with fail_token
+            Let fail_column be proc token_get_column from Parser with fail_token
+            Let fail_type be proc token_get_type from Parser with fail_token
+            Let fail_value be proc token_get_value from Parser with fail_token
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Unsupported or malformed statement in function body", fail_line, fail_column
+
+            Note:
+            PHASE 2 — make the body-statement failure ACTIONABLE. The keystone
+            marker below stays (greppable count anchor); we PREFIX it with the
+            construct the parser choked on so the failure names itself.
+
+            Emitted, in order, each as its own Alert (the proven separate-call
+            integer/string diagnostic path from grammer_rules.runa:830-849 —
+            NOT `Display X joined with <Integer>`, which SEGVs here, and NOT the
+            comma-concat desugar, whose runtime integer_to_string is miscompiled
+            in this hot parse path):
+              (1) the failing token's TYPE name via token_type_to_string from
+                  Parser (the complete stringifier: it names operator/math tokens
+                  500-535, every keyword, and returns "<token>" otherwise — so an
+                  identifier/literal, whose identity lives in the VALUE not the
+                  type, prints "<token>" here and is named by its spelling below);
+              (2) the token's source SPELLING when it carries one. Only
+                  TOKEN_IDENTIFIER values are printed: the lexer stores those as
+                  a freshly allocated NUL-terminated copy (lexer.runa:1276), so
+                  the C-string is bounded. Keyword tokens keep their identity in
+                  the TYPE (printed above); literal/operator value slots may be
+                  raw source pointers without a local terminator, so they are not
+                  dereferenced for printing;
+              (3) the source LINE, via integer_to_string from StringPrimitive
+                  (the established line-number path).
+            One clear line per failed statement:
+              [PARSE ERROR] body statement: <type-name>/<spelling> at line <N>
+            :End Note
+            Note:
+            The diagnostic string operands MUST be bound with an explicit
+            `as String` annotation. token_type_to_string / integer_to_string are
+            QUALIFIED imported calls (proc ... from Module); under separate
+            compilation the imported body is not in this module's local function
+            table, so codegen's RHS return-type inference for a qualified call
+            misses and the variable would default to the Integer slot — making
+            `Alert <var>` route to print_integer and emit the string POINTER as a
+            decimal. The explicit `as String` annotation (honored by the STMT_LET
+            codegen path that calls codegen_add_variable_with_type with the
+            declared type) pins the variable's type to String, so the STMT_PRINT
+            EXPR_VARIABLE dispatch selects print_string and the text renders. This
+            is the supported way to get a runtime-computed string to print here
+            without the miscompiling `joined with` / comma-concat desugar.
+            :End Note
+            Note:
+            One clear line per failed statement. Each leading Alert carries the
+            `continuing` modifier (codegen selects the print_*_nonl helpers — see
+            the monolith's Task #428 handling) so the type name, optional
+            spelling, and line concatenate onto a single line terminated by the
+            final newline Alert.
+            :End Note
+            Let fail_type_name as String be proc token_type_to_string from Parser with fail_type
+            Let fail_line_str as String be proc integer_to_string from StringPrimitive with fail_line
+            Alert "[PARSE ERROR] body statement: " continuing
+            Alert fail_type_name continuing
+            If fail_type is equal to TOKEN_IDENTIFIER:
+                If fail_value is not equal to 0:
+                    Let fail_value_str as String be fail_value
+                    Alert "/" continuing
+                    Alert fail_value_str continuing
+                End If
+            End If
+            Alert " at line " continuing
+            Alert fail_line_str continuing
+            Alert "\n"
+            Alert "[PARSE ERROR] statement-sequence: unsupported/malformed body statement"
+
+            Note: Depth-balanced recovery to the current block's closing terminator.
+            Note: Start at depth 0 (we are INSIDE this block). A nested block opener
+            Note: increments depth; an `End` at depth>0 closes a nested block and
+            Note: decrements it; an `End` at depth 0 is THIS block's terminator —
+            Note: stop there (do NOT consume it; the caller consumes its own `End`).
+            Note: TOKEN_OTHERWISE / TOKEN_WHEN at depth 0 likewise terminate the
+            Note: current then-block / match-arm. A bounded cap prevents runaway.
+            Let recover_depth be 0
+            Let recover_steps be 0
+            Loop forever:
+                Let r_at_end be proc parser_is_at_end from Parser with parser
+                If r_at_end is equal to 1:
+                    Break
+                End If
+                If recover_steps is greater than or equal to 1000000:
+                    Break
+                End If
+
+                Let r_token be proc parser_current_token from Parser with parser
+                Let r_type be proc token_get_type from Parser with r_token
+
+                If r_type is equal to TOKEN_EOF:
+                    Break
+                End If
+
+                Note: At depth 0 a terminator ends this block — stop on it.
+                If recover_depth is equal to 0:
+                    If r_type is equal to TOKEN_END:
+                        Break
+                    End If
+                    If r_type is equal to TOKEN_OTHERWISE:
+                        Break
+                    End If
+                    If r_type is equal to TOKEN_WHEN:
+                        Break
+                    End If
+                End If
+
+                Note: Nested block openers raise depth so their inner `End`s do not
+                Note: prematurely terminate this block.
+                If r_type is equal to TOKEN_IF:
+                    Set recover_depth to recover_depth plus 1
+                Otherwise:
+                    If r_type is equal to TOKEN_WHILE:
+                        Set recover_depth to recover_depth plus 1
+                    Otherwise:
+                        If r_type is equal to TOKEN_LOOP:
+                            Set recover_depth to recover_depth plus 1
+                        Otherwise:
+                            If r_type is equal to TOKEN_FOR:
+                                Set recover_depth to recover_depth plus 1
+                            Otherwise:
+                                If r_type is equal to TOKEN_MATCH:
+                                    Set recover_depth to recover_depth plus 1
+                                Otherwise:
+                                    If r_type is equal to TOKEN_PROCESS:
+                                        Set recover_depth to recover_depth plus 1
+                                    Otherwise:
+                                        If r_type is equal to TOKEN_TYPE:
+                                            Set recover_depth to recover_depth plus 1
+                                        Otherwise:
+                                            If r_type is equal to TOKEN_END:
+                                                Note: An `End` at depth>0 closes a nested block.
+                                                Set recover_depth to recover_depth minus 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+
+                proc parser_consume_token from Parser with parser
+                Set recover_steps to recover_steps plus 1
+            End While
+
+            Note: Stop the body loop. The parser is now positioned on this block's
+            Note: own terminator (or EOF), so the caller's `End <kind>` consumption
+            Note: proceeds and no body statement leaks to an outer scope.
+            Break
         End If
 
         Note: Add statement to list
@@ -4383,6 +4808,129 @@ Process called "parse_statement_sequence" takes parser as Integer returns Intege
 
     Note: 3. Return statements list
     Return statements
+End Process
+
+Process called "parse_print_statement" takes parser as Integer returns Integer:
+    Note:
+    Parse an `Alert <expr>` / `Display <expr>` print statement.
+
+    This mirrors the stage1 monolith's parser_parse_print_statement
+    (src/parser.runa:7005):
+      1. Consume the leading Alert (TOKEN_ALERT) or Display (TOKEN_DISPLAY)
+         keyword.
+      2. Reject the parenthesized function-call form `Display(expr)` --
+         Display/Alert are statements, not calls.
+      3. Parse the first expression.
+      4. Comma-concatenation (`Display a, b, c`): each subsequent
+         comma-separated expression is folded into a left-nested
+         string_concat call, so the whole list prints as one string
+         (Task #462).
+      5. Optional trailing `continuing` modifier suppresses the trailing
+         newline (Task #428); HIR lowering routes a continuing print
+         through the _nonl runtime helper variants.
+    The resulting AST_PRINT_STATEMENT node carries the (possibly folded)
+    expression as child 0 and the continuing flag in the value slot.
+    :End Note
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: 1. Consume the leading Alert/Display keyword.
+    Let print_token be proc parser_current_token from Parser with parser
+    Let print_token_type be proc token_get_type from Parser with print_token
+    Let stmt_line be proc token_get_line from Parser with print_token
+
+    Let eat_print be 0
+    If print_token_type is equal to TOKEN_ALERT:
+        Set eat_print to proc parser_expect_token from Parser with parser, TOKEN_ALERT
+    Otherwise:
+        Set eat_print to proc parser_expect_token from Parser with parser, TOKEN_DISPLAY
+    End If
+    If eat_print is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'Alert' or 'Display' keyword at start of print statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Note: 2. Reject the parenthesized function-call form: Display/Alert is a
+    Note: statement and must not use `Display(expression)` syntax.
+    Let after_kw_token be proc parser_current_token from Parser with parser
+    Let after_kw_type be proc token_get_type from Parser with after_kw_token
+    If after_kw_type is equal to TOKEN_LEFT_PAREN:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Display/Alert is a statement and should not use parentheses. Use 'Display expression' not 'Display(expression)'", proc token_get_line from Parser with after_kw_token, proc token_get_column from Parser with after_kw_token
+        Return 0
+    End If
+
+    Note: 3. Parse the first expression.
+    Let first_expr be proc parse_expression from ExpressionParsers with parser
+    If first_expr is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Invalid expression in print statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Note: 4. Comma-concatenation: fold any comma-separated expressions into a
+    Note: left-nested string_concat(...) call so the statement prints one string.
+    Let print_final_expr be first_expr
+    Let check_token be proc parser_current_token from Parser with parser
+    Let check_type be proc token_get_type from Parser with check_token
+    If check_type is equal to TOKEN_COMMA:
+        Let concat_expr be first_expr
+        Loop forever:
+            If check_type is not equal to TOKEN_COMMA:
+                Break
+            End If
+            proc parser_consume_token from Parser with parser  Note: Eat the comma
+            Let next_expr be proc parse_expression from ExpressionParsers with parser
+            If next_expr is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Invalid expression after ',' in print statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+
+            Note: Build string_concat(concat_expr, next_expr): callee identifier
+            Note: plus a two-element argument list, mirroring the monolith's manual
+            Note: expression_create_function_call("string_concat", args, 2).
+            Let concat_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "string_concat", stmt_line, 1
+            Let concat_args be proc create from List
+            proc append from List with concat_args, concat_expr
+            proc append from List with concat_args, next_expr
+            Let concat_call be proc build_call_expression from ASTBuilder with concat_callee, concat_args, 2, stmt_line, 1
+            If concat_call is equal to 0:
+                Return 0
+            End If
+            Set concat_expr to concat_call
+
+            Set check_token to proc parser_current_token from Parser with parser
+            Set check_type to proc token_get_type from Parser with check_token
+        End While
+        Set print_final_expr to concat_expr
+    End If
+
+    Note: 5. Optional trailing `continuing` modifier (Task #428): suppresses the
+    Note: trailing newline. It arrives as a bare TOKEN_IDENTIFIER spelled
+    Note: "continuing"; consume it and set the flag when present.
+    Let print_continuing be 0
+    Let cont_token be proc parser_current_token from Parser with parser
+    If cont_token is not equal to 0:
+        Let cont_type be proc token_get_type from Parser with cont_token
+        If cont_type is equal to TOKEN_IDENTIFIER:
+            Let cont_value be proc token_get_value from Parser with cont_token
+            If cont_value is not equal to 0:
+                If proc string_equals from StringCore with cont_value, "continuing" is equal to 1:
+                    proc parser_consume_token from Parser with parser
+                    Set print_continuing to 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Build the AST_PRINT_STATEMENT node carrying the expression and flag.
+    Let print_stmt be proc build_print_statement from ASTBuilder with print_final_expr, print_continuing, stmt_line
+    If print_stmt is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create print statement AST node", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+        Return 0
+    End If
+
+    Return print_stmt
 End Process
 
 Process called "parse_single_statement" takes parser as Integer returns Integer:
@@ -4463,12 +5011,29 @@ Process called "parse_single_statement" takes parser as Integer returns Integer:
         Return proc parse_return_statement with parser
     End If
 
+    Note: Alert / Display print statement (mirrors monolith parser.runa:9996/10000
+    Note: dispatch to parser_parse_print_statement).
+    If token_type is equal to TOKEN_ALERT:
+        Return proc parse_print_statement with parser
+    End If
+
+    If token_type is equal to TOKEN_DISPLAY:
+        Return proc parse_print_statement with parser
+    End If
+
     If token_type is equal to TOKEN_BREAK:
         Return proc parse_break_statement with parser
     End If
 
     If token_type is equal to TOKEN_CONTINUE:
         Return proc parse_continue_statement with parser
+    End If
+
+    Note: Inline assembly block: `Inline Assembly: ... End Assembly`. The lexer
+    Note: collapses the whole block into one TOKEN_INLINE token carrying the raw
+    Note: asm text; parse_inline_assembly consumes it and builds AST_INLINE_ASSEMBLY.
+    If token_type is equal to TOKEN_INLINE:
+        Return proc parse_inline_assembly with parser
     End If
 
     If token_type is equal to TOKEN_PROCESS:
@@ -4485,6 +5050,29 @@ Process called "parse_single_statement" takes parser as Integer returns Integer:
 
     If token_type is equal to TOKEN_EXTERNAL:
         Return proc parse_external_declaration with parser
+    End If
+
+    Note:
+    Procedural-call statement: `proc <name> [from <Module>] [with <args>]` used for
+    its side effect, with the result discarded. This is the dominant body
+    construct across the compiler's own sources (lexer alone has 73 such
+    statements) and its absence here was the residual reason real function bodies
+    failed to nest even after the escape was contained. The monolith handles the
+    same case in parser_parse_statement_block (src/parser.runa:7241-7244): it
+    parses the proc as a primary expression and wraps it with
+    statement_create_expression. The modular HIR has no expression-statement
+    wrapper node — its statement dispatcher (hir_builder.runa:746) lowers a bare
+    AST_CALL_EXPRESSION (1005) directly as a statement — so we return the parsed
+    call expression node itself as the statement. The expression parser already
+    routes TOKEN_PROC to parse_proc_call_expression (expression_parsers.runa:867).
+    :End Note
+    If token_type is equal to TOKEN_PROC:
+        Let proc_expr be proc parse_expression from ExpressionParsers with parser
+        If proc_expr is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Malformed 'proc' call statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+        Return proc_expr
     End If
 
     Note: Unknown statement type - report error
@@ -4930,8 +5518,17 @@ Process called "parse_identifier" takes parser as Integer returns Integer:
     End If
 
     Note: --- Single-token fallback (non-binder callers) ---
-    Note: Check if token is identifier
-    If token_type is not equal to TOKEN_IDENTIFIER:
+    Note: Accept a plain TOKEN_IDENTIFIER OR any contextual keyword that is
+    Note: identifier-eligible (e.g. `left`/`right`/`shifted`/`xor`/`bitwise`,
+    Note: `count`, `index`, ...). The lexer carries the source spelling in the
+    Note: token value (offset 8) even for keyword tokens, so the name string is
+    Note: still recoverable. Mirrors the monolith's token_can_be_identifier gate at
+    Note: every identifier-expecting slot (loop variables, parameter names,
+    Note: exception variables, field names). Without this a parameter or loop
+    Note: variable named `left` fails the parse and panic-mode recovery drops every
+    Note: following declaration.
+    Let id_eligible be proc token_can_be_identifier from Parser with token_type
+    If id_eligible is equal to 0:
         Return 0
     End If
 

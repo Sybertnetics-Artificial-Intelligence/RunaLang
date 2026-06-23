@@ -54,6 +54,10 @@ Import "compiler/frontend/parsing/parser.runa" as Parser
 Import "compiler/frontend/parsing/program.runa" as Program
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Note: string_index_of / string_substring back the platform-leaf skip predicate
+Note: (_import_is_platform_skipped) below; they live in string_primitive, not
+Note: string_core, and are otherwise unused by the bare driver code.
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 Note: AST + List providers — process_imports operates on the AST_PROGRAM node
 Note: returned by parser_parse_program (top-level declarations live in the
 Note: children List at AST offset 24), so the driver's bare calls to the AST node
@@ -87,6 +91,193 @@ Note: stored in the node's value slot (AST offset 40) and the optional alias is 
 Note: child identifier; the path is therefore read with ast_node_get_value.
 Constant DRIVER_AST_IMPORT_STATEMENT as Integer is 2016
 
+Note: AST discriminants the sep-comp mangle-resolve pass keys on. These mirror the
+Note: canonical constants in compiler/frontend/parsing/ast.runa (AST_IDENTIFIER 1001,
+Note: AST_CALL_EXPRESSION 1005, AST_PROCESS_DEFINITION 3000); declared locally here so
+Note: the driver's pass reads them without a cross-module Constant reference.
+Constant DRIVER_AST_IDENTIFIER as Integer is 1001
+Constant DRIVER_AST_CALL_EXPRESSION as Integer is 1005
+Constant DRIVER_AST_PROCESS_DEFINITION as Integer is 3000
+
+Note:
+==============================================================================
+TARGET-ONLY PLATFORM-LEAF INCLUSION (universal stage2 duplicate-symbol fix)
+==============================================================================
+
+The assembly aggregator modules (compiler/frontend/primitives/assembly/{register_map,
+syscall,atomic,threading,machine_code}.runa) each Import EVERY one of the 18
+canonical platform leaves -- e.g. register_map.runa imports
+primitives/platform/<key>/registers.runa for all of linux_x86_64, linux_arm64,
+mips32, riscv64, darwin_*, windows_*, ... Every leaf defines the SAME bare global
+names (REG_SP, get_param_register, get_return_register, atomic_*, memory_barrier_*,
+...) but with DIFFERENT per-platform values (REG_SP = "rsp" on linux_x86_64 vs
+"sp" on linux_arm64; get_param_register returns a different register set per ISA).
+
+When process_imports_into merges any import-bearing file's closure, all 18 leaves
+get spliced into the root program, so the emitted assembly defines each of those
+~131 symbols 2-18 times and `as --64` fails with ~506 "symbol already defined"
+errors -- no module can produce a linkable object. Because the symbols are NOT
+byte-identical across platforms, COMDAT/weak coalescing would be a correctness
+bug (it would pick one platform's value arbitrarily). The only correct fix is
+TARGET-ONLY INCLUSION: when a --target platform key is set, skip importing any
+primitives/platform/<other_key>/ leaf, keeping only the target platform's set.
+
+This mirrors the monolith's import_system.runa::_import_is_platform_skipped
+(v0.0.8.4.5.3.5/src/import_system.runa ~143-230). DRIVER_TARGET_PLATFORM_KEY is
+the driver-local copy of the validated --target key, published by main alongside
+the orchestrator's set_active_target_platform_key. When 0 (no --target), no skip
+occurs and the legacy all-platform-merge behavior is preserved exactly (the
+runtime platform-dispatch ladders then select at run time).
+:End Note
+Let DRIVER_TARGET_PLATFORM_KEY be 0
+
+Process called "set_driver_target_platform_key" takes key as Integer returns Integer:
+    Note: Publish the validated --target key string to the import-skip predicate.
+    Note: The key is a get_command_line_arg result (freed only at process exit), so
+    Note: it outlives the whole compile, matching the monolith's lifetime contract.
+    Set DRIVER_TARGET_PLATFORM_KEY to key
+    Return 0
+End Process
+
+Process called "_driver_is_platform_key" takes seg as Integer returns Integer:
+    Note:
+    Return 1 if seg is one of the 18 canonical platform-directory keys, 0 otherwise.
+    The key set is the directory names under primitives/platform/. A miss here
+    (e.g. the segment "platform_selector.runa") means the import is NOT a
+    platform-specific leaf and is never skipped. seg is a NUL-terminated string.
+    :End Note
+    If seg is equal to 0:
+        Return 0
+    End If
+    If string_equals(seg, "linux_x86_64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "linux_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "linux_arm32") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "mips32") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "mips64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "darwin_x86_64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "darwin_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "freebsd_x64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "freebsd_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "netbsd_x64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "netbsd_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "openbsd_x64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "openbsd_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "windows_x86_64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "windows_arm64") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "powerpc") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "riscv32") is equal to 1:
+        Return 1
+    End If
+    If string_equals(seg, "riscv64") is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "_import_is_platform_skipped" takes import_filename as Integer returns Integer:
+    Note:
+    Return 1 = skip this import entirely (foreign platform leaf), 0 = process it.
+    A skip happens only when ALL of the following hold:
+      - DRIVER_TARGET_PLATFORM_KEY is set (non-zero),
+      - the path contains the substring "primitives/platform/",
+      - the segment immediately after "primitives/platform/" (up to the next '/')
+        is one of the 18 canonical platform keys,
+      - that segment is not equal to DRIVER_TARGET_PLATFORM_KEY.
+    platform_selector.runa survives: its segment is "platform_selector.runa", which
+    _driver_is_platform_key rejects, so it is never skipped.
+    :End Note
+    If DRIVER_TARGET_PLATFORM_KEY is equal to 0:
+        Return 0
+    End If
+    If import_filename is equal to 0:
+        Return 0
+    End If
+
+    Note: Locate the "primitives/platform/" marker within the import path.
+    Let marker_pos be string_index_of(import_filename, "primitives/platform/")
+    If marker_pos is less than 0:
+        Return 0
+    End If
+
+    Note: The platform key starts immediately after the 20-char marker.
+    Let seg_start be marker_pos plus 20
+    Let path_len be string_length(import_filename)
+    If seg_start is greater than or equal to path_len:
+        Return 0
+    End If
+
+    Note: Scan forward from seg_start to the first '/' (ASCII 47). seg_end indexes
+    Note: the delimiting slash or path_len when the segment is the bare trailing
+    Note: component. string_substring takes (str, start, length), so the segment
+    Note: length is seg_end minus seg_start.
+    Let seg_end be seg_start
+    Let seg_done be 0
+    While seg_done is equal to 0:
+        If seg_end is greater than or equal to path_len:
+            Set seg_done to 1
+        Otherwise:
+            Let scan_ch be string_char_at(import_filename, seg_end)
+            If scan_ch is equal to 47:
+                Set seg_done to 1
+            Otherwise:
+                Set seg_end to seg_end plus 1
+            End If
+        End If
+    End While
+
+    Let segment_length be seg_end minus seg_start
+    If segment_length is less than or equal to 0:
+        Return 0
+    End If
+    Let segment be string_substring(import_filename, seg_start, segment_length)
+    If segment is equal to 0:
+        Return 0
+    End If
+
+    Note: A non-key segment (e.g. "platform_selector.runa") is never skipped.
+    If _driver_is_platform_key(segment) is equal to 0:
+        Return 0
+    End If
+
+    Note: Known key. Skip iff it is a different platform from the target.
+    If string_equals(segment, DRIVER_TARGET_PLATFORM_KEY) is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
 Note: Process imports: load, parse, and merge imported modules' declarations
 Note: into the importing program's top-level declaration list.
 Note: .
@@ -106,13 +297,52 @@ Note: .
 Note: visited holds the resolved path of every module already merged so a diamond
 Note: or cyclic import graph merges each module exactly once (no duplicate symbols,
 Note: no infinite recursion). Returns 0 on success, 1 on failure.
-Process called "process_imports" takes program as Integer returns Integer:
+Process called "process_imports" takes program as Integer, input_filename as Integer returns Integer:
     Let visited be list_create()
     Note: insert_pos threads the front-insertion cursor through the recursion so
     Note: imported declarations land BEFORE the importing module's own declarations
     Note: (a constant must be interned before the function that references it lowers;
     Note: lower_program's forward-declaration pre-pass covers processes only, not
     Note: Constants). A return value < 0 signals a fatal import error.
+    Note: Seed the ROOT file's own import-path key into visited so a cyclic import
+    Note: back to the root (e.g. expression_parsers.runa imports parser.runa which
+    Note: imports expression_parsers.runa) is recognized as already-merged and the
+    Note: root's own declarations are NOT spliced into itself a second time. The
+    Note: seed MUST use the SAME literal-relative form the cyclic importer writes in
+    Note: its Import statement, because import_already_visited compares raw strings
+    Note: against import_filename = ast_node_get_value(child), the verbatim Import
+    Note: path string. argv[1] is supplied to the compiler in that same project-root-
+    Note: relative form (e.g. "compiler/frontend/parsing/expression_parsers.runa"),
+    Note: so the seed and the back-edge literal are byte-identical and the existing
+    Note: string_equals compare matches without any path canonicalization.
+    If input_filename is not equal to 0:
+        list_append(visited, input_filename)
+    End If
+
+    Note: Sep-comp stage 3a (root seed): stamp the ROOT program's OWN Process
+    Note: definitions with the root file path (input_filename = argv[1]) BEFORE the
+    Note: merge runs. The merge appends imported decls (each carrying its own
+    Note: import_filename via process_def_set_source_file) AFTER these, so root-origin
+    Note: definitions are tagged here exactly once and the splice loop never
+    Note: re-stamps them. process_def_set_source_file guards on the discriminant so
+    Note: only AST_PROCESS_DEFINITION nodes are touched. When input_filename is 0
+    Note: (no path supplied) the root defs stay unstamped and fall through to the
+    Note: no-mangle path in the resolve pass, preserving the plain-name build.
+    If input_filename is not equal to 0:
+        Let root_own_children be ast_node_get_children(program)
+        If root_own_children is not equal to 0:
+            Let root_own_count be list_length(root_own_children)
+            Let ri be 0
+            While ri is less than root_own_count:
+                Let root_decl be list_get(root_own_children, ri)
+                If root_decl is not equal to 0:
+                    process_def_set_source_file(root_decl, input_filename)
+                End If
+                Set ri to ri plus 1
+            End While
+        End If
+    End If
+
     Let result be process_imports_into(program, program, visited, 0)
     If result is less than 0:
         Return 1
@@ -158,6 +388,18 @@ Process called "process_imports_into" takes root as Integer, current as Integer,
                 If import_filename is equal to 0:
                     Alert "[IMPORT ERROR] Import statement has no path"
                     Return -1
+                End If
+
+                Note: Target-only platform-leaf inclusion. When a --target key is
+                Note: set, a primitives/platform/<other_key>/... import belongs to a
+                Note: foreign platform whose bare globals (REG_*, get_param_register,
+                Note: atomic_*, ...) collide with the target leaf's at assembly time.
+                Note: Skip it before any read/tokenize/parse/merge so only the target
+                Note: platform's leaves reach codegen. Mirrors the monolith's
+                Note: _import_is_platform_skipped gate in process_imports_recursive.
+                If _import_is_platform_skipped(import_filename) is equal to 1:
+                    Set i to i plus 1
+                    Continue
                 End If
 
                 Note: Merge each module exactly once.
@@ -225,6 +467,27 @@ Process called "process_imports_into" takes root as Integer, current as Integer,
                             If imported_decl is not equal to 0:
                                 Let imported_kind be ast_node_get_type(imported_decl)
                                 If imported_kind is not equal to DRIVER_AST_IMPORT_STATEMENT:
+                                    Note: Sep-comp stage 3a: stamp each spliced Process definition with
+                                    Note: its TRUE origin file (import_filename), the verbatim Import path
+                                    Note: string for THIS module. The AST mangle-resolve pass later derives
+                                    Note: the definition's module key from this exact string, and the
+                                    Note: matching call sites derive theirs from the same string, so def
+                                    Note: label and call symbol agree by construction. process_def_set_source_file
+                                    Note: guards on the AST_PROCESS_DEFINITION discriminant, so non-Process
+                                    Note: decls (types, constants, async defs) are left untouched.
+                                    process_def_set_source_file(imported_decl, import_filename)
+                                    Note: Sep-comp Stage 5: mark this declaration as IMPORTED so the
+                                    Note: HIR program-lowering loop skips emitting its body. The decl
+                                    Note: stays in the merged AST (spliced below) so the pre-lowering
+                                    Note: mangle-resolve pass still sees it as part of the function table
+                                    Note: and can resolve cross-module calls to its @PLT symbol; only the
+                                    Note: BODY emission is suppressed, so each object contains only its own
+                                    Note: module's function definitions (the spliced-in imports become
+                                    Note: @PLT externals resolved at final link). process_def_set_imported
+                                    Note: guards on the AST_PROCESS_DEFINITION discriminant, so non-Process
+                                    Note: decls (types, constants, async defs) are left untouched — types and
+                                    Note: constants must still be emitted/interned for the importing module.
+                                    process_def_set_imported(imported_decl, 1)
                                     list_insert(root_children, cursor, imported_decl)
                                     Set cursor to cursor plus 1
                                 End If
@@ -282,25 +545,560 @@ Process called "import_already_visited" takes visited as Integer, path as Intege
     Return 0
 End Process
 
+Note: ============================================================================
+Note: Separate-compilation AST mangle-resolve pass (sep-comp port stages 3c + 4)
+Note: ----------------------------------------------------------------------------
+Note: Runs over the imports-merged AST_PROGRAM after process_imports and before HIR
+Note: lowering. The modular backend carries no program/import table and source_file
+Note: is severed across HIR/MIR/LIR, so resolution cannot be done at emit time the
+Note: way the monolith does it (codegen.runa:4317-4564). Instead this pass uses the
+Note: merged AST as the function table: the root's Import statements are the
+Note: alias->filename map, each Process definition's stamped source_file (offset 136)
+Note: is its origin, and each call's source-level `from Module` alias lives on the
+Note: callee identifier's metadata slot (offset 56, written by parse_proc_call_expression).
+Note: For every call it finds the target definition, derives the target's module key
+Note: from the target's source_file (identical derivation to the def-label path, so
+Note: caller symbol and callee label agree), and writes the resolved mangled symbol +
+Note: @PLT cross-object flag onto the call node (offsets 104/112) for the HIR->MIR->LIR
+Note: carrier chain to thread down to emit_call.
+Note: ============================================================================
+
+Note: Derive an identifier-safe module key from a source-file path: the parent
+Note: directory component + "_" + the basename (extension stripped), with '.' and
+Note: '-' normalized to '_'. Ported from codegen_module_key_from_path
+Note: (v0.0.8.4.5.3.5/src/codegen.runa:4015-4142). Returns a freshly heap-allocated
+Note: NUL-terminated string the caller owns, or 0 when the path is null/empty or the
+Note: basename is empty. Example: "compiler/frontend/parsing/expression_parsers.runa"
+Note: -> "parsing_expression_parsers".
+Process called "sepcomp_module_key_from_path" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let path_len be string_length(path)
+    If path_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Locate the last and second-to-last path separators (1-based; 0 = none).
+    Let last_sep be 0
+    Let prev_sep be 0
+    Let scan_i be 0
+    While scan_i is less than path_len:
+        Let ch be memory_get_byte(path, scan_i)
+        Let is_sep be 0
+        If ch is equal to 47:
+            Set is_sep to 1
+        End If
+        If ch is equal to 92:
+            Set is_sep to 1
+        End If
+        If is_sep is equal to 1:
+            Set prev_sep to last_sep
+            Set last_sep to scan_i plus 1
+        End If
+        Set scan_i to scan_i plus 1
+    End While
+
+    Let basename_start be 0
+    If last_sep is greater than 0:
+        Set basename_start to last_sep
+    End If
+
+    Note: Find the basename's extension boundary (last '.' at or after basename_start).
+    Let basename_end be path_len
+    Let scan_j be basename_start
+    Let last_dot be 0
+    While scan_j is less than path_len:
+        Let ch2 be memory_get_byte(path, scan_j)
+        If ch2 is equal to 46:
+            Set last_dot to scan_j plus 1
+        End If
+        Set scan_j to scan_j plus 1
+    End While
+    If last_dot is greater than 0:
+        Set basename_end to last_dot minus 1
+    End If
+
+    Let basename_len be basename_end minus basename_start
+    If basename_len is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Parent directory slice between prev_sep and (last_sep-1).
+    Let parent_start be 0
+    Let parent_end be 0
+    Let parent_len be 0
+    If last_sep is greater than 0:
+        If prev_sep is greater than 0:
+            Set parent_start to prev_sep
+            Set parent_end to last_sep minus 2
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        Otherwise:
+            Set parent_end to last_sep minus 2
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        End If
+    End If
+
+    Let total_len be basename_len
+    If parent_len is greater than 0:
+        Set total_len to parent_len plus 1 plus basename_len
+    End If
+
+    Let key_buf be allocate(total_len plus 1)
+    If key_buf is equal to 0:
+        Return 0
+    End If
+
+    Let write_idx be 0
+    If parent_len is greater than 0:
+        Let pi be 0
+        While pi is less than parent_len:
+            Let psrc be memory_get_byte(path, parent_start plus pi)
+            If psrc is equal to 46:
+                Set psrc to 95
+            End If
+            If psrc is equal to 45:
+                Set psrc to 95
+            End If
+            memory_set_byte(key_buf, write_idx, psrc)
+            Set write_idx to write_idx plus 1
+            Set pi to pi plus 1
+        End While
+        memory_set_byte(key_buf, write_idx, 95)
+        Set write_idx to write_idx plus 1
+    End If
+    Let bi be 0
+    While bi is less than basename_len:
+        Let bsrc be memory_get_byte(path, basename_start plus bi)
+        If bsrc is equal to 46:
+            Set bsrc to 95
+        End If
+        If bsrc is equal to 45:
+            Set bsrc to 95
+        End If
+        memory_set_byte(key_buf, write_idx, bsrc)
+        Set write_idx to write_idx plus 1
+        Set bi to bi plus 1
+    End While
+    memory_set_byte(key_buf, write_idx, 0)
+
+    Return key_buf
+End Process
+
+Note: Read the plain function-name string of an AST_PROCESS_DEFINITION node. name@80
+Note: is the NAME NODE (an AST_IDENTIFIER built by parse_process_name); the actual
+Note: name string is its value slot (ast_node_get_value, offset 40). Returns the
+Note: name string pointer or 0.
+Process called "sepcomp_process_def_name" takes def_node as Integer returns Integer:
+    If def_node is equal to 0:
+        Return 0
+    End If
+    Let name_node be memory_get_qword(def_node, 80)
+    If name_node is equal to 0:
+        Return 0
+    End If
+    Return ast_node_get_value(name_node)
+End Process
+
+Note: Walk the root program's top-level Let statements for the per-unit no-mangle
+Note: opt-out sentinel `Let __runa_no_mangle__ be 1`. Files that emit bare cross-file
+Note: calls without Import statements (the runtime ABI bridge runtime_api.runa,
+Note: program.runa) declare this so neither their definitions nor their calls are
+Note: mangled, keeping plain-symbol linkage. Mirrors codegen_is_mangling_disabled
+Note: (v0.0.8.4.5.3.5/src/codegen.runa:4212-4236). A top-level Let is an
+Note: AST_DEFINE_STATEMENT (2000) whose target identifier name is in the node value
+Note: slot. Returns 1 when the sentinel is present, 0 otherwise.
+Process called "sepcomp_mangling_disabled" takes root as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let children be ast_node_get_children(root)
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be list_length(children)
+    Let i be 0
+    While i is less than count:
+        Let decl be list_get(children, i)
+        If decl is not equal to 0:
+            Let kind be ast_node_get_type(decl)
+            If kind is equal to 2000:
+                Let target_name be ast_node_get_value(decl)
+                If target_name is not equal to 0:
+                    If string_equals(target_name, "__runa_no_mangle__") is equal to 1:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Map a source-level Import alias to the import's filename string (the verbatim
+Note: path the merge stamped onto each definition's source_file). The root's Import
+Note: statements (AST_IMPORT_STATEMENT, driver kind 2016) store the filename in the
+Note: node value slot (offset 40) and the alias as child 0 (an AST_IDENTIFIER whose
+Note: value is the alias string). Mirrors codegen_lookup_import_filename_by_alias
+Note: (v0.0.8.4.5.3.5/src/codegen.runa:4171-4200). Returns the filename string or 0.
+Process called "sepcomp_lookup_import_filename_by_alias" takes root as Integer, alias as Integer returns Integer:
+    If alias is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return 0
+    End If
+    Let children be ast_node_get_children(root)
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be list_length(children)
+    Let i be 0
+    While i is less than count:
+        Let decl be list_get(children, i)
+        If decl is not equal to 0:
+            Let kind be ast_node_get_type(decl)
+            If kind is equal to DRIVER_AST_IMPORT_STATEMENT:
+                Let alias_node be ast_node_get_child(decl, 0)
+                If alias_node is not equal to 0:
+                    Let alias_name be ast_node_get_value(alias_node)
+                    If alias_name is not equal to 0:
+                        If string_equals(alias_name, alias) is equal to 1:
+                            Return ast_node_get_value(decl)
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Find the AST_PROCESS_DEFINITION among the merged root children whose plain name
+Note: matches fn_name AND, when want_key is non-zero, whose source_file's module key
+Note: equals want_key (alias-disambiguated lookup). When want_key is 0 the first
+Note: name-match wins (bare-call / fallback path). Returns the def node or 0.
+Process called "sepcomp_find_target_def" takes root as Integer, fn_name as Integer, want_key as Integer returns Integer:
+    If fn_name is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return 0
+    End If
+    Let children be ast_node_get_children(root)
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be list_length(children)
+    Let i be 0
+    While i is less than count:
+        Let decl be list_get(children, i)
+        If decl is not equal to 0:
+            Let kind be ast_node_get_type(decl)
+            If kind is equal to DRIVER_AST_PROCESS_DEFINITION:
+                Let decl_name be sepcomp_process_def_name(decl)
+                If decl_name is not equal to 0:
+                    If string_equals(decl_name, fn_name) is equal to 1:
+                        If want_key is equal to 0:
+                            Return decl
+                        Otherwise:
+                            Let decl_src be process_def_get_source_file(decl)
+                            If decl_src is not equal to 0:
+                                Let decl_key be sepcomp_module_key_from_path(decl_src)
+                                If decl_key is not equal to 0:
+                                    Let matched be string_equals(decl_key, want_key)
+                                    deallocate(decl_key)
+                                    If matched is equal to 1:
+                                        Return decl
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Compute the module-mangled symbol for a resolved target definition, applying
+Note: the monolith's exclusions (codegen_mangled_name_for_func_in,
+Note: v0.0.8.4.5.3.5/src/codegen.runa:4246-4295): no mangling for the entry point
+Note: `main`, for a definition with no stamped source_file, or when the unit opts out
+Note: via __runa_no_mangle__. Returns a freshly heap-allocated "<module_key>__<name>"
+Note: string the caller owns, or 0 when no mangling applies (caller then emits the
+Note: plain name with a plain call).
+Process called "sepcomp_mangle_def" takes target_def as Integer, mangling_disabled as Integer returns Integer:
+    If target_def is equal to 0:
+        Return 0
+    End If
+    If mangling_disabled is equal to 1:
+        Return 0
+    End If
+    Let fn_name be sepcomp_process_def_name(target_def)
+    If fn_name is equal to 0:
+        Return 0
+    End If
+    If string_equals(fn_name, "main") is equal to 1:
+        Return 0
+    End If
+    Let source_file be process_def_get_source_file(target_def)
+    If source_file is equal to 0:
+        Return 0
+    End If
+    Let module_key be sepcomp_module_key_from_path(source_file)
+    If module_key is equal to 0:
+        Return 0
+    End If
+    Let sep_tmp be string_concat(module_key, "__")
+    Let full be string_concat(sep_tmp, fn_name)
+    deallocate(module_key)
+    deallocate(sep_tmp)
+    Return full
+End Process
+
+Note: Build the module-mangled symbol "<module_key>__<fn_name>" directly from an
+Note: already-derived module key and a plain function name. Used for the qualified-
+Note: import path where the target module is a SEPARATELY-compiled unit whose defs
+Note: are NOT in this compilation's merged AST (e.g. `proc allocate from Layout`
+Note: where layout.runa is imported but its bodies were not spliced): the monolith
+Note: mangles such a call straight from the import's module key
+Note: (codegen_lookup_qualified_target + codegen_module_key_from_path on the import
+Note: filename), and the separately-compiled module emits the identical label. Caller
+Note: owns the returned heap string. module_key is NOT consumed (caller frees it).
+Process called "sepcomp_mangle_with_key" takes module_key as Integer, fn_name as Integer returns Integer:
+    If module_key is equal to 0:
+        Return 0
+    End If
+    If fn_name is equal to 0:
+        Return 0
+    End If
+    If string_equals(fn_name, "main") is equal to 1:
+        Return 0
+    End If
+    Let sep_tmp be string_concat(module_key, "__")
+    Let full be string_concat(sep_tmp, fn_name)
+    deallocate(sep_tmp)
+    Return full
+End Process
+
+Note: Resolve and stamp a single AST_CALL_EXPRESSION node. Reads the plain callee
+Note: name (callee@80 -> ast_node_get_value) and the optional source-level module
+Note: alias (callee identifier metadata @56, written by parse_proc_call_expression).
+Note: When the alias names a known Import, the target is looked up alias-disambiguated
+Note: by the import's module key; otherwise (bare call or transitively-merged caller
+Note: whose alias is unknown here) the first name-match is used. If the resolved
+Note: target mangles, the mangled symbol is stored at offset 104 and the @PLT flag at
+Note: offset 112; if it does not mangle (main/external/no-source/no-mangle) the call
+Note: keeps its plain name and a plain call. Returns 1 always (resolution failure is
+Note: not fatal: an unresolved call falls back to the plain-name path that already
+Note: worked for non-import bare calls).
+Process called "sepcomp_resolve_one_call" takes root as Integer, call_node as Integer, mangling_disabled as Integer returns Integer:
+    If call_node is equal to 0:
+        Return 1
+    End If
+    Let callee be memory_get_qword(call_node, 80)
+    If callee is equal to 0:
+        Return 1
+    End If
+    Let callee_kind be ast_node_get_type(callee)
+    If callee_kind is not equal to DRIVER_AST_IDENTIFIER:
+        Note: Indirect / computed callee — no static symbol to mangle.
+        Return 1
+    End If
+    Let fn_name be ast_node_get_value(callee)
+    If fn_name is equal to 0:
+        Return 1
+    End If
+
+    Note: The source-level `from Module` / `Module.func` alias, if any, was stashed
+    Note: on the callee identifier's metadata slot (offset 56) by Stage 2.
+    Let alias be memory_get_qword(callee, 56)
+
+    Let want_key be 0
+    Let import_filename be 0
+    If alias is not equal to 0:
+        Set import_filename to sepcomp_lookup_import_filename_by_alias(root, alias)
+        If import_filename is not equal to 0:
+            Set want_key to sepcomp_module_key_from_path(import_filename)
+        End If
+    End If
+
+    Let target_def be sepcomp_find_target_def(root, fn_name, want_key)
+
+    If target_def is not equal to 0:
+        Note: The target definition is in this compilation's merged AST. Mangle from
+        Note: the target's OWN stamped source_file (the authoritative, def-symmetric
+        Note: derivation): the def label this same source_file produces downstream and
+        Note: this call symbol are guaranteed identical.
+        Let mangled_def be sepcomp_mangle_def(target_def, mangling_disabled)
+        If want_key is not equal to 0:
+            deallocate(want_key)
+        End If
+        If mangled_def is equal to 0:
+            Note: Target resolves but opts out of mangling (main / no-source / unit
+            Note: no-mangle) — keep the plain name and a plain call.
+            Return 1
+        End If
+        call_expr_set_resolved_symbol(call_node, mangled_def)
+        call_expr_set_cross_module(call_node, 1)
+        Return 1
+    End If
+
+    Note: No merged definition names this call. When the call is QUALIFIED `from
+    Note: <Module>` and that alias maps to a known Import (want_key derived), the
+    Note: target is a SEPARATELY-compiled module whose bodies were not spliced into
+    Note: this unit; mangle straight from the import's module key exactly as the
+    Note: monolith's lookup_qualified_target does. The separately-compiled module emits
+    Note: the identical `<module_key>__<fn_name>` label, so the @PLT call resolves at
+    Note: link time. Skip when this unit opts out of mangling.
+    If want_key is not equal to 0:
+        If mangling_disabled is equal to 0:
+            Let mangled_import be sepcomp_mangle_with_key(want_key, fn_name)
+            If mangled_import is not equal to 0:
+                call_expr_set_resolved_symbol(call_node, mangled_import)
+                call_expr_set_cross_module(call_node, 1)
+            End If
+        End If
+        deallocate(want_key)
+        Return 1
+    End If
+
+    Note: Unqualified bare call with no merged target: an External Process (libc /
+    Note: runtime ABI symbol the linker resolves under its plain name) or a runtime
+    Note: primitive reached without an Import. Leave it plain — the pre-existing
+    Note: bare-call path emits `callq <name>` exactly as before this pass existed.
+    Return 1
+End Process
+
+Note: Recursively walk an AST subtree, resolving every AST_CALL_EXPRESSION found.
+Note: The walk descends through the children List (offset 24) of every node so call
+Note: expressions nested anywhere in a function body (Return, Let, arguments, If/While
+Note: bodies, nested calls) are all reached.
+Process called "sepcomp_walk_resolve" takes root as Integer, node as Integer, mangling_disabled as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be ast_node_get_type(node)
+    If kind is equal to DRIVER_AST_CALL_EXPRESSION:
+        sepcomp_resolve_one_call(root, node, mangling_disabled)
+    End If
+    Let children be ast_node_get_children(node)
+    If children is not equal to 0:
+        Let count be list_length(children)
+        Let i be 0
+        While i is less than count:
+            Let child be list_get(children, i)
+            If child is not equal to 0:
+                sepcomp_walk_resolve(root, child, mangling_disabled)
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+Note: Entry point for the sep-comp AST mangle-resolve pass. Walks the merged program
+Note: resolving every call site. Called from main after process_imports, before
+Note: compile_program lowers the AST to HIR.
+Process called "sepcomp_resolve_program" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    Let mangling_disabled be sepcomp_mangling_disabled(program)
+    sepcomp_walk_resolve(program, program, mangling_disabled)
+    Return 0
+End Process
+
 Note: Main compiler entry point - Hybrid v0.0.8.5 Driver
 Note: Uses v0.0.8.4.5 lexer/parser with v0.0.8.5 codegen primitives
 Process called "main" takes argc as Integer, argv as Integer returns Integer:
-    Note: Check command line arguments (argc != 3)
+    Note: Supported command-line forms:
+    Note:   runac <input.runa> <output.s>                 (argc == 3)
+    Note:   runac <input.runa> <output.s> --target <key>  (argc == 5)
+    Note: Any other argc is a usage error. The --target form publishes the
+    Note: canonical platform key to the compile orchestrator's platform
+    Note: constant-fold pass; without it the platform-dispatch ladders stay
+    Note: intact and runtime selection takes over (legacy behavior preserved).
+    Let has_target_flag be 0
+    If argc is equal to 5:
+        Set has_target_flag to 1
+    End If
     If argc is not equal to 3:
-        Note: Alert usage message (equivalent to fprintf(stderr, "Usage: %s <input.runa> <output.s>\n", argv[0]))
-        Let prog_name be get_command_line_arg(0)
-        Let usage_msg_temp be string_concat("Usage: ", prog_name)
-        Let usage_msg be string_concat(usage_msg_temp, " <input.runa> <output.s>")
-        deallocate(usage_msg_temp)
-        Alert usage_msg
-        deallocate(usage_msg)
-        deallocate(prog_name)
-        Return 1
+        If has_target_flag is equal to 0:
+            Let prog_name be get_command_line_arg(0)
+            Let usage_msg_temp be string_concat("Usage: ", prog_name)
+            Let usage_msg be string_concat(usage_msg_temp, " <input.runa> <output.s> [--target <key>]")
+            deallocate(usage_msg_temp)
+            Alert usage_msg
+            deallocate(usage_msg)
+            deallocate(prog_name)
+            Return 1
+        End If
     End If
 
     Note: Get command line arguments (equivalent to input_filename = argv[1])
     Let input_filename be get_command_line_arg(1)
     Let output_filename be get_command_line_arg(2)
+
+    Note: Resolve the optional --target <key>. When present (argc == 5) the third
+    Note: arg must be exactly "--target" and the fourth must be one of the 18
+    Note: canonical platform keys (validated via target_platform_index_for_key,
+    Note: which returns 1..18 for a known key and 0 otherwise). The key string is
+    Note: a get_command_line_arg result (freed only at process exit) so it
+    Note: outlives the whole compile. Mirrors the monolith's --target handling.
+    If has_target_flag is equal to 1:
+        Let target_flag be get_command_line_arg(3)
+        Let target_value be get_command_line_arg(4)
+        If target_flag is equal to 0:
+            Alert "[ERROR] Missing --target flag"
+            deallocate(input_filename)
+            deallocate(output_filename)
+            Return 1
+        End If
+        If string_equals(target_flag, "--target") is equal to 0:
+            Let bad_flag_msg be string_concat("[ERROR] Unrecognized option: ", target_flag)
+            Alert bad_flag_msg
+            deallocate(bad_flag_msg)
+            deallocate(target_flag)
+            deallocate(target_value)
+            deallocate(input_filename)
+            deallocate(output_filename)
+            Return 1
+        End If
+        If target_value is equal to 0:
+            Alert "[ERROR] --target requires a platform key argument"
+            deallocate(target_flag)
+            deallocate(input_filename)
+            deallocate(output_filename)
+            Return 1
+        End If
+        If target_platform_index_for_key(target_value) is equal to 0:
+            Let bad_key_msg be string_concat("[ERROR] Unknown --target platform key: ", target_value)
+            Alert bad_key_msg
+            deallocate(bad_key_msg)
+            deallocate(target_flag)
+            deallocate(target_value)
+            deallocate(input_filename)
+            deallocate(output_filename)
+            Return 1
+        End If
+        deallocate(target_flag)
+        Note: Publish the validated key to the orchestrator's fold pass.
+        set_active_target_platform_key(target_value)
+        Note: Publish the same key to the import-closure platform-leaf skip gate so
+        Note: only the target platform's primitives/platform/<key>/ leaves are merged
+        Note: (the other 17 platforms' colliding bare globals are excluded entirely).
+        set_driver_target_platform_key(target_value)
+    End If
 
     Note: Read source file (equivalent to char *source = read_file(input_filename))
     Let source be read_file_internal(input_filename)
@@ -350,8 +1148,10 @@ Process called "main" takes argc as Integer, argv as Integer returns Integer:
         Return 1
     End If
 
-    Note: Process imports: load and merge imported files
-    Let import_result be process_imports(program)
+    Note: Process imports: load and merge imported files. input_filename (argv[1])
+    Note: is passed so process_imports can seed the root's own path into visited and
+    Note: skip a cyclic import back to the root (prevents self re-merge / dup defs).
+    Let import_result be process_imports(program, input_filename)
     If import_result is not equal to 0:
         Note: Import processing failed
         program_destroy(program)
@@ -361,6 +1161,16 @@ Process called "main" takes argc as Integer, argv as Integer returns Integer:
         deallocate(output_filename)
         Return 1
     End If
+
+    Note: Sep-comp stages 3c+4: resolve every call site against the merged AST,
+    Note: stamping each cross-object call with its module-mangled symbol + @PLT flag.
+    Note: Runs after the import merge (so the full function table is present) and
+    Note: before compile_program lowers AST->HIR (the carrier chain that threads the
+    Note: results down to emit_call begins at HIR lowering). The def-label mangling is
+    Note: driven separately by each definition's stamped source_file flowing through
+    Note: HIR->MIR->LIR; the two derivations use the identical module_key_from_path so
+    Note: caller symbol and callee label always agree.
+    sepcomp_resolve_program(program)
 
     Note: Compile program using v0.0.8.5 primitives
     Note: Using v0.0.8.5 orchestration function

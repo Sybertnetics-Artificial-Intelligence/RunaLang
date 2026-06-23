@@ -671,8 +671,16 @@ Process called "emit_function" that takes ctx as Integer, lir_func as Integer re
     Let output be __load(ctx, 0)
     Let section be MachineCode.SECTION_TEXT
 
-    Note: Get function name
+    Note: Get function name. Sep-comp stage 4: prefer the module-mangled label
+    Note: (LIRFunction.mangled_name, offset 8) when the LIR builder set it; this is the
+    Note: separately-compiled definition's link symbol. The plain name@0 remains the
+    Note: internal identity for the verifier/optimizer. When mangled_name is 0 (main /
+    Note: unstamped / legacy no-target build) the plain name@0 is used unchanged.
     Let func_name be __load(lir_func, 0)
+    Let mangled_name be __load(lir_func, 8)
+    If mangled_name is not 0:
+        Set func_name to mangled_name
+    End If
     Let is_external be __load(lir_func, 112)
 
     Note: Skip external (declaration-only) functions.
@@ -1994,6 +2002,13 @@ Process called "emit_call" that takes ctx as Integer, instr as Integer returns I
     Let output be __load(ctx, 0)
     Let operand1 be __load(instr, 16)
     Let convention_id be __load(instr, 64)
+    Note: Sep-comp stage 4: @PLT cross-object flag (LIR call instruction offset 72),
+    Note: threaded from the MIR call's cross_module flag by lower_call. When set, the
+    Note: callee is a separately-compiled definition whose label is module-mangled, so
+    Note: the call must go through the PLT: emit `callq <symbol>@PLT`. callee_name is
+    Note: already the mangled symbol (the resolve pass put it on the MIR/LIR callee), so
+    Note: caller and callee labels agree.
+    Let cross_module be __load(instr, 72)
 
     If operand1 is not 0:
         Let callee_name be __load(operand1, 16)
@@ -2006,12 +2021,19 @@ Process called "emit_call" that takes ctx as Integer, instr as Integer returns I
                 MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t_objc_msgSend@PLT")
                 MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "")
             Otherwise:
-                Note: Default path — direct call to the recorded symbol name.
-                Note: For convention syscall, the callee_name is itself a thunk
-                Note: function in primitives/assembly that wraps the syscall
-                Note: instruction; we emit the standard call to it.
-                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t")
-                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, callee_name)
+                If cross_module is not 0:
+                    Note: Cross-object call to a module-mangled definition — route via PLT.
+                    MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t")
+                    MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, callee_name)
+                    MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "@PLT")
+                Otherwise:
+                    Note: Default path — direct call to the recorded symbol name.
+                    Note: For convention syscall, the callee_name is itself a thunk
+                    Note: function in primitives/assembly that wraps the syscall
+                    Note: instruction; we emit the standard call to it.
+                    MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t")
+                    MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, callee_name)
+                End If
             End If
         End If
     End If
@@ -2163,12 +2185,31 @@ Process called "emit_comment" that takes ctx as Integer, instr as Integer return
 End Process
 
 Process called "emit_inline_asm" that takes ctx as Integer, instr as Integer returns Integer:
+    Note:
+    Emit an inline-assembly block. The operand1 wrapper carries the dialect flag
+    at offset 8 (0=intel default, 1=att) and the verbatim assembly text at
+    offset 16. Intel-dialect bodies are wrapped with `.intel_syntax noprefix`
+    before and `.att_syntax prefix` after, restoring the assembler's default
+    AT&T mode for the surrounding compiler-generated code -- mirroring the
+    monolith codegen (which emits these syntax-switch directives around every
+    intel inline-asm body). AT&T-dialect bodies are emitted verbatim with no
+    directives, since they are already in the assembler's default syntax.
+    :End Note
     Let output be __load(ctx, 0)
     Let operand1 be __load(instr, 16)
     If operand1 is not 0:
+        Let dialect be __load(operand1, 8)
         Let asm_text be __load(operand1, 16)
         If asm_text is not 0:
-            MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, asm_text)
+            If dialect is 1:
+                Note: AT&T dialect: emit verbatim, no syntax-switch directives.
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, asm_text)
+            Otherwise:
+                Note: Intel dialect (default): bracket with syntax-switch directives.
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\t.intel_syntax noprefix")
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, asm_text)
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\t.att_syntax prefix")
+            End If
         End If
     End If
     Return 1

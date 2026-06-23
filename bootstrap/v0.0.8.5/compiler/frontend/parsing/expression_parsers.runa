@@ -206,12 +206,68 @@ Process called "parse_expression_with_precedence" takes parser as Integer, min_p
     Let current_token be proc parser_current_token from Parser with parser
     Let token_type be proc token_get_type from Parser with current_token
 
+    Note: Result holder for the left operand. Declared up-front so the
+    Note: canonical "bitwise not" prefix arm, the generic unary arm and the
+    Note: primary arm can all assign it.
+    Let left be 0
+
+    Note:
+    Canonical word-form unary bitwise NOT. The lexer tokenises the canonical
+    phrase "bitwise not X" as TWO tokens — TOKEN_BITWISE (302) followed by
+    TOKEN_NOT (382) — so neither the precedence table's unary entry (keyed on
+    the symbolic ~ token TOKEN_BITWISE_NOT 533) nor the is_unary_operator check
+    below fires for the bare TOKEN_BITWISE keyword in prefix position. Detect
+    the phrase here and desugar it to "operand bitwise xor (-1)" — i.e. XOR with
+    an all-ones mask, which is one's-complement — mirroring the stage1 monolith
+    (which builds expression_create_binary_op(operand, bit_xor, -1)). This
+    reuses the already-lowered binary XOR path (TOKEN_BITWISE_XOR 532 ->
+    MIR 20012 -> LIR_XOR 30202) rather than introducing a parallel unary-NOT
+    lowering. The operand is parsed at PRECEDENCE_UNARY so the prefix binds
+    tighter than every binary operator, matching a real prefix operator.
+    :End Note
+    If token_type is equal to TOKEN_BITWISE:
+        Let not_disc_token be proc parser_peek_token from Parser with parser, 1
+        Let not_disc_type be 0
+        If not_disc_token is not equal to 0:
+            Set not_disc_type to proc token_get_type from Parser with not_disc_token
+        End If
+        If not_disc_type is equal to TOKEN_NOT:
+            Let not_op_line be proc token_get_line from Parser with current_token
+            Let not_op_column be proc token_get_column from Parser with current_token
+
+            Note: Consume "bitwise" and "not".
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+
+            Let not_operand be proc parse_expression_with_precedence with parser, PRECEDENCE_UNARY
+            If not_operand is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after bitwise not", not_op_line, not_op_column
+                Return 0
+            End If
+
+            Note: All-ones mask (-1) for the one's-complement XOR.
+            Let not_mask be proc build_integer_literal from ASTBuilder with 0 minus 1, not_op_line, not_op_column
+            If not_mask is equal to 0:
+                Return 0
+            End If
+
+            Let not_node be proc build_binary_expression from ASTBuilder with TOKEN_BITWISE_XOR, not_operand, not_mask, not_op_line, not_op_column
+            If not_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create bitwise not AST node", not_op_line, not_op_column
+                Return 0
+            End If
+            Set left to not_node
+        End If
+    End If
+
     Note: Check for unary operators (prefix)
-    Let is_unary be proc is_unary_operator from Precedence with token_type
-    If is_unary is equal to 1:
-        Let left be proc parse_unary_expression with parser
-    Otherwise:
-        Set left to proc parse_primary_expression with parser
+    If left is equal to 0:
+        Let is_unary be proc is_unary_operator from Precedence with token_type
+        If is_unary is equal to 1:
+            Set left to proc parse_unary_expression with parser
+        Otherwise:
+            Set left to proc parse_primary_expression with parser
+        End If
     End If
 
     If left is equal to 0:
@@ -262,6 +318,495 @@ Process called "parse_expression_with_precedence" takes parser as Integer, min_p
             If left is equal to 0:
                 Return 0
             End If
+            Continue
+        End If
+
+        Note:
+        Canonical word-form bitwise shift binary operators. The lexer tokenises
+        the canonical phrases "shifted left by" / "shifted right by" as THREE
+        tokens — the TOKEN_SHIFTED keyword (304) followed by the direction
+        discriminator TOKEN_LEFT (305) / TOKEN_RIGHT (306) and the connector
+        TOKEN_BY (387) — so the precedence table (which keys single operator
+        tokens) carries no entry for the bare TOKEN_SHIFTED keyword and the
+        generic is_binary_operator check below rejects it, silently truncating
+        the expression at "shifted". Handle the phrase here, mirroring the stage1
+        monolith parser (parser.runa:865-924 parser_parse_shift): shift sits at
+        PRECEDENCE_SHIFT (8) — TIGHTER than additive (+/- at 9 is numerically
+        lower, but the monolith parses additive operands BELOW shift so a plain
+        `a plus b shifted left by 1` groups as `(a plus b) shifted left by 1`),
+        and WEAKER than no other word-operator level here; it binds tighter than
+        the bitwise tiers (3-5) and comparison/equality (6-7). Both directions are
+        left-associative. The discriminator and connector are peeked (not
+        consumed) before min_precedence gating so the operator is rejected cleanly
+        if the floor excludes it. The symbolic operator codes TOKEN_SHIFT_LEFT
+        (534) / TOKEN_SHIFT_RIGHT (535) are stored in the binary AST node — those
+        are exactly the codes the HIR/MIR binary-operator mapping recognises
+        (534->20014 MIR_SHL, 535->20015 MIR_SHR), which lower through LIR_SHL
+        (30300) / LIR_SHR (30301) to the x86_64 `shl` / `shr` instructions. `shr`
+        is the logical (unsigned) right shift, matching the monolith's `shrq`
+        for `shifted right by` (codegen.runa:3446-3453: right shift is logical by
+        default per the language spec; arithmetic shift is expressed via
+        `divided by 2^N`).
+        :End Note
+        If token_type is equal to TOKEN_SHIFTED:
+            Let sh_dir_token be proc parser_peek_token from Parser with parser, 1
+            Let sh_dir_type be 0
+            If sh_dir_token is not equal to 0:
+                Set sh_dir_type to proc token_get_type from Parser with sh_dir_token
+            End If
+
+            Let sh_by_token be proc parser_peek_token from Parser with parser, 2
+            Let sh_by_type be 0
+            If sh_by_token is not equal to 0:
+                Set sh_by_type to proc token_get_type from Parser with sh_by_token
+            End If
+
+            Let sh_operator be 0
+            If sh_dir_type is equal to TOKEN_LEFT:
+                Set sh_operator to TOKEN_SHIFT_LEFT
+            End If
+            If sh_dir_type is equal to TOKEN_RIGHT:
+                Set sh_operator to TOKEN_SHIFT_RIGHT
+            End If
+
+            Note: A bare "shifted" not followed by left/right + by is not a shift
+            Note: operator here (e.g. an identifier named "shifted"); stop the
+            Note: Pratt loop so the surrounding context can handle the token.
+            If sh_operator is equal to 0:
+                Break
+            End If
+            If sh_by_type is not equal to TOKEN_BY:
+                Break
+            End If
+
+            Note: Respect the caller's precedence floor (Pratt climbing). A shift
+            Note: operator looser than the floor terminates this level.
+            If PRECEDENCE_SHIFT is less than min_precedence:
+                Break
+            End If
+
+            Note: Capture the operator position (the TOKEN_SHIFTED keyword) before
+            Note: consuming the three phrase tokens.
+            Let sh_op_line be proc token_get_line from Parser with current_token
+            Let sh_op_column be proc token_get_column from Parser with current_token
+
+            Note: Consume "shifted", the left/right direction, and "by".
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+
+            Note: Shift operators are left-associative: parse the right operand
+            Note: one level tighter (precedence + 1) so chained operands at the
+            Note: same level associate left-to-right.
+            Let sh_right be proc parse_expression_with_precedence with parser, PRECEDENCE_SHIFT plus 1
+            If sh_right is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after shift operator", sh_op_line, sh_op_column
+                Return 0
+            End If
+
+            Let sh_node be proc build_binary_expression from ASTBuilder with sh_operator, left, sh_right, sh_op_line, sh_op_column
+            If sh_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create shift binary expression AST node", sh_op_line, sh_op_column
+                Return 0
+            End If
+
+            Set left to sh_node
+            Continue
+        End If
+
+        Note:
+        Canonical word-form bitwise binary operators. The lexer tokenises the
+        canonical phrases "bitwise and" / "bitwise or" / "bitwise xor" as TWO
+        tokens — the TOKEN_BITWISE keyword (302) followed by the discriminator
+        TOKEN_AND (380) / TOKEN_OR (381) / TOKEN_XOR (303) — so the precedence
+        table (which keys single operator tokens) carries no entry for the bare
+        TOKEN_BITWISE keyword and the generic is_binary_operator check below
+        rejects it, silently truncating the expression at "bitwise". Handle the
+        phrase here, mirroring the stage1 monolith's bit_or/bit_xor/bit_and
+        precedence ladder: AND binds tightest (PRECEDENCE_BITWISE_AND = 5), then
+        XOR (PRECEDENCE_BITWISE_XOR = 4), then OR (PRECEDENCE_BITWISE_OR = 3),
+        all left-associative and all weaker than shift (8). The discriminator is
+        peeked (not consumed) first so min_precedence can gate the operator
+        before either token is eaten. The symbolic operator codes
+        TOKEN_BITWISE_AND (530) / TOKEN_BITWISE_OR (531) / TOKEN_BITWISE_XOR
+        (532) are stored in the binary AST node — those are exactly the codes the
+        HIR/MIR binary-operator mapping recognises (530->20010, 531->20011,
+        532->20012), so the node lowers to the correct bitwise machine op.
+        :End Note
+        If token_type is equal to TOKEN_BITWISE:
+            Let bw_disc_token be proc parser_peek_token from Parser with parser, 1
+            Let bw_disc_type be 0
+            If bw_disc_token is not equal to 0:
+                Set bw_disc_type to proc token_get_type from Parser with bw_disc_token
+            End If
+
+            Let bw_precedence be 0
+            Let bw_operator be 0
+            If bw_disc_type is equal to TOKEN_AND:
+                Set bw_precedence to PRECEDENCE_BITWISE_AND
+                Set bw_operator to TOKEN_BITWISE_AND
+            End If
+            If bw_disc_type is equal to TOKEN_OR:
+                Set bw_precedence to PRECEDENCE_BITWISE_OR
+                Set bw_operator to TOKEN_BITWISE_OR
+            End If
+            If bw_disc_type is equal to TOKEN_XOR:
+                Set bw_precedence to PRECEDENCE_BITWISE_XOR
+                Set bw_operator to TOKEN_BITWISE_XOR
+            End If
+
+            Note: If the word after "bitwise" is not a recognised bitwise
+            Note: discriminator (and/or/xor), this TOKEN_BITWISE does not open a
+            Note: binary operator here (e.g. a stray keyword); stop the Pratt loop
+            Note: so the surrounding context can handle the token.
+            If bw_operator is equal to 0:
+                Break
+            End If
+
+            Note: Respect the caller's precedence floor (Pratt climbing). A
+            Note: bitwise operator looser than the floor terminates this level.
+            If bw_precedence is less than min_precedence:
+                Break
+            End If
+
+            Note: Capture the operator position (the TOKEN_BITWISE keyword) before
+            Note: consuming the two phrase tokens.
+            Let bw_op_line be proc token_get_line from Parser with current_token
+            Let bw_op_column be proc token_get_column from Parser with current_token
+
+            Note: Consume "bitwise" and the and/or/xor discriminator.
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+
+            Note: Bitwise operators are left-associative: parse the right operand
+            Note: one level tighter (precedence + 1) so chained operands at the
+            Note: same level associate left-to-right.
+            Let bw_right be proc parse_expression_with_precedence with parser, bw_precedence plus 1
+            If bw_right is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after bitwise operator", bw_op_line, bw_op_column
+                Return 0
+            End If
+
+            Let bw_node be proc build_binary_expression from ASTBuilder with bw_operator, left, bw_right, bw_op_line, bw_op_column
+            If bw_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create bitwise binary expression AST node", bw_op_line, bw_op_column
+                Return 0
+            End If
+
+            Set left to bw_node
+            Continue
+        End If
+
+        Note:
+        Underscore-spelled bitwise binary operators. Unlike the canonical
+        spaced phrases ("bitwise and" / "bitwise or" / "bitwise xor"), the
+        lexer scans the fused spellings `bitwise_and` / `bitwise_or` /
+        `bitwise_xor` as a SINGLE TOKEN_IDENTIFIER (150) whose identity lives
+        in its source spelling, not its type — so the precedence table carries
+        no entry and the generic is_binary_operator check below rejects it,
+        silently truncating the expression at the identifier (the
+        `UNKNOWN/bitwise_and` first-marker observed in source_map.runa:705 and
+        ~8 other modules). The monolith oracle (lexer.runa:1722-1727) lexes
+        these words directly to the fused bit-operator tokens, so this arm must
+        produce IDENTICAL parses to that oracle and to this parser's own
+        spaced-form arm above. Reuse that arm's exact mapping: AND binds
+        tightest (PRECEDENCE_BITWISE_AND = 5), then XOR
+        (PRECEDENCE_BITWISE_XOR = 4), then OR (PRECEDENCE_BITWISE_OR = 3), all
+        left-associative and all weaker than shift, with the symbolic operator
+        codes TOKEN_BITWISE_AND (530) / TOKEN_BITWISE_OR (531) /
+        TOKEN_BITWISE_XOR (532) stored in the binary AST node — exactly the
+        codes the HIR/MIR binary-operator mapping recognises. The spelling is
+        peeked (via primary_token_value_is, which null-guards the token and its
+        value pointer) BEFORE consuming so min_precedence can gate the operator.
+        The fused spelling `bitwise_not` is intentionally NOT recognised here:
+        the monolith oracle does not lex it as an operator and every occurrence
+        in the tree is a function/process name (e.g. `proc bitwise_not from
+        BitwiseCore`), which must remain a plain identifier.
+        :End Note
+        If token_type is equal to TOKEN_IDENTIFIER:
+            Let uw_precedence be 0
+            Let uw_operator be 0
+            Let uw_is_and be proc primary_token_value_is with current_token, "bitwise_and"
+            If uw_is_and is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_AND
+                Set uw_operator to TOKEN_BITWISE_AND
+            End If
+            Let uw_is_or be proc primary_token_value_is with current_token, "bitwise_or"
+            If uw_is_or is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_OR
+                Set uw_operator to TOKEN_BITWISE_OR
+            End If
+            Let uw_is_xor be proc primary_token_value_is with current_token, "bitwise_xor"
+            If uw_is_xor is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_XOR
+                Set uw_operator to TOKEN_BITWISE_XOR
+            End If
+
+            Note:
+            Short underscore spellings `bit_and` / `bit_or` / `bit_xor` are the
+            same bitwise operations as the `bitwise_and` / `bitwise_or` /
+            `bitwise_xor` forms above — the monolith oracle lexes them to
+            TOKEN_BIT_AND/OR/XOR (lexer.runa:1710-1727) with identical semantics
+            and precedence. They occur across ~50 self-host sites (file_io,
+            and others). Map them to the same precedence + symbolic operator
+            codes so they produce identical parses. (`bit_not`, like
+            `bitwise_not`, is NOT an infix operator and stays a plain identifier
+            / function name.)
+            :End Note
+            Let uw_is_and_s be proc primary_token_value_is with current_token, "bit_and"
+            If uw_is_and_s is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_AND
+                Set uw_operator to TOKEN_BITWISE_AND
+            End If
+            Let uw_is_or_s be proc primary_token_value_is with current_token, "bit_or"
+            If uw_is_or_s is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_OR
+                Set uw_operator to TOKEN_BITWISE_OR
+            End If
+            Let uw_is_xor_s be proc primary_token_value_is with current_token, "bit_xor"
+            If uw_is_xor_s is equal to 1:
+                Set uw_precedence to PRECEDENCE_BITWISE_XOR
+                Set uw_operator to TOKEN_BITWISE_XOR
+            End If
+
+            Note: If the identifier is not one of the fused bitwise
+            Note: operator spellings, it is an ordinary operand identifier; fall
+            Note: through to the generic binary-operator handling below.
+            If uw_operator is not equal to 0:
+                Note: Respect the caller's precedence floor (Pratt climbing). A
+                Note: bitwise operator looser than the floor terminates this level.
+                If uw_precedence is less than min_precedence:
+                    Break
+                End If
+
+                Note: Capture the operator position before consuming the token.
+                Let uw_op_line be proc token_get_line from Parser with current_token
+                Let uw_op_column be proc token_get_column from Parser with current_token
+
+                Note: Consume the single fused operator identifier token.
+                proc parser_consume_token from Parser with parser
+
+                Note: Bitwise operators are left-associative: parse the right
+                Note: operand one level tighter (precedence + 1) so chained
+                Note: operands at the same level associate left-to-right.
+                Let uw_right be proc parse_expression_with_precedence with parser, uw_precedence plus 1
+                If uw_right is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after bitwise operator", uw_op_line, uw_op_column
+                    Return 0
+                End If
+
+                Let uw_node be proc build_binary_expression from ASTBuilder with uw_operator, left, uw_right, uw_op_line, uw_op_column
+                If uw_node is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create bitwise binary expression AST node", uw_op_line, uw_op_column
+                    Return 0
+                End If
+
+                Set left to uw_node
+                Continue
+            End If
+        End If
+
+        Note:
+        Canonical string-concatenation operator `X joined with Y`. The lexer
+        tokenises the phrase as TWO tokens — the TOKEN_JOINED keyword (560)
+        followed by the particle TOKEN_WITH (372). TOKEN_JOINED IS registered
+        in the precedence table at PRECEDENCE_ADDITIVE (9), so the generic
+        binary-operator arm below would accept it — but that arm consumes only
+        the single operator token (it has trailing-particle handling for
+        "multiplied by"/"divided by"/"modulo by", NOT for "joined with"), so it
+        would leave the "with" particle unconsumed and then fail the
+        right-operand parse on it, dropping the whole enclosing statement. It
+        also builds a generic binary node, whereas the construct must desugar to
+        a string_concat(X, Y) call (the monolith oracle does this in
+        parser.runa:1098-1112: parser_eat(JOINED), parser_eat(WITH), then
+        expression_create_function_call("string_concat", {left,right}, 2)).
+        Handle the phrase here, at the additive precedence level, left-
+        associative — identical to the monolith's placement alongside +/-.
+
+        The string_concat call node is built exactly as the print-statement
+        comma-concatenation builder constructs it (statement_parsers.runa:4842-
+        4849): a "string_concat" identifier callee plus a two-element positional
+        argument list, via build_call_expression. The HIR lowers a call to the
+        "string_concat" callable directly (hir_builder.runa:2755), so no new AST
+        node type or lowering case is required; this reuses the already-proven
+        print-port string_concat path.
+
+        The monolith additionally marks the call with an int32 auto-stringify
+        flag (Task #462) so its codegen can integer_to_string Integer operands.
+        That flag lives at the monolith node's offset 4 — a free int32 slot
+        BESIDE its int32 node_type at offset 0. The MODULAR node layout
+        (ast.runa create_call_expression_node) stores node_type as a full 8-byte
+        qword at offset 0, so offset 4 is the HIGH HALF of node_type, not a free
+        flag — writing it would corrupt the node type. The modular backend has
+        no auto-stringify reader (no int_proof side table) and every joined-with
+        site in the compiler's own sources concatenates Strings or already-
+        stringified `*_str` locals, so the flag is both unrepresentable in this
+        layout and unnecessary here; it is intentionally omitted, producing the
+        same node shape as the modular print-port concat builder.
+        :End Note
+        If token_type is equal to TOKEN_JOINED:
+            Note: Respect the caller's precedence floor (Pratt climbing). A
+            Note: joined-with operator looser than the floor terminates this level.
+            If PRECEDENCE_ADDITIVE is less than min_precedence:
+                Break
+            End If
+
+            Note: Capture the operator position (the TOKEN_JOINED keyword) before
+            Note: consuming the two phrase tokens.
+            Let jw_op_line be proc token_get_line from Parser with current_token
+            Let jw_op_column be proc token_get_column from Parser with current_token
+
+            Note: Consume "joined".
+            proc parser_consume_token from Parser with parser
+
+            Note: Consume the mandatory "with" particle. Its absence means this
+            Note: was not a well-formed joined-with phrase; report and abort so
+            Note: the malformed expression does not silently mis-parse.
+            Let jw_with_token be proc parser_current_token from Parser with parser
+            Let jw_with_type be proc token_get_type from Parser with jw_with_token
+            If jw_with_type is not equal to TOKEN_WITH:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'with' after 'joined' in string concatenation", jw_op_line, jw_op_column
+                Return 0
+            End If
+            proc parser_consume_token from Parser with parser
+
+            Note: joined-with is left-associative: parse the right operand one
+            Note: level tighter (precedence + 1) so chained `a joined with b
+            Note: joined with c` associates left-to-right as
+            Note: string_concat(string_concat(a, b), c).
+            Let jw_right be proc parse_expression_with_precedence with parser, PRECEDENCE_ADDITIVE plus 1
+            If jw_right is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after 'joined with'", jw_op_line, jw_op_column
+                Return 0
+            End If
+
+            Note: Desugar to string_concat(left, jw_right): a "string_concat"
+            Note: identifier callee plus a two-element positional argument list,
+            Note: mirroring the print-port comma-concat builder and the
+            Note: monolith's expression_create_function_call("string_concat",...).
+            Let jw_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "string_concat", jw_op_line, jw_op_column
+            If jw_callee is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_concat callee identifier AST node", jw_op_line, jw_op_column
+                Return 0
+            End If
+            Let jw_args be proc create from List
+            If jw_args is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_concat argument list", jw_op_line, jw_op_column
+                Return 0
+            End If
+            proc list_append from List with jw_args, left
+            proc list_append from List with jw_args, jw_right
+            Let jw_node be proc build_call_expression from ASTBuilder with jw_callee, jw_args, 2, jw_op_line, jw_op_column
+            If jw_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_concat call AST node for 'joined with'", jw_op_line, jw_op_column
+                Return 0
+            End If
+
+            Set left to jw_node
+            Continue
+        End If
+
+        Note:
+        Canonical collection-indexing operator. Three surface forms, all
+        equivalent: the bare `X at I` (e.g. `keys at i`), `X at index I`
+        (list/array), and `X at key K` (dictionary). The lexer tokenises the
+        phrase as the TOKEN_AT keyword (653) optionally followed by the
+        TOKEN_INDEX particle (388) or the TOKEN_KEY particle (390). The monolith
+        oracle parses this in its primary-postfix loop
+        (parser_parse_primary_with_postfix, parser.runa:1166-1185):
+        parser_eat(TOKEN_AT), OPTIONALLY eat `index` or `key` if present, parse
+        the index sub-expression, and build a `list_get(object, index)` function
+        call — the keyword is purely documentary and the bare form is fully
+        valid. The oracle's emitted asm for `Let x be xs at i` is a direct
+        `call list_get` (object → %rdi, index → %rsi, result → %rax).
+
+        This arm mirrors the oracle exactly: it desugars every form to a
+        `list_get(left, index)` call built from a "list_get" identifier callee
+        plus a two-element positional argument list — the same already-proven
+        call-desugar path used by joined-with (string_concat) and length-of
+        (string_length). list_get
+        (compiler/frontend/primitives/collections/list.runa:185) is a real
+        runtime callable that the HIR lowers as an ordinary direct call, so no
+        new AST node type or lowering case is introduced. List indexing versus
+        dictionary keying is resolved downstream by the runtime type of the
+        indexed object, exactly as in the oracle.
+
+        Placement and precedence: the oracle binds `at`-indexing at the
+        postfix/primary tier — tighter than every arithmetic operator — so
+        `xs at index i plus 1` parses as `(xs at index i) plus 1` (the oracle's
+        emitted asm loads `i` alone, calls list_get, then `addq $1`, confirming
+        the index operand stops before `plus`). To replicate this, the `at`
+        arm runs before the generic binary-operator dispatch (so it always
+        applies to the already-parsed `left` regardless of the caller's
+        precedence floor) and parses the index sub-expression at
+        PRECEDENCE_UNARY (12), the tightest binding level, so the index does
+        not greedily absorb a trailing additive/comparison operator.
+        :End Note
+        If token_type is equal to TOKEN_AT:
+            Note: Capture the operator position (the TOKEN_AT keyword) before
+            Note: consuming the phrase tokens.
+            Let at_op_line be proc token_get_line from Parser with current_token
+            Let at_op_column be proc token_get_column from Parser with current_token
+
+            Note: Consume "at".
+            proc parser_consume_token from Parser with parser
+
+            Note: Optionally consume an `index` or `key` particle. The oracle
+            Note: (parser.runa:1171-1179) treats both as OPTIONAL: the bare
+            Note: form `X at I` is a valid indexing expression (e.g. `keys at i`)
+            Note: and lowers to the same list_get(X, I) call as `X at index I`
+            Note: and `X at key K`. When the particle is present it is consumed;
+            Note: when absent the index sub-expression is parsed directly off
+            Note: the `at`. List indexing versus dictionary keying is resolved
+            Note: downstream by the runtime type of the indexed object, exactly
+            Note: as in the oracle — the surface keyword is purely documentary.
+            Let at_particle_token be proc parser_current_token from Parser with parser
+            Let at_particle_type be proc token_get_type from Parser with at_particle_token
+            If at_particle_type is equal to TOKEN_INDEX:
+                proc parser_consume_token from Parser with parser
+            Otherwise If at_particle_type is equal to TOKEN_KEY:
+                proc parser_consume_token from Parser with parser
+            End If
+
+            Note: Parse the index sub-expression at PRECEDENCE_UNARY so the
+            Note: index binds at the tightest tier — `xs at index i plus 1`
+            Note: becomes `(xs at index i) plus 1`, mirroring the oracle.
+            Let at_index_expr be proc parse_expression_with_precedence with parser, PRECEDENCE_UNARY
+            If at_index_expr is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected index expression after 'at index'/'at key'", at_op_line, at_op_column
+                Return 0
+            End If
+
+            Note: Desugar to list_get(left, at_index_expr): a "list_get"
+            Note: identifier callee plus a two-element positional argument list,
+            Note: built exactly like the joined-with string_concat builder above.
+            Note: This is the oracle's lowering target — the monolith's codegen
+            Note: emits `call list_get` for EXPR_ARRAY_INDEX (verified against
+            Note: the oracle asm for `Let x be xs at index i`: push index /
+            Note: push object / pop %rdi / pop %rsi / call list_get). list_get
+            Note: (compiler/frontend/primitives/collections/list.runa:185) is a
+            Note: real runtime callable, and the HIR lowers a direct call to it
+            Note: with no specialized node, so this reuses the already-proven
+            Note: call-desugar path used by joined-with and length-of.
+            Let at_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "list_get", at_op_line, at_op_column
+            If at_callee is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create list_get callee identifier AST node", at_op_line, at_op_column
+                Return 0
+            End If
+            Let at_args be proc create from List
+            If at_args is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create list_get argument list", at_op_line, at_op_column
+                Return 0
+            End If
+            proc list_append from List with at_args, left
+            proc list_append from List with at_args, at_index_expr
+            Let at_node be proc build_call_expression from ASTBuilder with at_callee, at_args, 2, at_op_line, at_op_column
+            If at_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create list_get call AST node for 'at index'/'at key'", at_op_line, at_op_column
+                Return 0
+            End If
+
+            Set left to at_node
             Continue
         End If
 
@@ -466,6 +1011,18 @@ Process called "is_expression_head" takes token_kind as Integer returns Integer:
         Return 1
     End If
 
+    Note: Contextual keywords that are identifier-eligible (e.g. `left`, `right`,
+    Note: `shifted`, `xor`, `bitwise`, `count`, `index`, ...) also begin an operand
+    Note: when they appear in primary position — parse_primary_expression now
+    Note: routes them to parse_identifier_expression. Keeping this predicate in
+    Note: lock-step with that dispatch ensures the DEC-0018 binder RHS-completeness
+    Note: gate (and the aggregation two-token gate) treat `Let x be left` as a
+    Note: complete RHS rather than a mis-parse.
+    Let kw_id_head be proc token_can_be_identifier from Parser with token_kind
+    If kw_id_head is equal to 1:
+        Return 1
+    End If
+
     Note: Grouping / collection openers
     If token_kind is equal to TOKEN_LEFT_PAREN:
         Return 1
@@ -567,6 +1124,51 @@ Process called "aggregation_word_is_operator" takes parser as Integer returns In
     Return proc is_expression_head with after_of_kind
 End Process
 
+Process called "first_last_word_is_operator" takes parser as Integer returns Integer:
+    Note:
+    Selection-keyword two-token gate, the first/last analogue of
+    aggregation_word_is_operator. The current token is TOKEN_FIRST or
+    TOKEN_LAST (already known by the caller). This decides whether it reads as
+    the SELECTION operator (`first N items ...`, `last item ...`) or as a bare
+    identifier (a variable named `first` / `last`, which the monolith always
+    permits because it never lexed these as keywords).
+
+    Rule (scope-free, O(1), bounded 1-token lookahead, no source rescan):
+      operator iff  peek(1) begins a count operand — a numeric literal, the
+      word `item` (count = 1), or any other expression-head token that the
+      selection grammar parses as the count expression.
+
+    The selection grammar (parse_first_last_expression) consumes the keyword
+    then REQUIRES a count expression or the `item` word; if `first` / `last`
+    is followed by anything that cannot begin that count operand (a statement
+    terminator, a binary operator, `End`, `,`, `)`, etc.) it is being used as a
+    plain identifier and must be demoted. Returns 1 for the operator reading, 0
+    for the identifier reading.
+    :End Note
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let next_token be proc parser_peek_token from Parser with parser, 1
+    If next_token is equal to 0:
+        Return 0
+    End If
+
+    Let next_kind be proc token_get_type from Parser with next_token
+
+    Note: `first item` / `last item` — the singular-count selection form.
+    If next_kind is equal to TOKEN_ITEM:
+        Return 1
+    End If
+
+    Note: `first <count> [items] ...` — any expression-head count operand. This
+    Note: covers numeric literals (the common case) and parenthesised / variable
+    Note: count expressions, exactly the set parse_first_last_expression's
+    Note: parse_expression call would accept as the count.
+    Return proc is_expression_head with next_kind
+End Process
+
 Process called "demote_aggregation_to_identifier" takes parser as Integer returns Integer:
     Note:
     DEC-0018 Layer 3 fallback. An aggregation word that the two-token gate
@@ -645,6 +1247,95 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
 
     Let current_token be proc parser_current_token from Parser with parser
     Let token_type be proc token_get_type from Parser with current_token
+
+    Note:
+    Unary minus in primary position. The lexer emits the symbolic `-` as
+    TOKEN_MINUS (501), which the precedence table registers as a BINARY
+    additive operator (is_binary=1, precedence.runa:304). It is therefore NOT
+    routed through the generic unary-prefix arm of the Pratt loop
+    (is_unary_operator returns 0 for it), so a leading `-` falls through to
+    this primary parser. Mirror the monolith oracle (parser.runa
+    parser_parse_primary, "Handle unary minus for negative numbers"): consume
+    the `-`, parse the operand as a primary, and desugar to the binary
+    expression `0 - operand`. This reuses the already-lowered binary
+    subtraction path (TOKEN_MINUS -> additive MIR -> LIR_SUB) and the existing
+    build_integer_literal / build_binary_expression builders, so no new AST
+    node, HIR lowering, or codegen is required. `0 - 1` evaluates to -1,
+    matching `Return -1`, `Let x be -3`, `Constant C as Integer is -1`, and
+    composes inside larger expressions (`a plus -1`, `-1 plus a`) because the
+    desugared node is an ordinary expression returned to the Pratt loop.
+    :End Note
+    If token_type is equal to TOKEN_MINUS:
+        Let neg_line be proc token_get_line from Parser with current_token
+        Let neg_column be proc token_get_column from Parser with current_token
+
+        Note: Consume the `-`.
+        proc parser_consume_token from Parser with parser
+
+        Note: Parse the operand as a primary so the minus binds only the
+        Note: immediately-following primary (literal / variable / grouping),
+        Note: exactly like the monolith's parser_parse_primary recursion.
+        Let neg_operand be proc parse_primary_expression with parser
+        If neg_operand is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after unary minus", neg_line, neg_column
+            Return 0
+        End If
+
+        Note: Zero literal as the left operand of the subtraction.
+        Let neg_zero be proc build_integer_literal from ASTBuilder with 0, neg_line, neg_column
+        If neg_zero is equal to 0:
+            Return 0
+        End If
+
+        Let neg_node be proc build_binary_expression from ASTBuilder with TOKEN_MINUS, neg_zero, neg_operand, neg_line, neg_column
+        If neg_node is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create unary minus AST node", neg_line, neg_column
+            Return 0
+        End If
+        Return neg_node
+    End If
+
+    Note:
+    Canonical word-form negation. The lexer tokenises the literal word
+    "negative" as TOKEN_NEGATIVE (307). In expression-primary position
+    "negative <INTEGER>" is the negative-integer-literal form (mirroring the
+    monolith's parser_parse_primary TOKEN_NEGATIVE branch, Bug #371): fold it
+    to a single integer literal carrying the negated value via the existing
+    build_integer_literal builder. When TOKEN_NEGATIVE is NOT followed by an
+    integer literal it is being used as an ordinary identifier ("negative" is
+    identifier-eligible so `Let negative be 0` and references to it must parse);
+    in that case fall through to the generic identifier dispatch below WITHOUT
+    consuming the token here.
+    :End Note
+    If token_type is equal to TOKEN_NEGATIVE:
+        Let neg_lit_next be proc parser_peek_token from Parser with parser, 1
+        Let neg_lit_next_type be 0
+        If neg_lit_next is not equal to 0:
+            Set neg_lit_next_type to proc token_get_type from Parser with neg_lit_next
+        End If
+        If neg_lit_next_type is equal to TOKEN_INTEGER_LITERAL:
+            Let neg_lit_line be proc token_get_line from Parser with current_token
+            Let neg_lit_column be proc token_get_column from Parser with current_token
+
+            Note: Read the magnitude from the following integer literal, negate it,
+            Note: and consume both the "negative" word and the integer token.
+            Let neg_lit_value_str be proc token_get_value from Parser with neg_lit_next
+            Let neg_lit_magnitude be proc string_to_integer from StringPrimitive with neg_lit_value_str
+            Let neg_lit_value be 0 minus neg_lit_magnitude
+
+            Note: Consume "negative".
+            proc parser_consume_token from Parser with parser
+            Note: Consume the integer literal.
+            proc parser_consume_token from Parser with parser
+
+            Let neg_lit_node be proc build_integer_literal from ASTBuilder with neg_lit_value, neg_lit_line, neg_lit_column
+            If neg_lit_node is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create negative integer literal node", neg_lit_line, neg_lit_column
+                Return 0
+            End If
+            Return neg_lit_node
+        End If
+    End If
 
     Note: Check for literals (string, number, boolean, null, character).
     Note: The literal token-type constants form the lexical literal class:
@@ -762,6 +1453,77 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         End If
     End If
 
+    Note:
+    `length of <collection>` aggregation/length operator (prefix form).
+    Mirrors the monolith oracle exactly (parser.runa parser_parse_primary,
+    "Handle length of X → string_length(X)"): when the word `length` is
+    immediately followed by the `of` particle it reads as the length
+    operator and desugars to a call to the runtime `string_length`
+    function with the collection as its sole positional argument; otherwise
+    `length` is a bare variable reference and falls through to the generic
+    identifier branch below. The modular lexer never lexed `length` as a
+    dedicated keyword (the monolith used TOKEN_LENGTH=151), so it arrives
+    here as a plain TOKEN_IDENTIFIER whose value is "length"; the
+    discriminant is therefore a value compare plus a single TOKEN_OF
+    lookahead, identical in shape to the canonical-list / value-of-type
+    article gates above and the aggregation-word two-token gate.
+    .
+    The desugar reuses the existing AST_CALL_EXPRESSION node and its HIR
+    call lowering (no new node kind, no new lowering layer), exactly as the
+    monolith emits `expression_create_function_call("string_length", ...)`
+    and the codegen maps TOKEN_STRING_LENGTH to a `call string_length`.
+    The operand is parsed at PRECEDENCE_UNARY so it binds a single primary
+    (with any postfix the loop applies at that tightness) and does not
+    swallow a trailing lower-precedence infix operator, matching the
+    monolith's parser_parse_primary_with_postfix operand scope.
+    :End Note
+    If token_type is equal to TOKEN_IDENTIFIER:
+        Let len_is_length be proc primary_token_value_is with current_token, "length"
+        If len_is_length is equal to 1:
+            Let len_peek be proc parser_peek_token from Parser with parser, 1
+            Let len_peek_type be proc token_get_type from Parser with len_peek
+            If len_peek_type is equal to TOKEN_OF:
+                Let len_op_line be proc token_get_line from Parser with current_token
+                Let len_op_column be proc token_get_column from Parser with current_token
+
+                Note: Consume `length` then the mandatory `of` particle.
+                proc parser_consume_token from Parser with parser
+                proc parser_consume_token from Parser with parser
+
+                Note: Parse the collection operand one level tighter than any
+                Note: infix operator so `length of a plus b` reads as
+                Note: (string_length(a)) plus b, mirroring the monolith primary.
+                Let len_operand be proc parse_expression_with_precedence with parser, PRECEDENCE_UNARY
+                If len_operand is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after 'length of'", len_op_line, len_op_column
+                    Return 0
+                End If
+
+                Note: Desugar to string_length(operand): a "string_length"
+                Note: identifier callee plus a one-element positional argument
+                Note: list, mirroring the joined-with string_concat builder and
+                Note: the monolith's expression_create_function_call.
+                Let len_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "string_length", len_op_line, len_op_column
+                If len_callee is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_length callee identifier AST node", len_op_line, len_op_column
+                    Return 0
+                End If
+                Let len_args be proc create from List
+                If len_args is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_length argument list", len_op_line, len_op_column
+                    Return 0
+                End If
+                proc list_append from List with len_args, len_operand
+                Let len_node be proc build_call_expression from ASTBuilder with len_callee, len_args, 1, len_op_line, len_op_column
+                If len_node is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_length call AST node for 'length of'", len_op_line, len_op_column
+                    Return 0
+                End If
+                Return len_node
+            End If
+        End If
+    End If
+
     Note: Check for identifier
     If token_type is equal to TOKEN_IDENTIFIER:
         Return proc parse_identifier_expression with parser
@@ -828,12 +1590,25 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Return proc demote_aggregation_to_identifier with parser
     End If
 
-    Note: Check for first/last selection keywords (Language Additions v0.0.8.5)
+    Note: Check for first/last selection keywords (Language Additions v0.0.8.5).
+    Note: Gated by the two-token discriminant: `first` / `last` reads as the
+    Note: selection operator only when followed by a count operand or the word
+    Note: `item`; otherwise it is a bare variable named `first` / `last` and is
+    Note: demoted to an identifier (mirrors the monolith, which never lexed these
+    Note: as keywords, and the aggregation-word demotion pattern above).
     If token_type is equal to TOKEN_FIRST:
-        Return proc parse_first_last_expression with parser, TOKEN_FIRST
+        Let first_is_operator be proc first_last_word_is_operator with parser
+        If first_is_operator is equal to 1:
+            Return proc parse_first_last_expression with parser, TOKEN_FIRST
+        End If
+        Return proc demote_aggregation_to_identifier with parser
     End If
     If token_type is equal to TOKEN_LAST:
-        Return proc parse_first_last_expression with parser, TOKEN_LAST
+        Let last_is_operator be proc first_last_word_is_operator with parser
+        If last_is_operator is equal to 1:
+            Return proc parse_first_last_expression with parser, TOKEN_LAST
+        End If
+        Return proc demote_aggregation_to_identifier with parser
     End If
 
     Note: Check for Group keyword (Language Additions v0.0.8.5)
@@ -854,6 +1629,24 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Note: Check for proc (indirect function call)
     If token_type is equal to TOKEN_PROC:
         Return proc parse_proc_call_expression with parser
+    End If
+
+    Note: Keyword-as-identifier fallback. Several contextual keywords double as
+    Note: legitimate variable / field names (`left`, `right`, `shifted`, `xor`,
+    Note: `bitwise`, `count`, `index`, `key`, ...). When such a token reaches the
+    Note: PRIMARY position it is the head of an operand — i.e. a variable
+    Note: REFERENCE — not an operator (the word-operator forms like `a shifted
+    Note: left by 2` are consumed by the infix/precedence loop on the LEFT operand
+    Note: before primary parsing re-enters, so they never arrive here). This gate
+    Note: is placed LAST so every specific keyword dispatch above (aggregation,
+    Note: first/last, group, transform, proc, ...) takes priority; only a bare
+    Note: identifier-eligible keyword falls through to be parsed as an identifier.
+    Note: Mirrors the monolith's token_can_be_identifier dispatch in
+    Note: parser_parse_primary. Without this, `Return left` fails and panic-mode
+    Note: recovery drops every following declaration.
+    Let id_eligible be proc token_can_be_identifier from Parser with token_type
+    If id_eligible is equal to 1:
+        Return proc parse_identifier_expression with parser
     End If
 
     Note: Unexpected token - report error
@@ -943,6 +1736,67 @@ Process called "parse_identifier_expression" takes parser as Integer returns Int
 
     Note: Consume the identifier token
     proc parser_consume_token from Parser with parser
+
+    Note: Module-qualified value access: `<Identifier> from <Module>` used as an
+    Note: rvalue (e.g. `If x is equal to AST_IDENTIFIER from AST:` or
+    Note: `Let y be VARIANT from EnumType`). The bootstrap import system flattens
+    Note: every imported constant / enum-variant / global into the main program
+    Note: under its PLAIN name, so the qualifier is source-level only and the value
+    Note: resolves through the merged namespace by the plain identifier name --
+    Note: exactly the resolution the monolith oracle (parser.runa parser_parse_primary)
+    Note: performs for the `X from Module` form (task #430). The previous modular
+    Note: primary parser never consumed the `from <Module>` tail after a bare
+    Note: identifier, so the comparison-RHS / Let-value parse stopped at `from`,
+    Note: derailing the whole enclosing statement (first marker `body statement:
+    Note: From`). This re-uses the existing AST_IDENTIFIER node -- no new node kind
+    Note: and no HIR lowering change is required, because the lowered reference is
+    Note: identical to a plain merged-name reference.
+    Note: .
+    Note: Lookahead-guard exactly as the monolith does: only treat `from` as a
+    Note: module qualifier when the token AFTER `from` is an identifier whose first
+    Note: character is uppercase A-Z (module-name convention). Without this guard the
+    Note: handler would also swallow `from <integer>` / `from <local var>` in
+    Note: unrelated forms like `substring of X from 0 to 1` or `For i from 0 to N`,
+    Note: corrupting parser state. The modular token stream provides O(1) lookahead
+    Note: via parser_peek_token, so no manual lexer save/restore is needed.
+    Note: .
+    Note: An OWNED duplicate of the module alias is stashed on the identifier node's
+    Note: metadata slot (offset 56) -- the same slot and ownership discipline the
+    Note: qualified proc-call path uses, so destroy_ast_node's metadata free stays
+    Note: correct. The alias is retained for the Stage 3 mangle-resolution pass.
+    Let from_token be proc parser_current_token from Parser with parser
+    Let from_type be proc token_get_type from Parser with from_token
+    If from_type is equal to TOKEN_FROM:
+        Let module_peek be proc parser_peek_token from Parser with parser, 1
+        Let module_is_name be 0
+        If module_peek is not equal to 0:
+            Let module_peek_type be proc token_get_type from Parser with module_peek
+            If module_peek_type is equal to TOKEN_IDENTIFIER:
+                Let module_peek_value be proc token_get_value from Parser with module_peek
+                If module_peek_value is not equal to 0:
+                    Let module_first_char be proc string_char_at from StringCore with module_peek_value, 0
+                    If module_first_char is greater than or equal to 65:
+                        If module_first_char is less than or equal to 90:
+                            Set module_is_name to 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        If module_is_name is equal to 1:
+            Note: Consume `from` and the module-name token.
+            proc parser_consume_token from Parser with parser
+            Let module_token be proc parser_current_token from Parser with parser
+            Let module_alias be proc token_get_value from Parser with module_token
+            proc parser_consume_token from Parser with parser
+            If module_alias is not equal to 0:
+                Let owned_alias be proc string_duplicate from StringCore with module_alias
+                If owned_alias is not equal to 0:
+                    proc memory_set_qword from Layout with identifier_node, 56, owned_alias
+                End If
+            End If
+        End If
+    End If
 
     Return identifier_node
 End Process
@@ -1861,11 +2715,24 @@ Process called "parse_proc_call_expression" takes parser as Integer returns Inte
     Let name_column be proc token_get_column from Parser with name_token
     proc parser_consume_token from Parser with parser
 
+    Note: module_alias holds the source-level module qualifier (the alias bound by
+    Note: an Import statement) when the call is written `proc Module.func ...` or
+    Note: `proc func from Module ...`, otherwise 0. It is the token VALUE pointer as
+    Note: read from the qualifier token (lexer-owned, NUL-terminated). Stage 3 of the
+    Note: separate-compilation port consumes it during AST-level mangle-resolution to
+    Note: disambiguate same-named functions across modules; this stage only captures
+    Note: it onto the callee node's metadata slot and adds no downstream reader, so
+    Note: behavior is unchanged for every existing call form.
+    Let module_alias be 0
+
     Note: 3. Optional dot qualifier: `proc Module.func`. The first name was the
     Note: module alias; the real callee name follows the dot.
     Let qual_token be proc parser_current_token from Parser with parser
     Let qual_type be proc token_get_type from Parser with qual_token
     If qual_type is equal to TOKEN_DOT:
+        Note: The name already read into func_name was the module alias; record it
+        Note: before the real callee name overwrites func_name below.
+        Set module_alias to func_name
         proc parser_consume_token from Parser with parser
         Let dot_name_token be proc parser_current_token from Parser with parser
         If dot_name_token is equal to 0:
@@ -1877,8 +2744,9 @@ Process called "parse_proc_call_expression" takes parser as Integer returns Inte
     End If
 
     Note: 4. Optional `from Module` qualifier. The module name is source-level only
-    Note: -- imported functions are flattened under their plain name, so the module
-    Note: token is consumed but does not change the callee symbol.
+    Note: at the call site; imported functions are flattened under their plain name,
+    Note: so the module token does not change the callee symbol. The alias is still
+    Note: captured into module_alias for the Stage 3 mangle-resolution pass.
     Set qual_token to proc parser_current_token from Parser with parser
     Set qual_type to proc token_get_type from Parser with qual_token
     If qual_type is equal to TOKEN_FROM:
@@ -1888,6 +2756,7 @@ Process called "parse_proc_call_expression" takes parser as Integer returns Inte
             proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected module name after 'from' in qualified proc call", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
             Return 0
         End If
+        Set module_alias to proc token_get_value from Parser with module_token
         proc parser_consume_token from Parser with parser
     End If
 
@@ -1901,6 +2770,22 @@ Process called "parse_proc_call_expression" takes parser as Integer returns Inte
     If callee is equal to 0:
         proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create proc-call callee identifier AST node", name_line, name_column
         Return 0
+    End If
+
+    Note: Stash the source-level module alias on the callee identifier node's
+    Note: metadata slot (ASTNode.metadata, offset 56) so the Stage 3 AST-level
+    Note: mangle-resolution pass can later distinguish same-named functions across
+    Note: modules. An OWNED duplicate is stored (not the lexer-owned token value)
+    Note: because destroy_ast_node deallocates whatever the metadata slot holds; a
+    Note: duplicate keeps that free correct and avoids aliasing the lexer's lexeme.
+    Note: When the call carries no qualifier the slot stays 0 (its create_node
+    Note: default), so unqualified calls are byte-for-byte unchanged. No downstream
+    Note: reader exists yet, so this capture is inert at this stage.
+    If module_alias is not equal to 0:
+        Let owned_alias be proc string_duplicate from StringCore with module_alias
+        If owned_alias is not equal to 0:
+            proc memory_set_qword from Layout with callee, 56, owned_alias
+        End If
     End If
 
     Note: Allocate the argument list (empty when there is no `with` clause).
