@@ -665,8 +665,84 @@ Process called "generate_x86_64_assembly" that takes lir_module as Integer, conf
     Note: Emit string literals to .rodata
     MachineCode.asm_emit_string_literals(output)
 
+    Note: Emit mutable module-level globals to .data (mutable-global support).
+    emit_module_globals(ctx, lir_module)
+
     Note: Finalize and return
     Return output
+End Process
+
+@Reasoning
+Emits each mutable module-level global as a COMDAT-coalesced .data datum,
+byte-faithful to the monolith (codegen.runa:10275-10337). A module global is
+byte-identical across every translation unit that declares it (the import merge
+re-emits importers' copies), so a plain strong `.globl` would multiple-define at
+link; a COMDAT group (`.section .data.<NAME>,"aG",@progbits,<NAME>,comdat`) tells
+the linker all copies are the same entity and to keep exactly one — standard ELF
+linkonce coalescing, lossless because the values are provably identical. Reads
+and writes of the global address it RIP-relative by its plain name, so the
+setter's store and every reader's load resolve to this one symbol.
+@End Reasoning
+
+@Implementation
+Read the globals descriptor List from the LIR module's global_init_block slot
+(offset 40; populated by build_lir_module_from_mir from MIRProgram.global_values).
+Each descriptor is {name@0, init_value@8, has_init@16}. For each, open the
+global's own COMDAT data section group, emit `.globl <name>`, the `<name>:` label,
+and a `.quad <init>` cell (init defaults to 0 when has_init is 0). All writes go
+to SECTION_DATA so asm_finalize emits them under `.data`.
+@End Implementation
+
+@Security_Scope
+Null-guards the module and the list. The name string originates in the HIR/MIR
+arena and outlives emission.
+@End Security_Scope
+
+Process called "emit_module_globals" that takes ctx as Integer, lir_module as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+    If lir_module is 0:
+        Return 0
+    End If
+
+    Let output be __load(ctx, 0)
+    Let globals be __load(lir_module, 40)
+    If globals is 0:
+        Return 1
+    End If
+
+    Let gcount be List.list_length(globals)
+    Let gi be 0
+    While gi is less than gcount:
+        Let descriptor be List.list_get(globals, gi)
+        If descriptor is not 0:
+            Let g_name be __load(descriptor, 0)
+            Let g_init be __load(descriptor, 8)
+            If g_name is not 0:
+                Note: Open this global's COMDAT section group:
+                Note:   .section .data.<NAME>,"aG",@progbits,<NAME>,comdat
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, ".section .data.")
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, g_name)
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, ",\"aG\",@progbits,")
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, g_name)
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_DATA, ",comdat")
+
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, ".globl ")
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_DATA, g_name)
+
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, g_name)
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_DATA, ":")
+
+                Let init_str be StringUtils.integer_to_string(g_init)
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_DATA, "\t.quad\t")
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_DATA, init_str)
+            End If
+        End If
+        Set gi to gi plus 1
+    End While
+
+    Return 1
 End Process
 
 Note: ============================================================================
@@ -1552,6 +1628,23 @@ Process called "emit_mov" that takes ctx as Integer, instr as Integer returns In
             MachineCode.asm_emit_to_section(output, section, str_label)
             MachineCode.asm_emit_to_section(output, section, "(%rip), ")
             MachineCode.asm_emit_line(output, section, lea_dst)
+            Return 1
+        End If
+        Note: Symbol-address source operand (OPERAND_TYPE_SYMBOL = 5): the operand
+        Note: carries a module-global's plain symbol-name pointer in its
+        Note: immediate_value slot (offset 16). Materialize the global's address
+        Note: RIP-relative with `leaq <name>(%rip), <dest>` — the symbol names an
+        Note: already-emitted .data datum (see emit_module_globals), so no rodata
+        Note: interning is needed; the name string IS the label. A following load/
+        Note: store dereferences the destination register. Mirrors the monolith's
+        Note: mutable-global addressing (leaq name(%rip),%rax).
+        If src_op_type is 5:
+            Let sym_name be __load(operand1, 16)
+            Let sym_lea_dst be format_operand(result, 8)
+            MachineCode.asm_emit_to_section(output, section, "\tleaq\t")
+            MachineCode.asm_emit_to_section(output, section, sym_name)
+            MachineCode.asm_emit_to_section(output, section, "(%rip), ")
+            MachineCode.asm_emit_line(output, section, sym_lea_dst)
             Return 1
         End If
     End If

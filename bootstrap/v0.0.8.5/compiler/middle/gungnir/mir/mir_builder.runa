@@ -167,7 +167,137 @@ Process called "create_mir_builder_context" that returns Integer:
     Let externals_dict be proc create from Dictionary
     proc memory_set_int64 from Layout with context_ptr, 80, externals_dict
 
+    Note:
+    Module-global registries (mutable top-level Let support). The 128-byte
+    context block reserves offsets 88..120 beyond the documented fields:
+      offset 88: global_symbols  Dictionary HIR-symbol-id -> plain global name.
+                 Populated by the HIR_DEFINE_STATEMENT pre handler when a define
+                 is tagged as a mutable global; consulted by the identifier-read
+                 and Set-statement lowering so a use of a global resolves to a
+                 MIR_GLOBAL_ADDR + load/store instead of an alloca lookup.
+      offset 96: module_globals   List of {name, init_value, has_init} descriptor
+                 records (one per mutable global). lower_hir_program harvests this
+                 list into the MIRProgram.global_values slot so the backend emits
+                 the .data storage. Globals are shared program-wide because a
+                 single MIRBuilderContext spans the whole lowering pass.
+    :End Note
+    Let global_symbols be proc create from Dictionary
+    proc memory_set_int64 from Layout with context_ptr, 88, global_symbols
+
+    Let module_globals be proc create from List
+    proc memory_set_int64 from Layout with context_ptr, 96, module_globals
+
     Return context_ptr
+End Process
+
+@Reasoning
+Registers a mutable module-level global: records the HIR symbol id -> plain
+name mapping so subsequent reads/writes lower through MIR_GLOBAL_ADDR, and
+appends a {name, init_value, has_init} descriptor to the module_globals list
+that lower_hir_program harvests for backend .data emission. Idempotent on the
+descriptor list is unnecessary — each global is defined exactly once.
+@End Reasoning
+
+@Implementation
+Stores (symbol_id+1) as the dictionary value so the natural "miss returns 0"
+semantic distinguishes a registered global with no special value from absence;
+the name pointer is the real payload and is recovered via
+mir_context_lookup_global. The descriptor is a 24-byte heap record:
+  offset 0  = name string pointer
+  offset 8  = init_value (the literal initializer, 0 when none)
+  offset 16 = has_init flag (1 when offset 8 is a known literal init)
+Returns 1 on success, 0 on null context/name.
+@End Implementation
+
+@Security_Scope
+Registries are private to the builder context; only the define pre handler,
+which has validated the global, reaches this Process.
+@End Security_Scope
+
+Process called "mir_context_register_global" that takes context_ptr as Integer, symbol_id as Integer, name as Integer, init_value as Integer, has_init as Integer returns Integer:
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let gsym_dict be proc memory_get_int64 from Layout with context_ptr, 88
+    If gsym_dict is equal to 0:
+        Set gsym_dict to proc create from Dictionary
+        proc memory_set_int64 from Layout with context_ptr, 88, gsym_dict
+    End If
+    Let sym_key be proc integer_to_string from StringUtils with symbol_id
+    proc set from Dictionary with gsym_dict, sym_key, name
+
+    Let gl_list be proc memory_get_int64 from Layout with context_ptr, 96
+    If gl_list is equal to 0:
+        Set gl_list to proc create from List
+        proc memory_set_int64 from Layout with context_ptr, 96, gl_list
+    End If
+    Let descriptor be proc allocate from Layout with 24
+    If descriptor is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with descriptor, 0, name
+    proc memory_set_int64 from Layout with descriptor, 8, init_value
+    proc memory_set_int64 from Layout with descriptor, 16, has_init
+    proc append from List with gl_list, descriptor
+
+    Return 1
+End Process
+
+@Reasoning
+Returns the plain global name string for a HIR symbol id if that id names a
+registered mutable module global, or 0 otherwise. Used by the identifier-read
+and Set-statement lowering to decide between the local-alloca path and the
+MIR_GLOBAL_ADDR path.
+@End Reasoning
+
+@Implementation
+Single dictionary lookup against the global_symbols registry at offset 88,
+keyed by the decimal string form of the symbol id (the same encoding
+mir_context_register_global writes). Returns 0 on null context, unallocated
+registry, or a miss.
+@End Implementation
+
+@Security_Scope
+Read-only accessor. A false negative degrades a global access to the alloca
+path (which then misses and reports a lowering error) — a correctness signal,
+never a memory-safety issue.
+@End Security_Scope
+
+Process called "mir_context_lookup_global" that takes context_ptr as Integer, symbol_id as Integer returns Integer:
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+    Let gsym_dict be proc memory_get_int64 from Layout with context_ptr, 88
+    If gsym_dict is equal to 0:
+        Return 0
+    End If
+    Let sym_key be proc integer_to_string from StringUtils with symbol_id
+    Return proc get from Dictionary with gsym_dict, sym_key
+End Process
+
+@Reasoning
+Returns the module_globals descriptor List so lower_hir_program can harvest
+the registered globals into the MIRProgram for backend .data emission.
+@End Reasoning
+
+@Implementation
+Reads offset 96. Returns 0 if the context is null or the list was never
+allocated.
+@End Implementation
+
+@Security_Scope
+Read-only accessor over builder-private state.
+@End Security_Scope
+
+Process called "mir_context_get_module_globals" that takes context_ptr as Integer returns Integer:
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with context_ptr, 96
 End Process
 
 @Reasoning

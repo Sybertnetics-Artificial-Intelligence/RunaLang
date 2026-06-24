@@ -326,6 +326,33 @@ Process called "lower_hir_set_statement_post" that takes ctx as Integer, hir_nod
     End If
 
     Let target_hir_id be proc memory_get_int64 from Layout with set_target, 16
+
+    Note:
+    Module-global assignment (`Set <global> to v`). A mutable top-level Let has no
+    alloca; the define handler registered it as a global. If the target HIR symbol
+    id names a registered global, materialise its address with a function-local
+    MIR_GLOBAL_ADDR (`leaq <name>(%rip), <reg>`) and STORE through it, so the value
+    lands in the global's persistent .data cell that every reader loads from. This
+    is checked BEFORE the alloca lookup (which would miss and report error 7).
+    :End Note
+    Let set_global_name be proc mir_context_lookup_global from MIRBuilder with builder_ctx, target_hir_id
+    If set_global_name is not equal to 0:
+        Let set_g_addr_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let set_g_addr_inst be proc create_mir_global_addr from MIRNodes with set_g_addr_value, set_global_name, 8
+        If set_g_addr_inst is equal to 0:
+            Return 0
+        End If
+        proc emit_instruction from MIRBuilder with builder_ctx, set_g_addr_inst
+
+        Let set_g_type_info be proc memory_get_int64 from Layout with set_target, 72
+        Let set_g_store be proc create_mir_store from MIRNodes with set_g_addr_value, value_to_store, 0, set_g_type_info, 0
+        If set_g_store is equal to 0:
+            Return 0
+        End If
+        proc emit_instruction from MIRBuilder with builder_ctx, set_g_store
+        Return 1
+    End If
+
     Let target_addr be proc lookup_mir_value from MIRBuilder with builder_ctx, target_hir_id
     If target_addr is equal to 0:
         proc lowering_set_error from LCtx with ctx, 7, hir_node_ptr
@@ -672,6 +699,34 @@ Process called "lower_hir_define_statement_pre" that takes ctx as Integer, hir_n
 
     Let const_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
     Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Note:
+    Mutable module global (top-level Let, tagged by hir_builder with offset 32 = 1).
+    It has persistent .data storage, NOT a stack slot, so it must NOT receive an
+    alloca: an alloca lives in whatever (top-level) function context is current and
+    is unreachable from the other functions that read/write the global, which is the
+    exact module-global bug. Instead register the global in the builder context's
+    global registry (symbol id -> plain name @56, plus a {name, init, has_init}
+    descriptor for backend .data emission) and return WITHOUT mapping const_id to
+    any MIR value. lower_hir_identifier_post and lower_hir_set_statement_post detect
+    a registered global symbol and materialise a MIR_GLOBAL_ADDR (a function-local
+    `leaq <name>(%rip)`) followed by a load/store, so the setter and every reader
+    reference the same RIP-relative symbol. The define itself emits no in-function
+    code (the initializer is materialised purely as the .data datum).
+    :End Note
+    Let is_mutable_global be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    If is_mutable_global is equal to 1:
+        Let mg_name be proc memory_get_int64 from Layout with hir_node_ptr, 56
+        Let mg_init be proc memory_get_int64 from Layout with hir_node_ptr, 40
+        Let mg_has_init be proc memory_get_int64 from Layout with hir_node_ptr, 48
+        If mg_name is not equal to 0:
+            proc mir_context_register_global from MIRBuilder with builder_ctx, const_id, mg_name, mg_init, mg_has_init
+        End If
+        Note: No pending lvalue, no alloca, no const_id mapping: the post handler
+        Note: short-circuits on a 0 pending lvalue and emits nothing.
+        proc lowering_set_pending_lvalue from LCtx with ctx, 0
+        Return 1
+    End If
 
     Let alloca_value be proc allocate_temp_value from MIRBuilder with builder_ctx
     Let alloca_inst be proc create_mir_alloca from MIRNodes with alloca_value, type_info, 0, 8

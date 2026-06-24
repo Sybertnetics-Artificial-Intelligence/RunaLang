@@ -1051,6 +1051,51 @@ Process called "lower_alloca" that takes builder as Integer, mir_node as Integer
     Return 1
 End Process
 
+@Reasoning
+Lowers MIR_GLOBAL_ADDR — the materialization of a module-global's RIP-relative
+address — to a symbol-label move that the x86-64 backend renders as
+`leaq <name>(%rip), <dest>`. The result vreg holds the global's data-cell
+ADDRESS, which a following MIR_LOAD / MIR_STORE (lowered to the standard
+register-indirect load/store path) dereferences. Because the address is
+recomputed at every use site (the identifier/Set lowering emits one
+MIR_GLOBAL_ADDR per access), it is always defined in the same basic block as
+its consumer, so no cross-block address vreg can spill to an uninitialized slot
+— the same rematerialization discipline lower_load/lower_store apply to alloca
+slots.
+@End Reasoning
+
+@Implementation
+Read the result value id (header offset 8) and the symbol name (extended offset
+72; written by create_mir_global_addr). Allocate a pointer-class result register
+(type_info=0 forces GPR/8). Build a symbol-label source operand carrying the
+name and a register destination operand, then emit an LIR move; emit_mov in the
+backend special-cases the symbol-label source into the RIP-relative leaq form.
+@End Implementation
+
+@Security_Scope
+Null-guards builder and node. The name pointer originates in the HIR/arena and
+outlives code emission.
+@End Security_Scope
+
+Process called "lower_global_addr" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder is equal to 0 or mir_node is equal to 0:
+        Display "lower_global_addr: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
+    Let symbol_name be proc memory_get_int64 from Layout with mir_node, 72
+
+    Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, 0
+    Let sym_operand be proc create_symbol_label_operand from LIRNodes with symbol_name, 8
+    Let dest_operand be proc create_register_operand from LIRNodes with result_reg, 8
+
+    Let sym_move be proc create_lir_move from LIRNodes with dest_operand, sym_operand, 8
+    proc append_lir_instruction with builder, sym_move
+
+    Return 1
+End Process
+
 Note: ============================================================================
 Note: Control Flow Lowering
 Note: ============================================================================
@@ -2592,6 +2637,11 @@ Process called "lower_mir_instruction" that takes builder as Integer, mir_node a
         Return proc lower_deref with builder, mir_node
     End If
 
+    Note: Module-global address materialization (mutable-global support).
+    If opcode is equal to MIR_GLOBAL_ADDR from MIR:
+        Return proc lower_global_addr with builder, mir_node
+    End If
+
     Note: Control flow
     If opcode is equal to MIR_BRANCH from MIR:
         Return proc lower_branch with builder, mir_node
@@ -3116,6 +3166,17 @@ Process called "build_lir_module_from_mir" that takes mir_module as Integer, cal
         Display "build_lir_module_from_mir: LIR module creation failed"
         Return 0
     End If
+
+    Note:
+    Forward the mutable module globals (MIRProgram.global_values @16, a List of
+    {name, init_value, has_init} descriptors harvested by lower_hir_program) to the
+    LIR module's global_init_block slot (offset 40, otherwise always 0 and unread).
+    generate_x86_64_assembly reads it back to emit each global as a `.data` /
+    COMDAT datum so the setter's store and every reader's load resolve to the same
+    RIP-relative symbol.
+    :End Note
+    Let mir_globals be proc memory_get_int64 from Layout with mir_module, 16
+    proc memory_set_int64 from Layout with lir_module, 40, mir_globals
 
     Note: Get all functions from MIR module (functions List at offset 0).
     Let mir_functions be proc memory_get_int64 from Layout with mir_module, 0

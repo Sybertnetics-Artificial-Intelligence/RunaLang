@@ -841,11 +841,11 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
     Note: define form emits AST_DEFINE_STATEMENT (2002). Both lower to a HIR
     Note: define statement (immutable named binding) so identifier uses resolve.
     If node_type is equal to AST_CONSTANT_STATEMENT from AST:
-        Return proc lower_constant_statement with context, ast_node, line, column
+        Return proc lower_constant_statement with context, ast_node, line, column, 0
     End If
 
     If node_type is equal to AST_DEFINE_STATEMENT from AST:
-        Return proc lower_constant_statement with context, ast_node, line, column
+        Return proc lower_constant_statement with context, ast_node, line, column, 0
     End If
 
     If node_type is equal to AST_BLOCK_STATEMENT from AST:
@@ -1058,7 +1058,14 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
                 If child_kind is equal to AST_LET_STATEMENT from AST:
                     Let child_line be proc memory_get_int64 from Layout with child_ast, 8
                     Let child_column be proc memory_get_int64 from Layout with child_ast, 16
-                    Set child_hir to proc lower_constant_statement with context, child_ast, child_line, child_column
+                    Note: A top-level Let is a MUTABLE module global. Pass is_mutable_global=1
+                    Note: so lower_constant_statement does NOT inline a literal initializer
+                    Note: (which would constant-fold every read to the init value and leave a
+                    Note: Set with nowhere to write) and instead tags the HIR_DEFINE_STATEMENT
+                    Note: as a persistent global so the MIR/backend emit real .data storage that
+                    Note: the setter and all readers share via a RIP-relative symbol. A Constant
+                    Note: (immutable) keeps the inline path (is_mutable_global=0 above).
+                    Set child_hir to proc lower_constant_statement with context, child_ast, child_line, child_column, 1
                 Otherwise:
                     Set child_hir to proc lower_ast_node with context, child_ast
                 End If
@@ -3669,7 +3676,137 @@ Process called "lower_continue_statement" takes context as Integer, ast_node as 
     Return base_hir
 End Process
 
-Process called "lower_constant_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+@Reasoning
+Compile-time integer evaluation of a mutable global's initializer HIR. A
+top-level Let's initializer is a constant expression that must be materialised
+as the global's .data datum (`<name>: .quad <value>`), so its value has to be
+known at compile time. The two forms that reach a module global are a bare
+integer literal and a constant integer arithmetic expression — notably the
+negative-literal form, which the parser desugars to the binary `0 - N`
+(HIR_BINARY_EXPRESSION), and any constant fold the source writes (e.g.
+`Let X be 64 multiplied by 1024`). A naive "HIR_LITERAL only" check would emit
+`.quad 0` for every negative or computed initializer, silently corrupting the
+global's initial value (the allocator-state and sentinel globals across the
+compiler use exactly these forms). Folding the whole constant expression here
+makes the emitted datum correct for every compile-time-constant initializer.
+@End Reasoning
+
+@Implementation
+Recursively evaluate the initializer HIR:
+  - HIR_LITERAL: return its integer value (offset 40), set ok=1.
+  - HIR_BINARY_EXPRESSION: fold left (offset 8) and right (offset 16) and apply
+    the operator (offset 24) for add/sub/mul/div. Operators accept BOTH the
+    canonical token codes (TOKEN_PLUS 500 / MINUS 501 / STAR 502 / SLASH 503,
+    plus the word forms `multiplied by` 393 / `divided by` 394) AND the legacy
+    1..5 mini-encoding (1=add 2=sub 3=mul 4=div 5=mod), matching
+    map_binary_operator_to_mir_opcode so the fold agrees with the runtime path.
+  - Anything else (or a non-constant operand): leave ok=0 so the caller falls
+    back to a 0 initializer rather than baking a wrong value.
+The ok flag is returned via the out-parameter cell (a 1-word heap slot the
+caller allocates) so the routine can distinguish "folds to 0" from "cannot
+fold". Returns the folded integer value (meaningful only when the cell reads 1).
+@End Implementation
+
+@Security_Scope
+Pure reads over the HIR tree with explicit node-kind guards; division guards
+against a zero divisor (yields ok=0). No mutation, no allocation beyond the
+caller-owned ok cell.
+@End Security_Scope
+
+Process called "hir_eval_const_int" takes init_hir as Integer, ok_cell as Integer returns Integer:
+    proc memory_set_int64 from Layout with ok_cell, 0, 0
+    If init_hir is equal to 0:
+        Return 0
+    End If
+    Let node_kind be proc memory_get_int64 from Layout with init_hir, 0
+    If node_kind is equal to HIR_LITERAL from HIR:
+        proc memory_set_int64 from Layout with ok_cell, 0, 1
+        Return proc memory_get_int64 from Layout with init_hir, 40
+    End If
+    If node_kind is equal to HIR_BINARY_EXPRESSION from HIR:
+        Let bin_left be proc memory_get_int64 from Layout with init_hir, 8
+        Let bin_right be proc memory_get_int64 from Layout with init_hir, 16
+        Let bin_op be proc memory_get_int64 from Layout with init_hir, 24
+
+        Let left_ok_cell be proc allocate from Layout with 8
+        Let right_ok_cell be proc allocate from Layout with 8
+        Let left_val be proc hir_eval_const_int with bin_left, left_ok_cell
+        Let right_val be proc hir_eval_const_int with bin_right, right_ok_cell
+        Let left_ok be proc memory_get_int64 from Layout with left_ok_cell, 0
+        Let right_ok be proc memory_get_int64 from Layout with right_ok_cell, 0
+        proc deallocate from Layout with left_ok_cell
+        proc deallocate from Layout with right_ok_cell
+
+        If left_ok is equal to 0:
+            Return 0
+        End If
+        If right_ok is equal to 0:
+            Return 0
+        End If
+
+        Let is_add be 0
+        If bin_op is equal to 500:
+            Set is_add to 1
+        End If
+        If bin_op is equal to 1:
+            Set is_add to 1
+        End If
+        If is_add is equal to 1:
+            proc memory_set_int64 from Layout with ok_cell, 0, 1
+            Return left_val plus right_val
+        End If
+
+        Let is_sub be 0
+        If bin_op is equal to 501:
+            Set is_sub to 1
+        End If
+        If bin_op is equal to 2:
+            Set is_sub to 1
+        End If
+        If is_sub is equal to 1:
+            proc memory_set_int64 from Layout with ok_cell, 0, 1
+            Return left_val minus right_val
+        End If
+
+        Let is_mul be 0
+        If bin_op is equal to 502:
+            Set is_mul to 1
+        End If
+        If bin_op is equal to 393:
+            Set is_mul to 1
+        End If
+        If bin_op is equal to 3:
+            Set is_mul to 1
+        End If
+        If is_mul is equal to 1:
+            proc memory_set_int64 from Layout with ok_cell, 0, 1
+            Return left_val multiplied by right_val
+        End If
+
+        Let is_div be 0
+        If bin_op is equal to 503:
+            Set is_div to 1
+        End If
+        If bin_op is equal to 394:
+            Set is_div to 1
+        End If
+        If bin_op is equal to 4:
+            Set is_div to 1
+        End If
+        If is_div is equal to 1:
+            If right_val is equal to 0:
+                Return 0
+            End If
+            proc memory_set_int64 from Layout with ok_cell, 0, 1
+            Return left_val divided by right_val
+        End If
+
+        Return 0
+    End If
+    Return 0
+End Process
+
+Process called "lower_constant_statement" takes context as Integer, ast_node as Integer, line as Integer, column as Integer, is_mutable_global as Integer returns Integer:
     Note: Lower a Constant / Define declaration to HIR
 
     @Reasoning:
@@ -3835,15 +3972,27 @@ Process called "lower_constant_statement" takes context as Integer, ast_node as 
     Note: (no stack slot, no load). A constant whose initializer is a computed
     Note: expression (not a literal) is NOT inlinable here; it retains the
     Note: HIR_DEFINE_STATEMENT path below, which lowers inside its function body.
-    If initializer_hir is not equal to 0:
-        Let init_node_type be proc memory_get_int64 from Layout with initializer_hir, 0
-        If init_node_type is equal to HIR_LITERAL from HIR:
-            Let literal_value be proc memory_get_int64 from Layout with initializer_hir, 40
-            Let literal_value_type be proc memory_get_int64 from Layout with initializer_hir, 48
-            proc memory_set_int64 from Layout with const_symbol, 88, 1
-            proc memory_set_int64 from Layout with const_symbol, 96, literal_value
-            proc memory_set_int64 from Layout with const_symbol, 104, literal_value_type
-            Return 0
+    Note:
+    A MUTABLE module global (top-level Let, is_mutable_global=1) is NEVER inlined,
+    even with a literal initializer: it has real, persistent .data storage that a
+    Set statement must be able to write and every read must load from. Inlining
+    would constant-fold every read to the initializer and discard the Set's store,
+    which is exactly the module-global bug. So for a mutable global we skip the
+    inline shortcut entirely and always build the HIR_DEFINE_STATEMENT below, which
+    the MIR define handler turns into a persistent global symbol (no alloca) and
+    the backend emits as a .data datum addressed RIP-relative.
+    :End Note
+    If is_mutable_global is equal to 0:
+        If initializer_hir is not equal to 0:
+            Let init_node_type be proc memory_get_int64 from Layout with initializer_hir, 0
+            If init_node_type is equal to HIR_LITERAL from HIR:
+                Let literal_value be proc memory_get_int64 from Layout with initializer_hir, 40
+                Let literal_value_type be proc memory_get_int64 from Layout with initializer_hir, 48
+                proc memory_set_int64 from Layout with const_symbol, 88, 1
+                proc memory_set_int64 from Layout with const_symbol, 96, literal_value
+                proc memory_set_int64 from Layout with const_symbol, 104, literal_value_type
+                Return 0
+            End If
         End If
     End If
 
@@ -3863,6 +4012,47 @@ Process called "lower_constant_statement" takes context as Integer, ast_node as 
     proc memory_set_int64 from Layout with define_stmt, 8, const_type
     proc memory_set_int64 from Layout with define_stmt, 16, symbol_id
     proc memory_set_int64 from Layout with define_stmt, 24, initializer_hir
+
+    Note:
+    Mutable-module-global tagging. A top-level Let is lowered here with
+    is_mutable_global=1; the MIR define handler keys off these flat slots to
+    emit a persistent .data symbol instead of a per-function stack alloca:
+      offset 32 -> is_mutable_global flag (1 = persistent global, 0 = ordinary
+                   define/constant that retains the alloca+store path)
+      offset 40 -> the literal initializer value (when the initializer is a
+                   compile-time integer literal); this is the value the backend
+                   writes as `<name>: .quad <init>` in the data section
+      offset 48 -> 1 when offset 40 holds a known literal init, else 0
+      offset 56 -> the plain global name string (the COMDAT data symbol name,
+                   matching the monolith which addresses module globals by their
+                   plain name with linkonce coalescing)
+    For a mutable global the initializer child (offset 24) is cleared so the HIR
+    visitor does not re-emit the init as in-function MIR_CONST code: the init is
+    materialised purely as the .data datum, never as a runtime store.
+    :End Note
+    proc memory_set_int64 from Layout with define_stmt, 32, 0
+    proc memory_set_int64 from Layout with define_stmt, 40, 0
+    proc memory_set_int64 from Layout with define_stmt, 48, 0
+    proc memory_set_int64 from Layout with define_stmt, 56, 0
+    If is_mutable_global is equal to 1:
+        proc memory_set_int64 from Layout with define_stmt, 32, 1
+        proc memory_set_int64 from Layout with define_stmt, 56, const_name
+        proc memory_set_int64 from Layout with define_stmt, 24, 0
+        If initializer_hir is not equal to 0:
+            Note: Fold the constant initializer to its integer value. This covers a
+            Note: bare literal, the parser's negative-literal desugaring (binary 0 - N),
+            Note: and any constant integer arithmetic. A non-constant initializer leaves
+            Note: has_init=0 so the backend defaults the datum to 0.
+            Let mg_ok_cell be proc allocate from Layout with 8
+            Let mg_init_value be proc hir_eval_const_int with initializer_hir, mg_ok_cell
+            Let mg_ok be proc memory_get_int64 from Layout with mg_ok_cell, 0
+            proc deallocate from Layout with mg_ok_cell
+            If mg_ok is equal to 1:
+                proc memory_set_int64 from Layout with define_stmt, 40, mg_init_value
+                proc memory_set_int64 from Layout with define_stmt, 48, 1
+            End If
+        End If
+    End If
 
     Return define_stmt
 End Process
