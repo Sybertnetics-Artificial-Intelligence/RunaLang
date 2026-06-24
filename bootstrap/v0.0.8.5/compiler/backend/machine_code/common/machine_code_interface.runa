@@ -31,6 +31,7 @@ Dependencies:
 Import "compiler/middle/gungnir/lir/lir.runa" as LIR
 Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -1074,8 +1075,135 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
     Return __load(final_buf, 0)
 End Process
 
+Process called "asm_escape_string_literal" that takes content as Integer returns Integer:
+    Note: Produces a freshly-allocated NUL-terminated C-string that is the
+    Note: GNU-as `.string`-safe escaping of the raw bytes pointed to by content.
+    Note: The result is wrapped verbatim in double quotes by the caller; this
+    Note: helper escapes the bytes that would otherwise corrupt the directive:
+    Note:   backslash (92)      -> \\
+    Note:   double quote (34)   -> \"
+    Note:   newline (10)        -> \n
+    Note:   tab (9)             -> \t
+    Note:   carriage return (13)-> \r
+    Note:   any other control byte (< 32) or non-ASCII byte (>= 127) -> \NNN
+    Note:                          (three-digit octal escape, the form GNU as
+    Note:                          accepts inside .string)
+    Note:   printable ASCII 32..126 (except the two above) -> emitted verbatim
+    Note: The empty string ("") yields an empty escaped buffer, which the caller
+    Note: renders as `.string ""` — a valid single NUL byte in .rodata.
+    Note: Worst case every byte expands to a 4-char octal escape, so the output
+    Note: buffer is sized at 4*len + 1.
+    If content is 0:
+        Note: Null content pointer: emit an empty (NUL-only) string literal.
+        Let empty_buf be proc allocate from Layout with 1
+        If empty_buf is equal to 0:
+            Return 0
+        End If
+        proc memory_set_byte from MemoryCore with empty_buf, 0, 0
+        Return empty_buf
+    End If
+
+    Note: Measure the raw content length.
+    Let len be 0
+    Let scan_byte be proc memory_get_byte from MemoryCore with content, 0
+    While scan_byte is not equal to 0:
+        Set len to len plus 1
+        Set scan_byte to proc memory_get_byte from MemoryCore with content, len
+    End While
+
+    Let out_capacity be len multiplied by 4
+    Set out_capacity to out_capacity plus 1
+    Let out_buf be proc allocate from Layout with out_capacity
+    If out_buf is equal to 0:
+        Return 0
+    End If
+
+    Let in_pos be 0
+    Let out_pos be 0
+    While in_pos is less than len:
+        Let b be proc memory_get_byte from MemoryCore with content, in_pos
+
+        If b is equal to 92:
+            Note: backslash -> \\
+            proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+            Set out_pos to out_pos plus 1
+            proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+            Set out_pos to out_pos plus 1
+        Otherwise:
+            If b is equal to 34:
+                Note: double quote -> \"
+                proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+                Set out_pos to out_pos plus 1
+                proc memory_set_byte from MemoryCore with out_buf, out_pos, 34
+                Set out_pos to out_pos plus 1
+            Otherwise:
+                If b is equal to 10:
+                    Note: newline -> \n
+                    proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+                    Set out_pos to out_pos plus 1
+                    proc memory_set_byte from MemoryCore with out_buf, out_pos, 110
+                    Set out_pos to out_pos plus 1
+                Otherwise:
+                    If b is equal to 9:
+                        Note: tab -> \t
+                        proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+                        Set out_pos to out_pos plus 1
+                        proc memory_set_byte from MemoryCore with out_buf, out_pos, 116
+                        Set out_pos to out_pos plus 1
+                    Otherwise:
+                        If b is equal to 13:
+                            Note: carriage return -> \r
+                            proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+                            Set out_pos to out_pos plus 1
+                            proc memory_set_byte from MemoryCore with out_buf, out_pos, 114
+                            Set out_pos to out_pos plus 1
+                        Otherwise:
+                            Let is_printable be 0
+                            If b is greater than 31:
+                                If b is less than 127:
+                                    Set is_printable to 1
+                                End If
+                            End If
+                            If is_printable is equal to 1:
+                                proc memory_set_byte from MemoryCore with out_buf, out_pos, b
+                                Set out_pos to out_pos plus 1
+                            Otherwise:
+                                Note: \NNN three-digit octal escape. Modulo is
+                                Note: computed as value minus quotient*divisor to
+                                Note: stay within the bootstrap operator set.
+                                Let o1 be b divided by 64
+                                Let rem be b minus o1 multiplied by 64
+                                Let o2 be rem divided by 8
+                                Let o3 be rem minus o2 multiplied by 8
+                                proc memory_set_byte from MemoryCore with out_buf, out_pos, 92
+                                Set out_pos to out_pos plus 1
+                                proc memory_set_byte from MemoryCore with out_buf, out_pos, o1 plus 48
+                                Set out_pos to out_pos plus 1
+                                proc memory_set_byte from MemoryCore with out_buf, out_pos, o2 plus 48
+                                Set out_pos to out_pos plus 1
+                                proc memory_set_byte from MemoryCore with out_buf, out_pos, o3 plus 48
+                                Set out_pos to out_pos plus 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set in_pos to in_pos plus 1
+    End While
+
+    proc memory_set_byte from MemoryCore with out_buf, out_pos, 0
+    Return out_buf
+End Process
+
 Process called "asm_emit_string_literals" that takes output as Integer returns Integer:
-    Note: Emits all registered string literals to the .rodata section
+    Note: Emits all registered string literals to the .rodata section. Each
+    Note: registered literal is written as `<label>:\n\t.string\t"<escaped>"`,
+    Note: where <escaped> is the GNU-as-safe escaping of the raw content bytes
+    Note: (see asm_escape_string_literal). The string_literals dictionary maps a
+    Note: raw content pointer to its interned label; both are produced by
+    Note: asm_register_string_literal.
     If output is 0:
         Return 0
     End If
@@ -1102,11 +1230,15 @@ Process called "asm_emit_string_literals" that takes output as Integer returns I
         Let content be List.list_get(keys, ki)
         Let label be Dictionary.get(string_dict, content)
 
-        Note: Emit label and string data in .rodata
+        Note: Emit label and properly-escaped string data in .rodata
+        Let escaped be asm_escape_string_literal(content)
         asm_emit_to_section(output, SECTION_RODATA, label)
         asm_emit_to_section(output, SECTION_RODATA, ":\n")
         asm_emit_to_section(output, SECTION_RODATA, "\t.string\t\"")
-        asm_emit_to_section(output, SECTION_RODATA, content)
+        If escaped is not equal to 0:
+            asm_emit_to_section(output, SECTION_RODATA, escaped)
+            Layout.deallocate(escaped)
+        End If
         asm_emit_line(output, SECTION_RODATA, "\"")
 
         Set ki to ki plus 1
