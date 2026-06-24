@@ -1876,29 +1876,33 @@ Note: HIR_FUNCTION_POINTER post handler (10017)
 Note: ============================================================
 
 @Reasoning
-HIR_FUNCTION_POINTER post: lowers a function-pointer expression
-($function_name) to a MIR_CONST whose constant_value is the
-resolved function's MIR id. The function id is recorded in the
-HIR node at offset 16 (resolved_function symbol id) when HIR
-construction resolves the name.
+HIR_FUNCTION_POINTER post: lowers a function-pointer expression to the
+RIP-relative ADDRESS of the named function, exactly as the monolith oracle
+does (`leaq <label>(%rip), %rax` in codegen_generate_variable_expr's symbol-
+reference fallthrough and its EXPR_FUNCTION_POINTER arm). The node is produced
+both by the `$name` literal and by lower_identifier when a function name with
+one or more parameters is used as a value (a callback/handler argument such as
+`lowering_pre_trampoline from LCtx`). The function's link LABEL is carried as a
+ready-to-emit string in the node's function_name slot (offset 8): lower_identifier
+stamps the MODULE-MANGLED label there so the address materialized here matches
+the symbol the function's own definition emits across separately-compiled objects.
 @End Reasoning
 
 @Implementation
-1. Read function_name at HIR_FUNCTION_POINTER offset 8 and
-   resolved_function id at offset 16.
-2. Read function_type at offset 24.
-3. Allocate a result value and emit MIR_CONST(resolved_function,
-   function_type, is_string=0).
-4. Push result.
+1. Read the function label string at HIR_FUNCTION_POINTER offset 8.
+2. Allocate a result value and emit MIR_GLOBAL_ADDR(label) -- the same
+   instruction the mutable-global read path uses, lowered to
+   `leaq <label>(%rip), <reg>` by the x86-64 backend. The pointer width is 8.
+3. Push the result (the function address) onto the result stack.
 @End Implementation
 
 @Performance_Hints
-Single emit per function-pointer creation.
+Single MIR_GLOBAL_ADDR emit per function-pointer reference; cold path.
 @End Performance_Hints
 
 @Security_Scope
-A zero resolved_function id is a lowering error (HIR resolver
-should have populated this).
+A zero function label is a lowering error (HIR construction must have stamped
+the label; an unresolved name never reaches here as a function pointer).
 @End Security_Scope
 
 Process called "lower_hir_function_pointer_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
@@ -1914,19 +1918,23 @@ Process called "lower_hir_function_pointer_post" that takes ctx as Integer, hir_
         Return 0
     End If
 
-    Let resolved_function be proc memory_get_int64 from Layout with hir_node_ptr, 16
-    Let function_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Note: The function label string lives at offset 8 (create_hir_function_pointer's
+    Note: function_name slot). It is the ready-to-emit, module-mangled link symbol the
+    Note: function's definition also produces, so `leaq <label>(%rip)` resolves to the
+    Note: real function across separately-compiled objects.
+    Let function_label be proc memory_get_int64 from Layout with hir_node_ptr, 8
 
-    If resolved_function is equal to 0:
+    If function_label is equal to 0:
         proc lowering_set_error from LCtx with ctx, 36, hir_node_ptr
         Return 0
     End If
 
     Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
-    Let const_inst be proc create_mir_const from MIRNodes with result_value, resolved_function, function_type, 0, 0
-    If const_inst is not equal to 0:
-        proc emit_instruction from MIRBuilder with builder_ctx, const_inst
+    Let addr_inst be proc create_mir_global_addr from MIRNodes with result_value, function_label, 8
+    If addr_inst is equal to 0:
+        Return 0
     End If
+    proc emit_instruction from MIRBuilder with builder_ctx, addr_inst
 
     proc lowering_push_result from LCtx with ctx, result_value
     Return 1

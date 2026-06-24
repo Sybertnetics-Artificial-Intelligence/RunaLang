@@ -50,6 +50,7 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 
 Note: ============================================================================
 Note: HIR Builder Context Structure
@@ -1007,6 +1008,20 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
                         Let pre_symbol be proc create_hir_symbol_info from HIR with pre_name, SYMBOL_FUNCTION from HIR, program_scope
                         If pre_symbol is not equal to 0:
                             proc memory_set_int64 from Layout with pre_symbol, 112, pre_param_count
+                            Note:
+                            Stamp the AST process-definition node onto the symbol's
+                            declaration_node slot (offset 40, otherwise unused for a
+                            SYMBOL_FUNCTION). A function name used as a VALUE (function-pointer
+                            reference, e.g. `lowering_pre_trampoline from LCtx` passed as a
+                            callback argument) must lower to the function's ADDRESS under the
+                            same module-mangled label its definition emits. lower_identifier
+                            recovers that label by reading the definition's origin source_file
+                            (AST_PROCESS_DEFINITION offset 136) through this slot and mangling it
+                            identically to the LIR builder's def-label derivation. Without the
+                            stamp there is no path from a bare function-name use back to the
+                            defining module, so the cross-module address could not be mangled.
+                            :End Note
+                            proc memory_set_int64 from Layout with pre_symbol, 40, pre_child
                             proc add_symbol_to_scope with program_scope, pre_symbol
                         End If
                     End If
@@ -1151,6 +1166,194 @@ Process called "lower_literal" takes context as Integer, ast_node as Integer, li
     Return hir_node
 End Process
 
+@Reasoning
+Derive the module key "<parent_dir>_<basename>" from a source-file path,
+byte-identical to the LIR builder's lir_sepcomp_module_key_from_path and the
+driver's sepcomp_module_key_from_path. A function name used as a VALUE (a
+function-pointer reference) must lower to a `leaq <label>(%rip)` whose label
+equals the label the function's DEFINITION emits. The definition label is the
+LIR builder's mangling of the def's source_file; reproducing the identical key
+derivation here guarantees the reference and the definition agree at link time.
+@End Reasoning
+
+@Implementation
+Find the basename (text after the last '/' or '\\') with its extension removed,
+and the immediate parent directory name. Concatenate "<parent>_<basename>",
+mapping '.' and '-' to '_' in both components, into a fresh NUL-terminated heap
+buffer the caller owns. Returns 0 when the path is empty or yields no basename.
+@End Implementation
+
+@Performance_Hints
+Two linear scans of the path plus one allocation. Invoked only when a
+function name is taken as a value (a cold path relative to ordinary reads).
+@End Performance_Hints
+
+@Security_Scope
+Pure read of the path bytes; writes only into the freshly allocated buffer it
+returns. Bounds are derived from the scanned separator/dot indices.
+@End Security_Scope
+
+Process called "hir_fnptr_module_key_from_path" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let path_len be proc string_length from StringCore with path
+    If path_len is equal to 0:
+        Return 0
+    End If
+
+    Let last_sep be 0
+    Let prev_sep be 0
+    Let scan_i be 0
+    While scan_i is less than path_len:
+        Let ch be proc memory_get_byte from Layout with path, scan_i
+        Let is_sep be 0
+        If ch is equal to 47:
+            Set is_sep to 1
+        End If
+        If ch is equal to 92:
+            Set is_sep to 1
+        End If
+        If is_sep is equal to 1:
+            Set prev_sep to last_sep
+            Set last_sep to scan_i plus 1
+        End If
+        Set scan_i to scan_i plus 1
+    End While
+
+    Let basename_start be 0
+    If last_sep is greater than 0:
+        Set basename_start to last_sep
+    End If
+
+    Let basename_end be path_len
+    Let scan_j be basename_start
+    Let last_dot be 0
+    While scan_j is less than path_len:
+        Let ch2 be proc memory_get_byte from Layout with path, scan_j
+        If ch2 is equal to 46:
+            Set last_dot to scan_j plus 1
+        End If
+        Set scan_j to scan_j plus 1
+    End While
+    If last_dot is greater than 0:
+        Set basename_end to last_dot minus 1
+    End If
+
+    Let basename_len be basename_end minus basename_start
+    If basename_len is less than or equal to 0:
+        Return 0
+    End If
+
+    Let parent_start be 0
+    Let parent_end be 0
+    Let parent_len be 0
+    If last_sep is greater than 0:
+        If prev_sep is greater than 0:
+            Set parent_start to prev_sep
+            Set parent_end to last_sep minus 2
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        Otherwise:
+            Set parent_end to last_sep minus 2
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        End If
+    End If
+
+    Let total_len be basename_len
+    If parent_len is greater than 0:
+        Set total_len to parent_len plus 1 plus basename_len
+    End If
+
+    Let key_buf be proc allocate from Layout with total_len plus 1
+    If key_buf is equal to 0:
+        Return 0
+    End If
+
+    Let write_idx be 0
+    If parent_len is greater than 0:
+        Let pi be 0
+        While pi is less than parent_len:
+            Let psrc be proc memory_get_byte from Layout with path, parent_start plus pi
+            If psrc is equal to 46:
+                Set psrc to 95
+            End If
+            If psrc is equal to 45:
+                Set psrc to 95
+            End If
+            proc memory_set_byte from Layout with key_buf, write_idx, psrc
+            Set write_idx to write_idx plus 1
+            Set pi to pi plus 1
+        End While
+        proc memory_set_byte from Layout with key_buf, write_idx, 95
+        Set write_idx to write_idx plus 1
+    End If
+    Let bi be 0
+    While bi is less than basename_len:
+        Let bsrc be proc memory_get_byte from Layout with path, basename_start plus bi
+        If bsrc is equal to 46:
+            Set bsrc to 95
+        End If
+        If bsrc is equal to 45:
+            Set bsrc to 95
+        End If
+        proc memory_set_byte from Layout with key_buf, write_idx, bsrc
+        Set write_idx to write_idx plus 1
+        Set bi to bi plus 1
+    End While
+    proc memory_set_byte from Layout with key_buf, write_idx, 0
+
+    Return key_buf
+End Process
+
+@Reasoning
+Compute the module-mangled label "<module_key>__<name>" for a function value
+reference, mirroring lir_sepcomp_mangle_name (the def-label derivation). A
+function used as a value addresses the SAME symbol its definition emits, so the
+two must mangle identically. The entry point `main` and functions with no
+stamped source_file keep their plain name (the def label is unmangled in those
+cases too), so the reference matches by emitting the plain name.
+@End Reasoning
+
+@Implementation
+Return 0 (caller emits the plain name) when name/source_file is 0 or the name
+is "main". Otherwise build "<key>__<name>" from hir_fnptr_module_key_from_path.
+Caller owns the returned heap string.
+@End Implementation
+
+@Performance_Hints
+One key derivation plus two concatenations; cold path (function-as-value only).
+@End Performance_Hints
+
+@Security_Scope
+Pure: reads name/path bytes, allocates and returns a new string.
+@End Security_Scope
+
+Process called "hir_fnptr_mangle_name" takes name as Integer, source_file as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If source_file is equal to 0:
+        Return 0
+    End If
+    Let is_main be proc string_equals from StringCore with name, "main"
+    If is_main is equal to 1:
+        Return 0
+    End If
+    Let module_key be hir_fnptr_module_key_from_path(source_file)
+    If module_key is equal to 0:
+        Return 0
+    End If
+    Let sep_tmp be proc string_concat from StringPrimitive with module_key, "__"
+    Let full be proc string_concat from StringPrimitive with sep_tmp, name
+    proc deallocate from Layout with module_key
+    proc deallocate from Layout with sep_tmp
+    Return full
+End Process
+
 Process called "lower_identifier" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
     Note: Lower identifier to HIR with symbol resolution
 
@@ -1291,6 +1494,59 @@ Process called "lower_identifier" takes context as Integer, ast_node as Integer,
                         proc set_hir_node_type_info from HIR with noarg_call, noarg_return_type
                     End If
                     Return noarg_call
+                Otherwise:
+                    Note:
+                    Function NAME used as a VALUE (a function-pointer reference). A name
+                    that resolves to a SYMBOL_FUNCTION with one or more parameters cannot
+                    be a zero-argument call, and is NOT a call's callee (callee_suppressed
+                    is 0), so the only valid meaning in value position is "the address of
+                    this function" -- e.g. `lowering_pre_trampoline from LCtx` passed as a
+                    callback argument to create_visitor_context. The monolith oracle emits
+                    `leaq <label>(%rip), %rax` for exactly this case
+                    (codegen_generate_variable_expr's symbol-reference fallthrough). The
+                    previous modular behavior left a bare HIR_IDENTIFIER here; its MIR post
+                    handler found no value mapping for the name (it is a function, not a
+                    local) and, outside callee context, raised an undefined-identifier
+                    lowering error that latched the visitor's stop flag and DROPPED every
+                    statement after the reference -- truncating the enclosing function (the
+                    self-host's lower_hir_program lost its entire declaration loop after the
+                    create_visitor_context call, so no MIR functions, and thus no `main:`,
+                    were emitted). Produce an HIR_FUNCTION_POINTER instead, carrying the
+                    function's MODULE-MANGLED label so the address it materializes matches
+                    the symbol the function's own definition emits. main / unstamped
+                    functions keep the plain name (their def label is unmangled too).
+                    :End Note
+                    Let fp_decl_node be proc memory_get_int64 from Layout with symbol, 40
+                    Let fp_source_file be 0
+                    If fp_decl_node is not equal to 0:
+                        Set fp_source_file to proc memory_get_int64 from Layout with fp_decl_node, 136
+                    End If
+                    Let fp_emit_name be name
+                    Let fp_mangled be hir_fnptr_mangle_name(name, fp_source_file)
+                    If fp_mangled is not equal to 0:
+                        Set fp_emit_name to fp_mangled
+                    End If
+                    Note:
+                    Build the HIR_FUNCTION_POINTER as a FLAT node: the type tag lives at
+                    offset 0 (so the HIR visitor's offset-0 dispatch routes it to the
+                    10017 post handler) and the ready-to-emit function LABEL lives at
+                    offset 8 (where lower_hir_function_pointer_post reads it to emit
+                    `leaq <label>(%rip)`). This mirrors the FLAT-node convention every
+                    other lowered expression uses (e.g. HIR_CALL_EXPRESSION). The legacy
+                    create_hir_function_pointer wrapper stores a base-node pointer at
+                    offset 0, which the visitor would misread as a node type, so it is
+                    deliberately not used here.
+                    :End Note
+                    Let fp_node be proc create_hir_node from HIR with HIR_FUNCTION_POINTER from HIR, line, column
+                    If fp_node is equal to 0:
+                        Return hir_node
+                    End If
+                    proc memory_set_int64 from Layout with fp_node, 8, fp_emit_name
+                    proc memory_set_int64 from Layout with fp_node, 16, symbol_id
+                    If symbol_type is not equal to 0:
+                        proc set_hir_node_type_info from HIR with fp_node, symbol_type
+                    End If
+                    Return fp_node
                 End If
             End If
         End If
@@ -1743,17 +1999,44 @@ Process called "lower_function_pointer_expression" takes context as Integer, ast
         Return 0
     End If
 
-    Note: Create specialized function pointer HIR node
-    Let func_ptr_expr be proc create_hir_function_pointer from HIRNodes with base_hir, function_name, resolved_function, function_type
-
-    If func_ptr_expr is equal to 0:
-        Return 0
+    Note:
+    Mangle the function name to its module-qualified link label, mirroring the
+    function-name-as-value path in lower_identifier. lower_hir_function_pointer_post
+    materializes the function ADDRESS as `leaq <label>(%rip)` using the string stored
+    here at the function_name slot, so it must be the SAME label the function's
+    definition emits across separately-compiled objects (the LIR builder mangles the
+    def label identically). The resolved symbol carries its defining AST node at the
+    declaration_node slot (offset 40, stamped by lower_program's forward-decl pre-pass),
+    from which the origin source_file (AST_PROCESS_DEFINITION offset 136) drives the
+    mangling. main / unstamped functions keep the plain name (their def label is
+    unmangled too).
+    :End Note
+    Let fp_lit_decl_node be proc memory_get_int64 from Layout with resolved_function, 40
+    Let fp_lit_source_file be 0
+    If fp_lit_decl_node is not equal to 0:
+        Set fp_lit_source_file to proc memory_get_int64 from Layout with fp_lit_decl_node, 136
+    End If
+    Let fp_lit_emit_name be function_name
+    Let fp_lit_mangled be hir_fnptr_mangle_name(function_name, fp_lit_source_file)
+    If fp_lit_mangled is not equal to 0:
+        Set fp_lit_emit_name to fp_lit_mangled
     End If
 
-    Note: Set function type on base HIR node (function pointer has function type)
+    Note:
+    Build the HIR_FUNCTION_POINTER as a FLAT node (type tag @0 for the visitor's
+    offset-0 dispatch, function LABEL @8 for lower_hir_function_pointer_post's
+    `leaq <label>(%rip)` emission), matching every other lowered expression and the
+    function-name-as-value path in lower_identifier. base_hir is reused as the flat
+    node itself: it already carries HIR_FUNCTION_POINTER at offset 0 and the source
+    position; we only need to stamp the label and resolved-symbol id.
+    :End Note
+    proc memory_set_int64 from Layout with base_hir, 8, fp_lit_emit_name
+    proc memory_set_int64 from Layout with base_hir, 16, resolved_function
+
+    Note: Set function type on the node (function pointer has function type)
     proc set_hir_node_type_info from HIR with base_hir, function_type
 
-    Return func_ptr_expr
+    Return base_hir
 End Process
 
 Process called "lower_indirect_call_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
