@@ -2252,9 +2252,45 @@ Process called "emit_umod" that takes ctx as Integer, instr as Integer returns I
 End Process
 
 Process called "emit_shift" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    @Reasoning
+    A LIR shift is three-address (result = value SHIFT count) where value is
+    operand1(@16) and the shift count is operand2(@24). x86-64 shifts are
+    two-address and constrain the count to EITHER an 8-bit immediate OR the CL
+    register; the destination is also the (only) source value operand. The
+    previous emitter read only result(@8) and operand2(@24): it dropped the
+    value operand entirely (never seeding the destination with operand1) and,
+    for a register count, hard-coded "%cl" without ever moving the actual count
+    register into RCX. The result was code like "shrq %cl, %rax" where %rax held
+    the count and %cl was garbage, so e.g. omap_hash produced a nondeterministic
+    hash and every hash-map lookup after an insert missed — the #537 regalloc
+    runaway. This emitter materialises the correct two-address sequence for both
+    the immediate-count and register-count forms, independent of how the
+    register allocator coalesced result/value.
+    @End Reasoning
+
+    @Implementation
+    value  := operand1(@16), count := operand2(@24).
+    Immediate count (tag 2):
+        result == value : SHIFT $imm, result
+        otherwise       : mov value, result ; SHIFT $imm, result
+    Register count: stage the value through the caller-saved scratch r11 so no
+    aliasing between value, count, RCX, and result can corrupt an operand:
+        mov value, r11 ; mov count, %rcx ; SHIFT %cl, r11 ; mov r11, result
+    r11 is reserved as this emitter's scratch (see emit_binary_op) and is never
+    allocated to a value, so it cannot alias result, value, or the count.
+    @End Implementation
+
+    @Security_Scope
+    All operand reads are NULL/tag guarded. The register-count path always
+    routes through r11 (SysV caller-saved temporary), which guarantees the count
+    load into RCX happens after the value is captured, so a value coalesced onto
+    RCX, or a result coalesced onto the count register, cannot lose an operand.
+    @End Security_Scope
+
     Let output be __load(ctx, 0)
     Let section be MachineCode.SECTION_TEXT
     Let result be __load(instr, 8)
+    Let value be __load(instr, 16)
     Let operand2 be __load(instr, 24)
     Let size be 8
     If result is not 0:
@@ -2265,24 +2301,84 @@ Process called "emit_shift" that takes ctx as Integer, instr as Integer, mnemoni
     End If
     Let suffix be get_size_suffix(size)
     Let dst_str be format_operand(result, size)
+    Let value_str be format_operand(value, size)
+
+    Note: Physical register ids of the result and value operands (-1 if not a
+    Note: plain register operand). Used to elide redundant value->dest moves.
+    Let result_reg be 0 minus 1
+    If result is not 0:
+        If __load(result, 0) is equal to 1:
+            Set result_reg to __load(result, 8)
+        End If
+    End If
+    Let value_reg be 0 minus 1
+    If value is not 0:
+        If __load(value, 0) is equal to 1:
+            Set value_reg to __load(value, 8)
+        End If
+    End If
 
     Let count_type be 0
     If operand2 is not 0:
         Set count_type to __load(operand2, 0)
     End If
 
+    If count_type is 2:
+        Note: Immediate shift count: ensure the destination holds the value,
+        Note: then shift in place by the immediate.
+        If result_reg is not equal to value_reg:
+            MachineCode.asm_emit_to_section(output, section, "\tmov")
+            MachineCode.asm_emit_to_section(output, section, suffix)
+            MachineCode.asm_emit_to_section(output, section, "\t")
+            MachineCode.asm_emit_to_section(output, section, value_str)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, dst_str)
+        End If
+
+        Let count_str be format_operand(operand2, 1)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, mnemonic)
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, count_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, dst_str)
+        Return 1
+    End If
+
+    Note: Register shift count: stage the value through r11, place the count in
+    Note: RCX (CL), shift, then write the result back. This sequence is correct
+    Note: for every coalescing of result/value/count.
+    Let scratch_str be get_register_name(11, size)
+    Let count_str be format_operand(operand2, size)
+    Let rcx_str be get_register_name(2, size)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, value_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, scratch_str)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, count_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, rcx_str)
+
     MachineCode.asm_emit_to_section(output, section, "\t")
     MachineCode.asm_emit_to_section(output, section, mnemonic)
     MachineCode.asm_emit_to_section(output, section, suffix)
     MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, "%cl")
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, scratch_str)
 
-    If count_type is 2:
-        Let count_str be format_operand(operand2, 1)
-        MachineCode.asm_emit_to_section(output, section, count_str)
-    Otherwise:
-        MachineCode.asm_emit_to_section(output, section, "%cl")
-    End If
-
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, scratch_str)
     MachineCode.asm_emit_to_section(output, section, ", ")
     MachineCode.asm_emit_line(output, section, dst_str)
     Return 1
