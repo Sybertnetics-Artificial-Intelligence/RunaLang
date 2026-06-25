@@ -187,6 +187,230 @@ Process called "parse_expression" takes parser as Integer returns Integer:
     Return expression
 End Process
 
+Process called "parse_postfix_operators" takes parser as Integer, left as Integer returns Integer:
+    Note:
+    Apply trailing postfix operators (member access, function call, with-call,
+    indexing, range, sorted) to an already-parsed operand `left`, looping until
+    no further postfix token applies. Returns the (possibly extended) operand,
+    or 0 on a parse error.
+
+    This is invoked TWICE by parse_expression_with_precedence: once on the LEFT
+    operand BEFORE the binary Pratt loop (so postfix binds tighter than infix,
+    e.g. `ctx.a minus ctx.b` attaches `.a`/`.b` before the `minus` is climbed),
+    and once AFTER the Pratt loop (preserving the trailing sorted/range-tail
+    behaviour). The post-loop call is a no-op when no postfix token remains.
+    :End Note
+    Let current_token be 0
+    Let token_type be 0
+
+    Note: Check for postfix operators (member access, function call, indexing)
+    Loop forever:
+        Set current_token to proc parser_current_token from Parser with parser
+        Set token_type to proc token_get_type from Parser with current_token
+
+        Note: Check for member access (.)
+        If token_type is equal to TOKEN_DOT:
+            Note:
+            Module-qualified access in expression position. Two source forms,
+            both produced by the bootstrap import system flattening every
+            imported function / constant / global into the main program under
+            its PLAIN name, so the module qualifier is source-level only and
+            resolution keys off the plain name. The monolith oracle (parser.runa
+            postfix `.` handler, ~lines 1424-1548) handles BOTH here:
+
+              (1) `Module.method(args)`  -- a module-qualified METHOD CALL
+                  (e.g. `Return Dictionary.contains(d, k)`,
+                  `Dictionary.size(d)`, `StringUtils.integer_to_string(n)`).
+                  The monolith builds an EXPR_QUALIFIED_CALL. The modular AST
+                  has no distinct qualified-call node; the `proc method from
+                  Module with args` arm (commit 3413b066) represents one as a
+                  plain AST_CALL_EXPRESSION whose callee is an AST_IDENTIFIER
+                  carrying the PLAIN method name with the module alias stashed
+                  on metadata@56. This desugar reuses that EXACT node shape and
+                  the existing direct-call HIR lowering.
+
+              (2) `Module.CONSTANT`  -- a module-qualified CONSTANT / enum /
+                  global access with NO parentheses (e.g.
+                  `CallingConv.CALLING_CONV_AAPCS64`, `MachineCode.SECTION_TEXT`).
+                  The monolith rewrites it to a bare variable reference against
+                  the merged namespace, retaining the alias. This desugar reuses
+                  the existing AST_IDENTIFIER node carrying the PLAIN name with
+                  the module alias on metadata@56 -- byte-identical lowering to
+                  the `CONSTANT from Module` form already handled by
+                  parse_identifier_expression.
+
+            Both names are read by SPELLING via token_can_be_identifier so
+            keyword-typed names (contains/size/remove) and uppercase constants
+            are accepted. The whole handler is gated so it fires ONLY when left
+            is a bare AST_IDENTIFIER whose first character is uppercase A-Z
+            (module-name convention, matching the `X from Module` guard) and the
+            token after the dot can name an identifier. Any miss falls through
+            to the unchanged parse_member_expression path, so plain
+            lowercase-object `obj.field` member access is untouched. Reusing the
+            qualified-call / qualified-identifier nodes means NO new node kind
+            and NO new HIR/MIR lowering is introduced.
+            :End Note
+            Let qmc_handled be 0
+            If left is not equal to 0:
+                Let qmc_left_type be proc ast_node_get_type from AST with left
+                If qmc_left_type is equal to AST_IDENTIFIER from AST:
+                    Let qmc_module_name be proc ast_node_get_value from AST with left
+                    Let qmc_module_is_name be 0
+                    If qmc_module_name is not equal to 0:
+                        Let qmc_first_char be proc string_char_at from StringCore with qmc_module_name, 0
+                        If qmc_first_char is greater than or equal to 65:
+                            If qmc_first_char is less than or equal to 90:
+                                Set qmc_module_is_name to 1
+                            End If
+                        End If
+                    End If
+                    If qmc_module_is_name is equal to 1:
+                        Let qmc_name_token be proc parser_peek_token from Parser with parser, 1
+                        Let qmc_name_ok be 0
+                        If qmc_name_token is not equal to 0:
+                            Let qmc_name_type be proc token_get_type from Parser with qmc_name_token
+                            Let qmc_name_can_id be proc token_can_be_identifier from Parser with qmc_name_type
+                            If qmc_name_can_id is equal to 1:
+                                Set qmc_name_ok to 1
+                            End If
+                        End If
+                        If qmc_name_ok is equal to 1:
+                            Let qmc_member_value be proc token_get_value from Parser with qmc_name_token
+                            Let qmc_acc_line be proc token_get_line from Parser with qmc_name_token
+                            Let qmc_acc_column be proc token_get_column from Parser with qmc_name_token
+                            Let qmc_paren_token be proc parser_peek_token from Parser with parser, 2
+                            Let qmc_is_call be 0
+                            If qmc_paren_token is not equal to 0:
+                                Let qmc_paren_type be proc token_get_type from Parser with qmc_paren_token
+                                If qmc_paren_type is equal to TOKEN_LEFT_PAREN:
+                                    Set qmc_is_call to 1
+                                End If
+                            End If
+
+                            Note: Consume the dot and the member-name token (shared
+                            Note: by both the call and the constant-access forms).
+                            proc parser_consume_token from Parser with parser
+                            proc parser_consume_token from Parser with parser
+
+                            If qmc_is_call is equal to 1:
+                                Note: Form (1): `Module.method(args)`. Consume '(' and
+                                Note: parse the comma-separated argument list.
+                                proc parser_consume_token from Parser with parser
+                                Let qmc_arguments be proc parse_argument_list with parser
+                                If qmc_arguments is equal to 0:
+                                    Set qmc_arguments to proc create from List
+                                End If
+                                Let qmc_rparen be proc parser_expect_token from Parser with parser, TOKEN_RIGHT_PAREN
+                                If qmc_rparen is equal to 0:
+                                    Return 0
+                                End If
+                                Let qmc_callee be proc build_identifier_node from ASTBuilder with qmc_member_value, qmc_acc_line, qmc_acc_column
+                                If qmc_callee is equal to 0:
+                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified method-call callee identifier AST node", qmc_acc_line, qmc_acc_column
+                                    Return 0
+                                End If
+                                Let qmc_call_alias be proc string_duplicate from StringCore with qmc_module_name
+                                If qmc_call_alias is not equal to 0:
+                                    proc memory_set_qword from Layout with qmc_callee, 56, qmc_call_alias
+                                End If
+                                Let qmc_argument_count be proc list_length from List with qmc_arguments
+                                Let qmc_call_node be proc build_call_expression from ASTBuilder with qmc_callee, qmc_arguments, qmc_argument_count, qmc_acc_line, qmc_acc_column
+                                If qmc_call_node is equal to 0:
+                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified method-call expression AST node", qmc_acc_line, qmc_acc_column
+                                    Return 0
+                                End If
+                                proc destroy_ast_node from AST with left
+                                Set left to qmc_call_node
+                                Set qmc_handled to 1
+                            Otherwise:
+                                Note: Form (2): `Module.CONSTANT` (no parens). Build a
+                                Note: bare identifier carrying the PLAIN member name with
+                                Note: the module alias on metadata@56 -- identical to the
+                                Note: `CONSTANT from Module` rvalue node.
+                                Let qmc_const_node be proc build_identifier_node from ASTBuilder with qmc_member_value, qmc_acc_line, qmc_acc_column
+                                If qmc_const_node is equal to 0:
+                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified constant-access identifier AST node", qmc_acc_line, qmc_acc_column
+                                    Return 0
+                                End If
+                                Let qmc_const_alias be proc string_duplicate from StringCore with qmc_module_name
+                                If qmc_const_alias is not equal to 0:
+                                    proc memory_set_qword from Layout with qmc_const_node, 56, qmc_const_alias
+                                End If
+                                proc destroy_ast_node from AST with left
+                                Set left to qmc_const_node
+                                Set qmc_handled to 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            If qmc_handled is equal to 1:
+                Continue
+            End If
+            Set left to proc parse_member_expression with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: Check for function call (()
+        If token_type is equal to TOKEN_LEFT_PAREN:
+            Set left to proc parse_call_expression with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: Check for canonical named-call argument clause (`callee with arg
+        Note: [and arg] [, arg] ...`). This is the primary Runa call surface
+        Note: form: `helper with 41`, `add with 20 and 22`. The opening "with"
+        Note: promotes the parsed callee expression into a function call whose
+        Note: arguments follow. Handled as a postfix operator so chained forms
+        Note: (`obj.method with x`) and qualified callees compose naturally.
+        If token_type is equal to TOKEN_WITH:
+            Set left to proc parse_with_call_arguments with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: Check for array indexing ([])
+        If token_type is equal to TOKEN_LEFT_BRACKET:
+            Set left to proc parse_index_expression with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: Check for range operator (..)
+        If token_type is equal to TOKEN_RANGE:
+            Set left to proc parse_range_expression with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: Check for "sorted by" operator (Language Additions v0.0.8.5)
+        If token_type is equal to TOKEN_SORTED:
+            Set left to proc parse_sorted_expression with parser, left
+            If left is equal to 0:
+                Return 0
+            End If
+            Continue
+        End If
+
+        Note: No more postfix operators, done
+        Break
+    End While
+
+    Return left
+End Process
+
 Process called "parse_expression_with_precedence" takes parser as Integer, min_precedence as Integer returns Integer:
     Note:
     Parse expression with minimum precedence constraint (Pratt parser core)
@@ -305,6 +529,19 @@ Process called "parse_expression_with_precedence" takes parser as Integer, min_p
         End If
     End If
 
+    If left is equal to 0:
+        Return 0
+    End If
+
+    Note:
+    Apply postfix operators to the LEFT operand BEFORE the binary Pratt loop so
+    postfix (member access, call, index, etc.) binds tighter than every infix
+    operator. parse_primary_expression returns a BARE primary (e.g. identifier
+    `ctx`); without this, an operand like `ctx.a` left of an infix operator
+    (`ctx.a minus ctx.b`) would leave the `.a` unattached when the Pratt loop
+    examines `.` (not a binary operator) and breaks, stranding the infix tail.
+    :End Note
+    Set left to proc parse_postfix_operators with parser, left
     If left is equal to 0:
         Return 0
     End If
@@ -899,210 +1136,15 @@ Process called "parse_expression_with_precedence" takes parser as Integer, min_p
         End If
     End While
 
-    Note: Check for postfix operators (member access, function call, indexing)
-    Loop forever:
-        Set current_token to proc parser_current_token from Parser with parser
-        Set token_type to proc token_get_type from Parser with current_token
-
-        Note: Check for member access (.)
-        If token_type is equal to TOKEN_DOT:
-            Note:
-            Module-qualified access in expression position. Two source forms,
-            both produced by the bootstrap import system flattening every
-            imported function / constant / global into the main program under
-            its PLAIN name, so the module qualifier is source-level only and
-            resolution keys off the plain name. The monolith oracle (parser.runa
-            postfix `.` handler, ~lines 1424-1548) handles BOTH here:
-
-              (1) `Module.method(args)`  -- a module-qualified METHOD CALL
-                  (e.g. `Return Dictionary.contains(d, k)`,
-                  `Dictionary.size(d)`, `StringUtils.integer_to_string(n)`).
-                  The monolith builds an EXPR_QUALIFIED_CALL. The modular AST
-                  has no distinct qualified-call node; the `proc method from
-                  Module with args` arm (commit 3413b066) represents one as a
-                  plain AST_CALL_EXPRESSION whose callee is an AST_IDENTIFIER
-                  carrying the PLAIN method name with the module alias stashed
-                  on metadata@56. This desugar reuses that EXACT node shape and
-                  the existing direct-call HIR lowering.
-
-              (2) `Module.CONSTANT`  -- a module-qualified CONSTANT / enum /
-                  global access with NO parentheses (e.g.
-                  `CallingConv.CALLING_CONV_AAPCS64`, `MachineCode.SECTION_TEXT`).
-                  The monolith rewrites it to a bare variable reference against
-                  the merged namespace, retaining the alias. This desugar reuses
-                  the existing AST_IDENTIFIER node carrying the PLAIN name with
-                  the module alias on metadata@56 -- byte-identical lowering to
-                  the `CONSTANT from Module` form already handled by
-                  parse_identifier_expression.
-
-            Both names are read by SPELLING via token_can_be_identifier so
-            keyword-typed names (contains/size/remove) and uppercase constants
-            are accepted. The whole handler is gated so it fires ONLY when left
-            is a bare AST_IDENTIFIER whose first character is uppercase A-Z
-            (module-name convention, matching the `X from Module` guard) and the
-            token after the dot can name an identifier. Any miss falls through
-            to the unchanged parse_member_expression path, so plain
-            lowercase-object `obj.field` member access is untouched. Reusing the
-            qualified-call / qualified-identifier nodes means NO new node kind
-            and NO new HIR/MIR lowering is introduced.
-            :End Note
-            Let qmc_handled be 0
-            If left is not equal to 0:
-                Let qmc_left_type be proc ast_node_get_type from AST with left
-                If qmc_left_type is equal to AST_IDENTIFIER from AST:
-                    Let qmc_module_name be proc ast_node_get_value from AST with left
-                    Let qmc_module_is_name be 0
-                    If qmc_module_name is not equal to 0:
-                        Let qmc_first_char be proc string_char_at from StringCore with qmc_module_name, 0
-                        If qmc_first_char is greater than or equal to 65:
-                            If qmc_first_char is less than or equal to 90:
-                                Set qmc_module_is_name to 1
-                            End If
-                        End If
-                    End If
-                    If qmc_module_is_name is equal to 1:
-                        Let qmc_name_token be proc parser_peek_token from Parser with parser, 1
-                        Let qmc_name_ok be 0
-                        If qmc_name_token is not equal to 0:
-                            Let qmc_name_type be proc token_get_type from Parser with qmc_name_token
-                            Let qmc_name_can_id be proc token_can_be_identifier from Parser with qmc_name_type
-                            If qmc_name_can_id is equal to 1:
-                                Set qmc_name_ok to 1
-                            End If
-                        End If
-                        If qmc_name_ok is equal to 1:
-                            Let qmc_member_value be proc token_get_value from Parser with qmc_name_token
-                            Let qmc_acc_line be proc token_get_line from Parser with qmc_name_token
-                            Let qmc_acc_column be proc token_get_column from Parser with qmc_name_token
-                            Let qmc_paren_token be proc parser_peek_token from Parser with parser, 2
-                            Let qmc_is_call be 0
-                            If qmc_paren_token is not equal to 0:
-                                Let qmc_paren_type be proc token_get_type from Parser with qmc_paren_token
-                                If qmc_paren_type is equal to TOKEN_LEFT_PAREN:
-                                    Set qmc_is_call to 1
-                                End If
-                            End If
-
-                            Note: Consume the dot and the member-name token (shared
-                            Note: by both the call and the constant-access forms).
-                            proc parser_consume_token from Parser with parser
-                            proc parser_consume_token from Parser with parser
-
-                            If qmc_is_call is equal to 1:
-                                Note: Form (1): `Module.method(args)`. Consume '(' and
-                                Note: parse the comma-separated argument list.
-                                proc parser_consume_token from Parser with parser
-                                Let qmc_arguments be proc parse_argument_list with parser
-                                If qmc_arguments is equal to 0:
-                                    Set qmc_arguments to proc create from List
-                                End If
-                                Let qmc_rparen be proc parser_expect_token from Parser with parser, TOKEN_RIGHT_PAREN
-                                If qmc_rparen is equal to 0:
-                                    Return 0
-                                End If
-                                Let qmc_callee be proc build_identifier_node from ASTBuilder with qmc_member_value, qmc_acc_line, qmc_acc_column
-                                If qmc_callee is equal to 0:
-                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified method-call callee identifier AST node", qmc_acc_line, qmc_acc_column
-                                    Return 0
-                                End If
-                                Let qmc_call_alias be proc string_duplicate from StringCore with qmc_module_name
-                                If qmc_call_alias is not equal to 0:
-                                    proc memory_set_qword from Layout with qmc_callee, 56, qmc_call_alias
-                                End If
-                                Let qmc_argument_count be proc list_length from List with qmc_arguments
-                                Let qmc_call_node be proc build_call_expression from ASTBuilder with qmc_callee, qmc_arguments, qmc_argument_count, qmc_acc_line, qmc_acc_column
-                                If qmc_call_node is equal to 0:
-                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified method-call expression AST node", qmc_acc_line, qmc_acc_column
-                                    Return 0
-                                End If
-                                proc destroy_ast_node from AST with left
-                                Set left to qmc_call_node
-                                Set qmc_handled to 1
-                            Otherwise:
-                                Note: Form (2): `Module.CONSTANT` (no parens). Build a
-                                Note: bare identifier carrying the PLAIN member name with
-                                Note: the module alias on metadata@56 -- identical to the
-                                Note: `CONSTANT from Module` rvalue node.
-                                Let qmc_const_node be proc build_identifier_node from ASTBuilder with qmc_member_value, qmc_acc_line, qmc_acc_column
-                                If qmc_const_node is equal to 0:
-                                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create qualified constant-access identifier AST node", qmc_acc_line, qmc_acc_column
-                                    Return 0
-                                End If
-                                Let qmc_const_alias be proc string_duplicate from StringCore with qmc_module_name
-                                If qmc_const_alias is not equal to 0:
-                                    proc memory_set_qword from Layout with qmc_const_node, 56, qmc_const_alias
-                                End If
-                                proc destroy_ast_node from AST with left
-                                Set left to qmc_const_node
-                                Set qmc_handled to 1
-                            End If
-                        End If
-                    End If
-                End If
-            End If
-            If qmc_handled is equal to 1:
-                Continue
-            End If
-            Set left to proc parse_member_expression with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: Check for function call (()
-        If token_type is equal to TOKEN_LEFT_PAREN:
-            Set left to proc parse_call_expression with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: Check for canonical named-call argument clause (`callee with arg
-        Note: [and arg] [, arg] ...`). This is the primary Runa call surface
-        Note: form: `helper with 41`, `add with 20 and 22`. The opening "with"
-        Note: promotes the parsed callee expression into a function call whose
-        Note: arguments follow. Handled as a postfix operator so chained forms
-        Note: (`obj.method with x`) and qualified callees compose naturally.
-        If token_type is equal to TOKEN_WITH:
-            Set left to proc parse_with_call_arguments with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: Check for array indexing ([])
-        If token_type is equal to TOKEN_LEFT_BRACKET:
-            Set left to proc parse_index_expression with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: Check for range operator (..)
-        If token_type is equal to TOKEN_RANGE:
-            Set left to proc parse_range_expression with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: Check for "sorted by" operator (Language Additions v0.0.8.5)
-        If token_type is equal to TOKEN_SORTED:
-            Set left to proc parse_sorted_expression with parser, left
-            If left is equal to 0:
-                Return 0
-            End If
-            Continue
-        End If
-
-        Note: No more postfix operators, done
-        Break
-    End While
+    Note:
+    Apply any trailing postfix operators AFTER the binary Pratt loop. This
+    preserves the existing sorted/range-tail behaviour on a fully-climbed
+    expression. It is a no-op when no postfix token remains.
+    :End Note
+    Set left to proc parse_postfix_operators with parser, left
+    If left is equal to 0:
+        Return 0
+    End If
 
     Return left
 End Process
