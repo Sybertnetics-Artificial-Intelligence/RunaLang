@@ -2166,10 +2166,14 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
     Read object/property from offsets 80/88 of the MemberExpressionNode,
     lower the object expression, then look up the property name on the
     object's HIRTypeInfo via resolve_member_index and resolve_member_type.
-    A negative index indicates an unknown field, which triggers an
-    add_error diagnostic and falls back to index 0 so the HIR stays
-    well-formed for the rest of the pass. The specialised HIRMemberExpression
-    node carries the resolved field index for codegen offset arithmetic.
+    A negative index means the declared type does not own the field; a
+    Pass-2 fallback then scans every user-defined type on the scope chain
+    and, when exactly one declares a field of this name, adopts that type's
+    index/type (parity with the monolith's codegen_find_struct_type_for_field).
+    Only when zero or more than one type owns the field does an add_error
+    diagnostic fire with a fallback to index 0 so the HIR stays well-formed.
+    The specialised HIRMemberExpression node carries the resolved field
+    index for codegen offset arithmetic.
     @End Implementation
 
     @Performance_Hints
@@ -2230,9 +2234,62 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
     Let member_type be proc resolve_member_type with context, object_type, property_name
 
     If member_index is equal to negative 1:
-        Note: Member not found - this is an error
-        proc add_error with context, line, column, property_name
-        Set member_index to 0  Note: Use 0 as fallback
+        Note: ---------------------------------------------------------------------
+        Note: Pass-2 unique-owner fallback (parity with the monolith codegen
+        Note: function codegen_find_struct_type_for_field, Pass 2, in
+        Note: ../v0.0.8.4.5.3.5/src/codegen.runa). The object's declared type does
+        Note: not own this field. The common cause is the deliberate idiom of
+        Note: passing a struct pointer through an Integer parameter
+        Note: (e.g. `takes results as Integer` then `results.total`), where the
+        Note: declared type is Integer and therefore carries no fields. Scan every
+        Note: user-defined type visible on the scope chain for those that declare a
+        Note: field of this name. If EXACTLY ONE type owns it, adopt that type's
+        Note: field index/type and proceed through the normal offset path; if zero
+        Note: or more than one own it the access is genuinely unresolved or
+        Note: ambiguous, so fall through to the original add_error behaviour and
+        Note: never guess.
+        Let candidate_count be 0
+        Let resolved_index be negative 1
+        Let resolved_type be 0
+        Let scan_scope be proc get_current_scope with context
+        While scan_scope is not equal to 0:
+            Note: Each scope holds its declared types in the types list at offset 56
+            Note: (count at offset 64); types are registered there as SYMBOL_TYPE
+            Note: entries by lower_type_definition via add_symbol_to_scope.
+            Let scan_types be proc memory_get_int64 from Layout with scan_scope, 56
+            Let scan_type_count be proc memory_get_int64 from Layout with scan_scope, 64
+            If scan_types is not equal to 0:
+                Let scan_i be 0
+                While scan_i is less than scan_type_count:
+                    Let type_symbol be proc get from List with scan_types, scan_i
+                    If type_symbol is not equal to 0:
+                        Note: The HIRTypeInfo for a type symbol lives at offset 24.
+                        Let candidate_type be proc get_symbol_type with type_symbol
+                        If candidate_type is not equal to 0:
+                            Let candidate_index be proc resolve_member_index with context, candidate_type, property_name
+                            If candidate_index is not equal to negative 1:
+                                Set candidate_count to candidate_count plus 1
+                                Set resolved_index to candidate_index
+                                Set resolved_type to proc resolve_member_type with context, candidate_type, property_name
+                            End If
+                        End If
+                    End If
+                    Set scan_i to scan_i plus 1
+                End While
+            End If
+            Note: Walk outward to the enclosing scope (parent pointer at offset 8).
+            Set scan_scope to proc memory_get_int64 from Layout with scan_scope, 8
+        End While
+
+        If candidate_count is equal to 1:
+            Note: Exactly one user-defined type owns this field - adopt it.
+            Set member_index to resolved_index
+            Set member_type to resolved_type
+        Otherwise:
+            Note: Member not found or ambiguous - this is an error
+            proc add_error with context, line, column, property_name
+            Set member_index to 0  Note: Use 0 as fallback
+        End If
     End If
 
     Note: Field byte offset: index * 8 (one 8-byte slot per field), matching the
