@@ -162,6 +162,66 @@ Process called "parse_let_statement" takes parser as Integer returns Integer:
             proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected type annotation after 'as' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
             Return 0
         End If
+
+        Note:
+        Optional qualified type suffix `Let X as Module.Type be V`.
+        parse_type_annotation reads only the base name (`Module`) and stops at the
+        dot, so the `.Type` qualifier is consumed here, mirroring the monolith
+        pre-value `as` arm (parser.runa:2073-2091). The resolved type name is the
+        part AFTER the dot (the module prefix is source-level only; types resolve
+        by bare name in the merged program scope, where the import system has
+        already merged the module's Type definitions). A generic `[...]` suffix
+        after the qualified name is absorbed the same way parse_type_annotation
+        absorbs it after a plain base name. This arm only runs when the token
+        directly after the parsed type is a dot — a position that, in a correct
+        `Let X as T be V`, otherwise holds `be`; so non-qualified Let statements
+        are byte-for-byte unaffected.
+        :End Note
+        Let la_dot be proc parser_current_token from Parser with parser
+        Let la_dot_type be proc token_get_type from Parser with la_dot
+        If la_dot_type is equal to TOKEN_DOT:
+            proc parser_consume_token from Parser with parser
+            Let la_qual be proc parser_current_token from Parser with parser
+            If la_qual is not equal to 0:
+                Let la_qual_val be proc token_get_value from Parser with la_qual
+                If la_qual_val is not equal to 0:
+                    proc ast_node_set_value from AST with type_annotation, la_qual_val, 1
+                End If
+                proc parser_consume_token from Parser with parser
+            End If
+
+            Note: Optional generic argument suffix after the qualified type name.
+            Let la_gen be proc parser_current_token from Parser with parser
+            Let la_gen_type be proc token_get_type from Parser with la_gen
+            If la_gen_type is equal to TOKEN_LEFT_BRACKET:
+                proc parser_consume_token from Parser with parser
+                Let la_depth be 1
+                Loop forever:
+                    If la_depth is less than or equal to 0:
+                        Break
+                    End If
+                    Let la_inner be proc parser_current_token from Parser with parser
+                    If la_inner is equal to 0:
+                        Break
+                    End If
+                    Let la_inner_type be proc token_get_type from Parser with la_inner
+                    If la_inner_type is equal to TOKEN_EOF:
+                        Break
+                    End If
+                    If la_inner_type is equal to TOKEN_LEFT_BRACKET:
+                        Set la_depth to la_depth plus 1
+                        proc parser_consume_token from Parser with parser
+                        Continue
+                    End If
+                    If la_inner_type is equal to TOKEN_RIGHT_BRACKET:
+                        Set la_depth to la_depth minus 1
+                        proc parser_consume_token from Parser with parser
+                        Continue
+                    End If
+                    proc parser_consume_token from Parser with parser
+                End While
+            End If
+        End If
     End If
 
     Note: 4. Expect and consume be keyword
@@ -176,6 +236,126 @@ Process called "parse_let_statement" takes parser as Integer returns Integer:
     If value_expr is equal to 0:
         proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected expression after 'be' keyword in Let statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
+    End If
+
+    Note:
+    5b. Optional trailing type annotation: `Let X be <expr> of type <TypeName>`.
+    This is the canonical post-value type-ascription form (mirrors the monolith
+    parser_parse_let_statement trailing "of type" arm, parser.runa:2169-2264).
+    The constructor expression `a value of type T with ...` consumes its own
+    `of type` internally inside the expression parser, so any TOKEN_OF that is
+    still the current token after the value is parsed is unambiguously this
+    annotation. To stay safe against the many other postfix `of` phrases, we
+    COMMIT only when the token immediately after `of` is `type` — either
+    TOKEN_TYPE (the capitalised keyword) or an identifier whose spelling is
+    `type` (lowercase `type` is not a keyword in the modular lexer). A trailing
+    `of type T` overrides a pre-value `as T` annotation (last-writer-wins),
+    matching the monolith. The peek is non-destructive (token-stream lookahead),
+    so when the sequence is not `of type` no tokens are consumed and parsing is
+    byte-for-byte unchanged.
+    :End Note
+    Let trail_token be proc parser_current_token from Parser with parser
+    Let trail_type be proc token_get_type from Parser with trail_token
+    If trail_type is equal to TOKEN_OF:
+        Let trail_next be proc parser_peek_token from Parser with parser, 1
+        Let trail_is_of_type be 0
+        If trail_next is not equal to 0:
+            Let trail_next_type be proc token_get_type from Parser with trail_next
+            If trail_next_type is equal to TOKEN_TYPE:
+                Set trail_is_of_type to 1
+            End If
+            If trail_is_of_type is equal to 0:
+                Let trail_next_val be proc token_get_value from Parser with trail_next
+                If trail_next_val is not equal to 0:
+                    Let trail_word_eq be proc string_equals from StringCore with trail_next_val, proc create_from_literal from StringCore with "type"
+                    If trail_word_eq is equal to 1:
+                        Set trail_is_of_type to 1
+                    End If
+                End If
+            End If
+        End If
+
+        If trail_is_of_type is equal to 1:
+            Note: Capture the source position from the `of` token for the type node.
+            Let trail_line be proc token_get_line from Parser with trail_token
+            Let trail_column be proc token_get_column from Parser with trail_token
+
+            Note: Consume `of` and `type`.
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+
+            Note: Read the base type name.
+            Let trail_name_token be proc parser_current_token from Parser with parser
+            If trail_name_token is equal to 0:
+                proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected type name after 'of type' in Let statement", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                Return 0
+            End If
+            Let trail_type_name be proc token_get_value from Parser with trail_name_token
+            proc parser_consume_token from Parser with parser
+
+            Note: Optional `.QualifiedName` suffix — the part after the dot is the
+            Note: resolved type name (the module prefix is source-level only; types
+            Note: resolve by bare name in the merged program scope).
+            Let trail_dot be proc parser_current_token from Parser with parser
+            Let trail_dot_type be proc token_get_type from Parser with trail_dot
+            If trail_dot_type is equal to TOKEN_DOT:
+                proc parser_consume_token from Parser with parser
+                Let trail_qual be proc parser_current_token from Parser with parser
+                If trail_qual is not equal to 0:
+                    Let trail_qual_val be proc token_get_value from Parser with trail_qual
+                    If trail_qual_val is not equal to 0:
+                        Set trail_type_name to trail_qual_val
+                    End If
+                    proc parser_consume_token from Parser with parser
+                End If
+            End If
+
+            Note: Optional generic argument suffix `[ ... ]` (e.g. `of type
+            Note: List[Integer]`). Retain only the base name, matching
+            Note: parse_type_annotation and the monolith; absorb the bracketed span
+            Note: with a depth counter that handles nesting.
+            Let trail_gen be proc parser_current_token from Parser with parser
+            Let trail_gen_type be proc token_get_type from Parser with trail_gen
+            If trail_gen_type is equal to TOKEN_LEFT_BRACKET:
+                proc parser_consume_token from Parser with parser
+                Let trail_depth be 1
+                Loop forever:
+                    If trail_depth is less than or equal to 0:
+                        Break
+                    End If
+                    Let trail_inner be proc parser_current_token from Parser with parser
+                    If trail_inner is equal to 0:
+                        Break
+                    End If
+                    Let trail_inner_type be proc token_get_type from Parser with trail_inner
+                    If trail_inner_type is equal to TOKEN_EOF:
+                        Break
+                    End If
+                    If trail_inner_type is equal to TOKEN_LEFT_BRACKET:
+                        Set trail_depth to trail_depth plus 1
+                        proc parser_consume_token from Parser with parser
+                        Continue
+                    End If
+                    If trail_inner_type is equal to TOKEN_RIGHT_BRACKET:
+                        Set trail_depth to trail_depth minus 1
+                        proc parser_consume_token from Parser with parser
+                        Continue
+                    End If
+                    proc parser_consume_token from Parser with parser
+                End While
+            End If
+
+            Note: Build an AST_TYPE_BASIC node (the same shape parse_type_annotation
+            Note: produces for a plain `as T`) and use it as the Let's type
+            Note: annotation, overriding any pre-value `as T` (last-writer-wins).
+            If trail_type_name is not equal to 0:
+                Let trail_type_node be proc create_ast_node from AST with 4000, trail_line, trail_column
+                If trail_type_node is not equal to 0:
+                    proc ast_node_set_value from AST with trail_type_node, trail_type_name, 1
+                    Set type_annotation to trail_type_node
+                End If
+            End If
+        End If
     End If
 
     Note: 6. Create Let statement AST node
@@ -1510,6 +1690,77 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     If loop_variable is equal to 0:
         proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected loop variable after 'For' keyword", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
         Return 0
+    End If
+
+    Note:
+    2b. Optional loop-variable type annotation in the typed for-each form
+    `For Each <var> as <Type> in <collection>:` (mirrors the monolith
+    parser_parse_for_range_statement, parser.runa:7497-7511). The declared
+    element type is consumed here; the HIR for-loop lowering derives the
+    iterator's element type from the iterable expression itself
+    (lower_for_statement / get_iterable_element_type), which is the canonical
+    source of the loop-variable type, so the annotation is redundant for
+    lowering and is consumed without changing the For AST shape. A qualified
+    `.Type` suffix and a generic `[...]` suffix are absorbed for completeness.
+    This arm only runs when `as` follows the loop variable — a position that in
+    the untyped `For [Each] <var> in ...` forms holds `in` — so existing for
+    loops are byte-for-byte unaffected.
+    :End Note
+    Let fe_as_token be proc parser_current_token from Parser with parser
+    Let fe_as_type be proc token_get_type from Parser with fe_as_token
+    If fe_as_type is equal to TOKEN_AS:
+        proc parser_consume_token from Parser with parser
+
+        Note: Consume the base type-name token.
+        Let fe_type_token be proc parser_current_token from Parser with parser
+        If fe_type_token is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected type name after 'as' in for-each loop variable", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+        proc parser_consume_token from Parser with parser
+
+        Note: Optional `.QualifiedName` suffix.
+        Let fe_dot be proc parser_current_token from Parser with parser
+        Let fe_dot_type be proc token_get_type from Parser with fe_dot
+        If fe_dot_type is equal to TOKEN_DOT:
+            proc parser_consume_token from Parser with parser
+            Let fe_qual be proc parser_current_token from Parser with parser
+            If fe_qual is not equal to 0:
+                proc parser_consume_token from Parser with parser
+            End If
+        End If
+
+        Note: Optional generic argument suffix `[ ... ]`.
+        Let fe_gen be proc parser_current_token from Parser with parser
+        Let fe_gen_type be proc token_get_type from Parser with fe_gen
+        If fe_gen_type is equal to TOKEN_LEFT_BRACKET:
+            proc parser_consume_token from Parser with parser
+            Let fe_depth be 1
+            Loop forever:
+                If fe_depth is less than or equal to 0:
+                    Break
+                End If
+                Let fe_inner be proc parser_current_token from Parser with parser
+                If fe_inner is equal to 0:
+                    Break
+                End If
+                Let fe_inner_type be proc token_get_type from Parser with fe_inner
+                If fe_inner_type is equal to TOKEN_EOF:
+                    Break
+                End If
+                If fe_inner_type is equal to TOKEN_LEFT_BRACKET:
+                    Set fe_depth to fe_depth plus 1
+                    proc parser_consume_token from Parser with parser
+                    Continue
+                End If
+                If fe_inner_type is equal to TOKEN_RIGHT_BRACKET:
+                    Set fe_depth to fe_depth minus 1
+                    proc parser_consume_token from Parser with parser
+                    Continue
+                End If
+                proc parser_consume_token from Parser with parser
+            End While
+        End If
     End If
 
     Note: 3. Expect and consume in keyword
@@ -5280,6 +5531,114 @@ Process called "parse_single_statement" takes parser as Integer returns Integer:
             Return 0
         End If
         Return proc_expr
+    End If
+
+    Note:
+    Canonical statement forms whose lead word is an ordinary identifier in the
+    modular lexer (no dedicated keyword token), detected here by spelling at
+    statement-leading position only — exactly the monolith's approach
+    (parser.runa:10067-10108 special-cases the "Add" identifier; its `Call` is a
+    keyword there but a plain identifier here). Detection is confined to the
+    statement-leading slot, so identifiers of the same spelling used as
+    operands/fields/arguments elsewhere are never affected.
+    :End Note
+    If token_type is equal to TOKEN_IDENTIFIER:
+        Let lead_value be proc token_get_value from Parser with current_token
+        If lead_value is not equal to 0:
+            Note:
+            `Call f [Module.f | from Module] [with a, b, ...]` — a named call
+            invoked for its side effect, the result discarded. Mirrors the
+            monolith TOKEN_CALL dispatch (parser.runa:10007 ->
+            parser_parse_call_statement). The call tail is parsed by the shared
+            parse_proc_call_expression (which now consumes either the `proc`
+            keyword or this `Call` introducer), and the resulting
+            AST_CALL_EXPRESSION is returned directly as the statement, exactly as
+            the `proc ...` statement arm above does (the HIR builder lowers a bare
+            call expression as a statement).
+            :End Note
+            Let lead_is_call be proc string_equals from StringCore with lead_value, proc create_from_literal from StringCore with "Call"
+            If lead_is_call is equal to 1:
+                Return proc parse_proc_call_expression from ExpressionParsers with parser
+            End If
+
+            Note:
+            `Add VALUE to [end of] LIST` — canonical Runa list-append, lowered to a
+            call to list_append(LIST, VALUE). Mirrors the monolith
+            (parser.runa:10079-10101: expression_create_function_call("list_append",
+            {list, value}, 2) wrapped as an expression statement). The optional
+            `end of` after `to` is consumed when present (lowercase `end` lexes as
+            an identifier, `of` as TOKEN_OF). The VALUE expression parses up to the
+            `to` particle: TOKEN_TO is never an infix continuation in the Pratt
+            loop, so the value expression cannot swallow it.
+            :End Note
+            Let lead_is_add be proc string_equals from StringCore with lead_value, proc create_from_literal from StringCore with "Add"
+            If lead_is_add is equal to 1:
+                Note: Capture the `Add` source position before any token is consumed
+                Note: (the current_token pointer is freed once the parser advances).
+                Let add_line be proc token_get_line from Parser with current_token
+                Let add_column be proc token_get_column from Parser with current_token
+
+                Note: Consume `Add`.
+                proc parser_consume_token from Parser with parser
+
+                Note: Parse the VALUE expression (stops at the `to` particle).
+                Let add_value_expr be proc parse_expression from ExpressionParsers with parser
+                If add_value_expr is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Malformed 'Add' statement: missing value expression", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                    Return 0
+                End If
+
+                Note: Consume `to`.
+                Let add_to_consumed be proc parser_expect_token from Parser with parser, TOKEN_TO
+                If add_to_consumed is equal to 0:
+                    Return 0
+                End If
+
+                Note: Optional `end of` qualifier (lowercase `end` is an identifier).
+                Let add_after_to be proc parser_current_token from Parser with parser
+                Let add_after_to_type be proc token_get_type from Parser with add_after_to
+                If add_after_to_type is equal to TOKEN_IDENTIFIER:
+                    Let add_after_to_val be proc token_get_value from Parser with add_after_to
+                    If add_after_to_val is not equal to 0:
+                        Let add_is_end be proc string_equals from StringCore with add_after_to_val, proc create_from_literal from StringCore with "end"
+                        If add_is_end is equal to 1:
+                            proc parser_consume_token from Parser with parser
+                            proc parser_expect_token from Parser with parser, TOKEN_OF
+                        End If
+                    End If
+                End If
+
+                Note: Parse the LIST expression.
+                Let add_list_expr be proc parse_expression from ExpressionParsers with parser
+                If add_list_expr is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Malformed 'Add' statement: missing list expression", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+                    Return 0
+                End If
+
+                Note: Build list_append(LIST, VALUE) as the statement node. Argument
+                Note: order matches the monolith: list first, value second.
+                Let add_args be proc create from List
+                If add_args is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create 'Add' statement argument list", add_line, add_column
+                    Return 0
+                End If
+                proc list_append from List with add_args, add_list_expr
+                proc list_append from List with add_args, add_value_expr
+
+                Let add_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "list_append", add_line, add_column
+                If add_callee is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create 'Add' statement callee node", add_line, add_column
+                    Return 0
+                End If
+
+                Let add_call be proc build_call_expression from ASTBuilder with add_callee, add_args, 2, add_line, add_column
+                If add_call is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create 'Add' statement call node", add_line, add_column
+                    Return 0
+                End If
+                Return add_call
+            End If
+        End If
     End If
 
     Note: Unknown statement type - report error
