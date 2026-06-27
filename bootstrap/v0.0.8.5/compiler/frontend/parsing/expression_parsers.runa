@@ -1866,6 +1866,88 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         End If
     End If
 
+    Note:
+    `substring of X from A to B` string-slice operator (prefix form). Mirrors the
+    monolith oracle (parser.runa:5270): `substring` (a plain TOKEN_IDENTIFIER --
+    the lexer gives it no dedicated keyword) + the `of` particle (TOKEN_OF) +
+    operand + `from` (TOKEN_FROM) + start-expr + `to` (TOKEN_TO) + end-expr,
+    desugared to a call to the runtime `string_substring(X, A, B)`. Reuses the
+    existing AST_CALL_EXPRESSION node and its HIR call lowering (no new node kind),
+    exactly as the monolith emits expression_create_function_call("string_substring", ...).
+    Nothing is consumed unless the full `substring of <X> from <A> to <B>` shape
+    matches (the `of` lookahead gates it), so a bare identifier `substring` falls
+    through to the generic identifier branch below. The operand binds at
+    PRECEDENCE_UNARY so it stops at `from` rather than swallowing it; start/end are
+    full expressions (matching the monolith's parse_expression for the bounds).
+    :End Note
+    If token_type is equal to TOKEN_IDENTIFIER:
+        Let sub_is_kw be proc primary_token_value_is with current_token, "substring"
+        If sub_is_kw is equal to 1:
+            Let sub_peek1 be proc parser_peek_token from Parser with parser, 1
+            Let sub_peek1_type be proc token_get_type from Parser with sub_peek1
+            If sub_peek1_type is equal to TOKEN_OF:
+                Let sub_op_line be proc token_get_line from Parser with current_token
+                Let sub_op_column be proc token_get_column from Parser with current_token
+
+                Note: Consume `substring` and the `of` particle.
+                proc parser_consume_token from Parser with parser
+                proc parser_consume_token from Parser with parser
+
+                Let sub_operand be proc parse_expression_with_precedence with parser, PRECEDENCE_UNARY
+                If sub_operand is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected operand after 'substring of'", sub_op_line, sub_op_column
+                    Return 0
+                End If
+
+                Let sub_from_ok be proc parser_expect_token from Parser with parser, TOKEN_FROM
+                If sub_from_ok is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'from' after 'substring of <X>'", sub_op_line, sub_op_column
+                    Return 0
+                End If
+                Let sub_start be proc parse_expression with parser
+                If sub_start is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected start expression after 'from' in substring", sub_op_line, sub_op_column
+                    Return 0
+                End If
+
+                Let sub_to_ok be proc parser_expect_token from Parser with parser, TOKEN_TO
+                If sub_to_ok is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'to' after substring start expression", sub_op_line, sub_op_column
+                    Return 0
+                End If
+                Let sub_end be proc parse_expression with parser
+                If sub_end is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected end expression after 'to' in substring", sub_op_line, sub_op_column
+                    Return 0
+                End If
+
+                Note: Desugar to string_substring(operand, start, end). The callee
+                Note: name is bound to a local first so the trailing line/column reach
+                Note: build_identifier_node (avoiding the nested-call comma-binding trap).
+                Let sub_callee_name be proc create_from_literal from StringCore with "string_substring"
+                Let sub_callee be proc build_identifier_node from ASTBuilder with sub_callee_name, sub_op_line, sub_op_column
+                If sub_callee is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_substring callee identifier AST node", sub_op_line, sub_op_column
+                    Return 0
+                End If
+                Let sub_args be proc create from List
+                If sub_args is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_substring argument list", sub_op_line, sub_op_column
+                    Return 0
+                End If
+                proc list_append from List with sub_args, sub_operand
+                proc list_append from List with sub_args, sub_start
+                proc list_append from List with sub_args, sub_end
+                Let sub_node be proc build_call_expression from ASTBuilder with sub_callee, sub_args, 3, sub_op_line, sub_op_column
+                If sub_node is equal to 0:
+                    proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create string_substring call AST node", sub_op_line, sub_op_column
+                    Return 0
+                End If
+                Return sub_node
+            End If
+        End If
+    End If
+
     Note: Check for identifier
     If token_type is equal to TOKEN_IDENTIFIER:
         Return proc parse_identifier_expression with parser
@@ -3980,6 +4062,38 @@ Process called "parse_canonical_list_literal" takes parser as Integer returns In
         Let sep_token be proc parser_current_token from Parser with parser
         Let sep_type be proc token_get_type from Parser with sep_token
         If sep_type is equal to TOKEN_COMMA:
+            Note:
+            Struct-field disambiguation. When this list literal is the value of a
+            struct-construction field, the comma after the final element actually
+            separates the NEXT struct field, e.g.
+              a value of type T with
+                  attr_values as a list containing X,
+                  line as 1
+            Here `, line as 1` must NOT be eaten as a second list element. If the
+            comma is followed by `<ident-or-string> as`, it is the next field
+            initializer: stop the element loop and leave the comma for the struct
+            field parser. Mirrors the monolith parser_peek_struct_field_after_comma
+            (parser.runa:2920) wired into its list-literal loop (parser.runa:3437).
+            A standalone list `a, b, c` is unaffected: the token after the comma is
+            an element, never followed by `as`.
+            :End Note
+            Let cl_pk1 be proc parser_peek_token from Parser with parser, 1
+            Let cl_pk1_type be proc token_get_type from Parser with cl_pk1
+            Let cl_pk2 be proc parser_peek_token from Parser with parser, 2
+            Let cl_pk2_type be proc token_get_type from Parser with cl_pk2
+            Let cl_field_ahead be 0
+            If cl_pk2_type is equal to TOKEN_AS:
+                Let cl_pk1_id be proc token_can_be_identifier from Parser with cl_pk1_type
+                If cl_pk1_id is equal to 1:
+                    Set cl_field_ahead to 1
+                End If
+                If cl_pk1_type is equal to TOKEN_STRING_LITERAL:
+                    Set cl_field_ahead to 1
+                End If
+            End If
+            If cl_field_ahead is equal to 1:
+                Break
+            End If
             proc parser_consume_token from Parser with parser
             Continue
         End If
