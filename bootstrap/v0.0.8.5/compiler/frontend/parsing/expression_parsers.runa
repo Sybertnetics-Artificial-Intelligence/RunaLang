@@ -1616,9 +1616,12 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Note: The article ("a"/"an") and "list"/"empty" all lex as TOKEN_IDENTIFIER, so this
     Note: is detected by token-value lookahead before the generic identifier branch.
     Note: "containing" is accepted as TOKEN_CONTAINING OR an identifier valued "containing"
-    Note: so both the source and the transformed bracket form route here. Only the list
-    Note: form lowers end-to-end today; dictionary/set literals have no HIR lowering and
-    Note: are intentionally not intercepted (they would otherwise produce dropped output).
+    Note: so both the source and the transformed bracket form route here. The list form
+    Note: lowers to an AST_ARRAY_LITERAL; the dictionary and set forms desugar at parse
+    Note: time to nested runtime-call expressions (dict_create/dict_with and
+    Note: set_create/set_with) so they lower end-to-end through the proven call path with
+    Note: no dedicated HIR/MIR node, exactly as the `at key` -> list_get and `length of`
+    Note: -> string_length desugars do.
     If token_type is equal to TOKEN_IDENTIFIER:
         Let cl_is_article be proc primary_token_value_is with current_token, "a"
         If cl_is_article is equal to 0:
@@ -1627,13 +1630,24 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         If cl_is_article is equal to 1:
             Let cl_next be proc parser_peek_token from Parser with parser, 1
 
-            Note: Empty-list form: "an empty list".
+            Note: Empty-collection forms: "an empty list" / "an empty dictionary" /
+            Note: "an empty set" (the shape the syntax transformer emits for [], {}, and
+            Note: empty set literals). The dictionary/set empty forms desugar to a single
+            Note: dict_create()/set_create() runtime call expression.
             Let cl_next_is_empty be proc primary_token_value_is with cl_next, "empty"
             If cl_next_is_empty is equal to 1:
                 Let cl_after_empty be proc parser_peek_token from Parser with parser, 2
                 Let cl_after_empty_is_list be proc primary_token_value_is with cl_after_empty, "list"
                 If cl_after_empty_is_list is equal to 1:
                     Return proc parse_canonical_empty_list_literal with parser
+                End If
+                Let cl_after_empty_is_dict be proc primary_token_value_is with cl_after_empty, "dictionary"
+                If cl_after_empty_is_dict is equal to 1:
+                    Return proc parse_canonical_empty_dictionary_literal with parser
+                End If
+                Let cl_after_empty_is_set be proc primary_token_value_is with cl_after_empty, "set"
+                If cl_after_empty_is_set is equal to 1:
+                    Return proc parse_canonical_empty_set_literal with parser
                 End If
             End If
 
@@ -1651,6 +1665,46 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
                 End If
                 If cl_after_is_containing is equal to 1:
                     Return proc parse_canonical_list_literal with parser
+                End If
+            End If
+
+            Note: Non-empty dictionary form: "a dictionary containing K1 as V1, ...".
+            Note: "dictionary" is not in the lexer keyword table, so it arrives as a
+            Note: TOKEN_IDENTIFIER valued "dictionary"; "containing" is accepted as the
+            Note: keyword token or the transformer's identifier form, mirroring the list
+            Note: gate above.
+            Let cl_next_is_dict be proc primary_token_value_is with cl_next, "dictionary"
+            If cl_next_is_dict is equal to 1:
+                Let cl_after_dict be proc parser_peek_token from Parser with parser, 2
+                Let cl_after_dict_type be proc token_get_type from Parser with cl_after_dict
+                Let cl_dict_containing be 0
+                If cl_after_dict_type is equal to TOKEN_CONTAINING:
+                    Set cl_dict_containing to 1
+                End If
+                If cl_dict_containing is equal to 0:
+                    Set cl_dict_containing to proc primary_token_value_is with cl_after_dict, "containing"
+                End If
+                If cl_dict_containing is equal to 1:
+                    Return proc parse_canonical_dictionary_literal with parser
+                End If
+            End If
+
+            Note: Non-empty set form: "a set containing E1, E2, ...". Lowercase "set" is
+            Note: not the TOKEN_SET keyword (the keyword table registers capitalised
+            Note: "Set" only), so it arrives as a TOKEN_IDENTIFIER valued "set".
+            Let cl_next_is_set be proc primary_token_value_is with cl_next, "set"
+            If cl_next_is_set is equal to 1:
+                Let cl_after_set be proc parser_peek_token from Parser with parser, 2
+                Let cl_after_set_type be proc token_get_type from Parser with cl_after_set
+                Let cl_set_containing be 0
+                If cl_after_set_type is equal to TOKEN_CONTAINING:
+                    Set cl_set_containing to 1
+                End If
+                If cl_set_containing is equal to 0:
+                    Set cl_set_containing to proc primary_token_value_is with cl_after_set, "containing"
+                End If
+                If cl_set_containing is equal to 1:
+                    Return proc parse_canonical_set_literal with parser
                 End If
             End If
 
@@ -3969,6 +4023,349 @@ Process called "parse_canonical_empty_list_literal" takes parser as Integer retu
         Return 0
     End If
     Return empty_node
+End Process
+
+Process called "parse_canonical_dictionary_literal" takes parser as Integer returns Integer:
+    Note: Parse the canonical dictionary literal "a dictionary containing K1 as V1, ...".
+    Note: .
+    Note: Grammar (caller has confirmed the article/"dictionary"/"containing" prefix):
+    Note:   a|an dictionary containing nothing
+    Note:   a|an dictionary containing [:] k1 as v1, [and] k2 as v2, ... [End Dictionary]
+    Note: An optional ':' may follow "containing" (the canonical block form); pairs are
+    Note: comma- or "and"-separated; a trailing "End Dictionary" closer is consumed when
+    Note: present. Keys and values are full expressions parsed with parse_expression -- a
+    Note: key expression stops at the "as" particle because TOKEN_AS is not registered as
+    Note: a binary operator, so the operator-climb loop terminates before consuming it.
+    Note: .
+    Note: The literal desugars to a left-nested chain of runtime calls:
+    Note:   dict_with(dict_with(dict_create(), k1, v1), k2, v2)
+    Note: dict_create() allocates an empty dictionary and dict_with(d, k, v) sets one
+    Note: entry and returns d (both no-mangle ABI functions in
+    Note: runtime/integration/runtime_api.runa). This reuses the proven
+    Note: AST_CALL_EXPRESSION lowering with no dedicated HIR/MIR node, exactly as the
+    Note: `at key` -> list_get and `length of` -> string_length desugars do, and works in
+    Note: every expression position (Let/Set initializer, struct-field value, nested
+    Note: dictionary value, call argument, Return).
+    Note: .
+    Note: Parameters:
+    Note:   parser - Pointer to ParserState
+    Note: .
+    Note: Returns:
+    Note:   Pointer to the desugared call-expression AST node, or 0 on parsing error.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Capture the source position of the article token for node anchoring.
+    Let article_token be proc parser_current_token from Parser with parser
+    Let dict_line be proc token_get_line from Parser with article_token
+    Let dict_column be proc token_get_column from Parser with article_token
+
+    Note: Consume the article ("a"/"an") and the collection word ("dictionary").
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+
+    Note: Consume "containing" (TOKEN_CONTAINING or the transformer's identifier form).
+    Let containing_token be proc parser_current_token from Parser with parser
+    Let containing_type be proc token_get_type from Parser with containing_token
+    Let containing_ok be 0
+    If containing_type is equal to TOKEN_CONTAINING:
+        Set containing_ok to 1
+    End If
+    If containing_ok is equal to 0:
+        Set containing_ok to proc primary_token_value_is with containing_token, "containing"
+    End If
+    If containing_ok is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'containing' in canonical dictionary literal", dict_line, dict_column
+        Return 0
+    End If
+    proc parser_consume_token from Parser with parser
+
+    Note: Base expression: dict_create().
+    Let create_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "dict_create", dict_line, dict_column
+    If create_callee is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_create callee for dictionary literal", dict_line, dict_column
+        Return 0
+    End If
+    Let create_args be proc create from List
+    Let acc be proc build_call_expression from ASTBuilder with create_callee, create_args, 0, dict_line, dict_column
+    If acc is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_create call for dictionary literal", dict_line, dict_column
+        Return 0
+    End If
+
+    Note: Empty form: "containing nothing" -> bare dict_create().
+    Let after_containing be proc parser_current_token from Parser with parser
+    Let is_nothing be proc primary_token_value_is with after_containing, "nothing"
+    If is_nothing is equal to 1:
+        proc parser_consume_token from Parser with parser
+        Return acc
+    End If
+
+    Note: Optional ':' before the first pair (canonical block form).
+    Let colon_token be proc parser_current_token from Parser with parser
+    Let colon_type be proc token_get_type from Parser with colon_token
+    If colon_type is equal to TOKEN_COLON:
+        proc parser_consume_token from Parser with parser
+    End If
+
+    Note: Parse "key as value" pairs until a terminator follows a pair.
+    Loop forever:
+        Let key_token be proc parser_current_token from Parser with parser
+        If key_token is equal to 0:
+            Break
+        End If
+        Let key_token_type be proc token_get_type from Parser with key_token
+        If key_token_type is equal to TOKEN_EOF:
+            Break
+        End If
+        If key_token_type is equal to TOKEN_END:
+            Break
+        End If
+
+        Let key_expr be proc parse_expression with parser
+        If key_expr is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected key expression in dictionary literal", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+
+        Let as_consumed be proc parser_expect_token from Parser with parser, TOKEN_AS
+        If as_consumed is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'as' between key and value in dictionary literal", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+
+        Let value_expr be proc parse_expression with parser
+        If value_expr is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected value expression in dictionary literal", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+
+        Note: acc = dict_with(acc, key_expr, value_expr).
+        Let with_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "dict_with", dict_line, dict_column
+        If with_callee is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_with callee for dictionary literal", dict_line, dict_column
+            Return 0
+        End If
+        Let with_args be proc create from List
+        proc list_append from List with with_args, acc
+        proc list_append from List with with_args, key_expr
+        proc list_append from List with with_args, value_expr
+        Set acc to proc build_call_expression from ASTBuilder with with_callee, with_args, 3, dict_line, dict_column
+        If acc is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_with call for dictionary literal", dict_line, dict_column
+            Return 0
+        End If
+
+        Note: A comma or natural-language "and" continues the pair list.
+        Let sep_token be proc parser_current_token from Parser with parser
+        Let sep_type be proc token_get_type from Parser with sep_token
+        If sep_type is equal to TOKEN_COMMA:
+            proc parser_consume_token from Parser with parser
+            Continue
+        End If
+        If sep_type is equal to TOKEN_AND:
+            proc parser_consume_token from Parser with parser
+            Continue
+        End If
+        Break
+    End While
+
+    Note: Optional "End Dictionary" closer for the multi-line block form. "Dictionary"
+    Note: is not a lexer keyword, so it arrives as an identifier valued "Dictionary".
+    Let end_token be proc parser_current_token from Parser with parser
+    Let end_token_type be proc token_get_type from Parser with end_token
+    If end_token_type is equal to TOKEN_END:
+        Let end_next be proc parser_peek_token from Parser with parser, 1
+        Let end_next_is_dict be proc primary_token_value_is with end_next, "Dictionary"
+        If end_next_is_dict is equal to 1:
+            proc parser_consume_token from Parser with parser
+            proc parser_consume_token from Parser with parser
+        End If
+    End If
+
+    Return acc
+End Process
+
+Process called "parse_canonical_set_literal" takes parser as Integer returns Integer:
+    Note: Parse the canonical set literal "a set containing E1, E2, ...".
+    Note: .
+    Note: Grammar (caller has confirmed the article/"set"/"containing" prefix):
+    Note:   a|an set containing nothing
+    Note:   a|an set containing [:] e1, [and] e2, ...
+    Note: Elements are comma- or "and"-separated full expressions. The literal desugars
+    Note: to a left-nested chain of runtime calls:
+    Note:   set_with(set_with(set_create(), e1), e2)
+    Note: set_create() allocates an empty set and set_with(s, e) adds one element and
+    Note: returns s (both no-mangle ABI functions in
+    Note: runtime/integration/runtime_api.runa). This reuses the proven
+    Note: AST_CALL_EXPRESSION lowering with no dedicated HIR/MIR node.
+    Note: .
+    Note: Parameters:
+    Note:   parser - Pointer to ParserState
+    Note: .
+    Note: Returns:
+    Note:   Pointer to the desugared call-expression AST node, or 0 on parsing error.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let article_token be proc parser_current_token from Parser with parser
+    Let set_line be proc token_get_line from Parser with article_token
+    Let set_column be proc token_get_column from Parser with article_token
+
+    Note: Consume the article ("a"/"an") and the collection word ("set").
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+
+    Note: Consume "containing" (TOKEN_CONTAINING or the transformer's identifier form).
+    Let containing_token be proc parser_current_token from Parser with parser
+    Let containing_type be proc token_get_type from Parser with containing_token
+    Let containing_ok be 0
+    If containing_type is equal to TOKEN_CONTAINING:
+        Set containing_ok to 1
+    End If
+    If containing_ok is equal to 0:
+        Set containing_ok to proc primary_token_value_is with containing_token, "containing"
+    End If
+    If containing_ok is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected 'containing' in canonical set literal", set_line, set_column
+        Return 0
+    End If
+    proc parser_consume_token from Parser with parser
+
+    Note: Base expression: set_create().
+    Let create_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "set_create", set_line, set_column
+    If create_callee is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_create callee for set literal", set_line, set_column
+        Return 0
+    End If
+    Let create_args be proc create from List
+    Let acc be proc build_call_expression from ASTBuilder with create_callee, create_args, 0, set_line, set_column
+    If acc is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_create call for set literal", set_line, set_column
+        Return 0
+    End If
+
+    Note: Empty form: "containing nothing" -> bare set_create().
+    Let after_containing be proc parser_current_token from Parser with parser
+    Let is_nothing be proc primary_token_value_is with after_containing, "nothing"
+    If is_nothing is equal to 1:
+        proc parser_consume_token from Parser with parser
+        Return acc
+    End If
+
+    Note: Optional ':' before the first element.
+    Let colon_token be proc parser_current_token from Parser with parser
+    Let colon_type be proc token_get_type from Parser with colon_token
+    If colon_type is equal to TOKEN_COLON:
+        proc parser_consume_token from Parser with parser
+    End If
+
+    Note: Parse elements until a terminator follows an element.
+    Loop forever:
+        Let elem_token be proc parser_current_token from Parser with parser
+        If elem_token is equal to 0:
+            Break
+        End If
+        Let elem_token_type be proc token_get_type from Parser with elem_token
+        If elem_token_type is equal to TOKEN_EOF:
+            Break
+        End If
+        If elem_token_type is equal to TOKEN_END:
+            Break
+        End If
+
+        Let element_expr be proc parse_expression with parser
+        If element_expr is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Expected element expression in set literal", proc token_get_line from Parser with proc parser_current_token from Parser with parser, proc token_get_column from Parser with proc parser_current_token from Parser with parser
+            Return 0
+        End If
+
+        Note: acc = set_with(acc, element_expr).
+        Let with_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "set_with", set_line, set_column
+        If with_callee is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_with callee for set literal", set_line, set_column
+            Return 0
+        End If
+        Let with_args be proc create from List
+        proc list_append from List with with_args, acc
+        proc list_append from List with with_args, element_expr
+        Set acc to proc build_call_expression from ASTBuilder with with_callee, with_args, 2, set_line, set_column
+        If acc is equal to 0:
+            proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_with call for set literal", set_line, set_column
+            Return 0
+        End If
+
+        Note: A comma or natural-language "and" continues the element list.
+        Let sep_token be proc parser_current_token from Parser with parser
+        Let sep_type be proc token_get_type from Parser with sep_token
+        If sep_type is equal to TOKEN_COMMA:
+            proc parser_consume_token from Parser with parser
+            Continue
+        End If
+        If sep_type is equal to TOKEN_AND:
+            proc parser_consume_token from Parser with parser
+            Continue
+        End If
+        Break
+    End While
+
+    Return acc
+End Process
+
+Process called "parse_canonical_empty_dictionary_literal" takes parser as Integer returns Integer:
+    Note: Parse "an empty dictionary" (the form the syntax transformer produces for {}).
+    Note: Consumes the three words article/"empty"/"dictionary" and desugars to a single
+    Note: dict_create() runtime call expression.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let article_token be proc parser_current_token from Parser with parser
+    Let dict_line be proc token_get_line from Parser with article_token
+    Let dict_column be proc token_get_column from Parser with article_token
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+    Let create_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "dict_create", dict_line, dict_column
+    If create_callee is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_create callee for empty dictionary literal", dict_line, dict_column
+        Return 0
+    End If
+    Let create_args be proc create from List
+    Let dict_node be proc build_call_expression from ASTBuilder with create_callee, create_args, 0, dict_line, dict_column
+    If dict_node is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create dict_create call for empty dictionary literal", dict_line, dict_column
+        Return 0
+    End If
+    Return dict_node
+End Process
+
+Process called "parse_canonical_empty_set_literal" takes parser as Integer returns Integer:
+    Note: Parse "an empty set" (the form the syntax transformer produces for an empty set
+    Note: literal). Consumes the three words article/"empty"/"set" and desugars to a
+    Note: single set_create() runtime call expression.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let article_token be proc parser_current_token from Parser with parser
+    Let set_line be proc token_get_line from Parser with article_token
+    Let set_column be proc token_get_column from Parser with article_token
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+    proc parser_consume_token from Parser with parser
+    Let create_callee be proc build_identifier_node from ASTBuilder with proc create_from_literal from StringCore with "set_create", set_line, set_column
+    If create_callee is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_create callee for empty set literal", set_line, set_column
+        Return 0
+    End If
+    Let create_args be proc create from List
+    Let set_node be proc build_call_expression from ASTBuilder with create_callee, create_args, 0, set_line, set_column
+    If set_node is equal to 0:
+        proc parser_report_error from Parser with parser, 2, proc create_from_literal from StringCore with "Failed to create set_create call for empty set literal", set_line, set_column
+        Return 0
+    End If
+    Return set_node
 End Process
 
 Process called "parse_tuple_literal" takes parser as Integer returns Integer:
