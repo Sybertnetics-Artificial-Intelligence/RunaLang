@@ -79,7 +79,7 @@ Process called "create_builder_context" returns Integer:
     @End Reasoning
 
     @Implementation:
-    HIRBuilderContext: 10 fields × 8 bytes = 80 bytes (P2-D Q4: added unsafe_depth + unsafe_externals registry)
+    HIRBuilderContext: 12 fields × 8 bytes = 96 bytes (P2-D Q4: added unsafe_depth + unsafe_externals registry; field 11 @80 = current_process_body AST for local structural member resolution; field 12 @88 = AST_PROGRAM root for whole-program broaden)
     Initialize with root scope and empty error list. unsafe_depth starts at 0.
     unsafe_externals dict holds (name_string -> 1) for every external declared
     with the unsafe flag; lower_call_expression consults this for compile-time
@@ -99,7 +99,7 @@ Process called "create_builder_context" returns Integer:
     returning 0 to prevent a leak from a half-constructed context.
     @End Security_Scope
 
-    Let context_size be 80
+    Let context_size be 96
     Let context be proc allocate from Layout with context_size
 
     If context is equal to 0:
@@ -146,6 +146,8 @@ Process called "create_builder_context" returns Integer:
     proc memory_set_int64 from Layout with context, 56, 0  Note: unsafe_depth (P2-D Q4)
     proc memory_set_int64 from Layout with context, 64, unsafe_externals_dict  Note: unsafe_externals registry
     proc memory_set_int64 from Layout with context, 72, 0  Note: reserved for future semantic state
+    proc memory_set_int64 from Layout with context, 80, 0  Note: current_process_body AST (local structural member resolution); set per process
+    proc memory_set_int64 from Layout with context, 88, 0  Note: AST_PROGRAM root (whole-program structural broaden); set in lower_program
 
     Return context
 End Process
@@ -954,6 +956,12 @@ Process called "lower_program" takes context as Integer, ast_node as Integer ret
         Return 0
     End If
 
+    Note: Record the AST_PROGRAM root (context offset 88) for the whole-program
+    Note: structural-member broaden in lower_member_expression. ast_node is the
+    Note: program root whose declarations live at offset 24; the collector descends
+    Note: each AST_PROCESS_DEFINITION body to gather a receiver's full field-set.
+    proc memory_set_int64 from Layout with context, 88, ast_node
+
     Note: Allocate the HIR program root (declarations List at offset 24).
     Let hir_program be proc create_hir_program from HIR
     If hir_program is equal to 0:
@@ -1693,15 +1701,19 @@ Process called "lower_unary_expression" takes context as Integer, ast_node as In
     Note: Infer result type
     Let result_type be proc infer_unary_result_type with context, operator, operand_type
 
-    Note: Create specialized HIRUnaryExpression structure
-    Let unary_expr be proc create_hir_unary_expression from HIRNodes with base_hir, operator, operand_hir, result_type
-
-    If unary_expr is equal to 0:
-        Return base_hir  Note: Fallback to base node
-    End If
-
-    Note: Store specialized structure pointer in base node metadata field
-    proc memory_set_int64 from Layout with base_hir, 56, unary_expr
+    Note: Store the operand/operator/result-type DIRECTLY on the flat base node,
+    Note: mirroring lower_binary_expression (operand@16, operator@24, result_type@32).
+    Note: The earlier code stashed these in a create_hir_unary_expression WRAPPER at
+    Note: base@56, but both consumers read the flat node: the MIR post handler
+    Note: lower_hir_unary_expression_post reads operator@24 / result_type@32, and the
+    Note: HIR visitor walks the operand at @16. With the wrapper layout the visitor read
+    Note: a flat-node position field at @16 and dereferenced it as a node pointer, and the
+    Note: MIR post read 0 for operator/result_type -- the flat layout fixes both. The 150
+    Note: self-host sources use no unary expressions, so this path never executes for them
+    Note: (the prior broken build self-hosted), keeping the fixpoint byte-identical.
+    proc memory_set_int64 from Layout with base_hir, 16, operand_hir
+    proc memory_set_int64 from Layout with base_hir, 24, operator
+    proc memory_set_int64 from Layout with base_hir, 32, result_type
 
     If result_type is not equal to 0:
         proc set_hir_node_type_info from HIR with base_hir, result_type
@@ -2154,6 +2166,161 @@ Process called "lower_indirect_call_expression" takes context as Integer, ast_no
     Return base
 End Process
 
+Process called "collect_member_fields_for_var" takes node as Integer, target_name as Integer, fields_buf as Integer, count_ptr as Integer, max_count as Integer returns Integer:
+    Note: Recursively collect the DISTINCT field names accessed as <target_name>.<field>
+    Note: anywhere inside the given AST subtree. Used by lower_member_expression's
+    Note: structural fallback to disambiguate an unresolved-struct receiver: the unique
+    Note: in-scope struct owning the whole collected set is the receiver's real type.
+    Note: The modular AST is uniform (children list with ast_node_get_child), so a single
+    Note: generic recursion covers every statement/expression form -- no per-node-type
+    Note: offset table is needed (unlike the monolith codegen_collect_field_names_in_stmt).
+    If node is equal to 0:
+        Return 0
+    End If
+    Note: Pointer sanity guard: reject obviously non-heap small integers.
+    If node is less than 65536:
+        Return 0
+    End If
+
+    Let nt be proc ast_node_get_type from AST with node
+    If nt is equal to AST_MEMBER_EXPRESSION from AST:
+        Let obj be proc ast_node_get_child from AST with node, 0
+        If obj is not equal to 0:
+            Let obj_t be proc ast_node_get_type from AST with obj
+            If obj_t is equal to AST_IDENTIFIER from AST:
+                Let obj_name be proc ast_node_get_value from AST with obj
+                If obj_name is not equal to 0:
+                    Let name_matches be proc string_equals from StringCore with obj_name, target_name
+                    If name_matches is equal to 1:
+                        Let prop be proc ast_node_get_child from AST with node, 1
+                        If prop is not equal to 0:
+                            Let prop_name be proc ast_node_get_value from AST with prop
+                            If prop_name is not equal to 0:
+                                Let cur_count be proc memory_get_int64 from Layout with count_ptr, 0
+                                If cur_count is less than max_count:
+                                    Let is_dup be 0
+                                    Let dj be 0
+                                    While dj is less than cur_count:
+                                        Let dj_off be dj multiplied by 8
+                                        Let existing be proc memory_get_int64 from Layout with fields_buf, dj_off
+                                        Let dup_eq be proc string_equals from StringCore with existing, prop_name
+                                        If dup_eq is equal to 1:
+                                            Set is_dup to 1
+                                            Set dj to cur_count
+                                        End If
+                                        Set dj to dj plus 1
+                                    End While
+                                    If is_dup is equal to 0:
+                                        Let store_off be cur_count multiplied by 8
+                                        proc memory_set_int64 from Layout with fields_buf, store_off, prop_name
+                                        Let new_count be cur_count plus 1
+                                        proc memory_set_int64 from Layout with count_ptr, 0, new_count
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: A process definition stores its body at fixed offset 112 (not in the generic
+    Note: children list), so the generic recursion below never reaches it. Descend it
+    Note: explicitly -- this is what lets the whole-program broaden pass (seeded at the
+    Note: AST_PROGRAM root) reach every function body's member accesses.
+    If nt is equal to AST_PROCESS_DEFINITION from AST:
+        Let pd_body be proc memory_get_int64 from Layout with node, 112
+        proc collect_member_fields_for_var with pd_body, target_name, fields_buf, count_ptr, max_count
+    End If
+
+    Note: Recurse into every child regardless of node kind.
+    Let child_total be proc ast_node_get_child_count from AST with node
+    Let ci be 0
+    While ci is less than child_total:
+        Let child be proc ast_node_get_child from AST with node, ci
+        proc collect_member_fields_for_var with child, target_name, fields_buf, count_ptr, max_count
+        Set ci to ci plus 1
+    End While
+    Return 0
+End Process
+
+Process called "find_unique_struct_for_var_fields" takes context as Integer, collect_root as Integer, recv_name as Integer returns Integer:
+    Note: Collect the set of field names accessed as recv_name.<field> within collect_root,
+    Note: then return the single in-scope struct type that declares the ENTIRE set, or 0
+    Note: when zero or multiple types match (or the set is empty). This is the engine of
+    Note: lower_member_expression's structural fallback: it is called first with the
+    Note: current process body (precise local pass, avoids cross-function pollution) and,
+    Note: if that is ambiguous, with the whole AST_PROGRAM root (broaden pass, parity with
+    Note: the monolith's codegen_resolve_struct_via_structural).
+    If collect_root is equal to 0:
+        Return 0
+    End If
+    If recv_name is equal to 0:
+        Return 0
+    End If
+
+    Let fld_buf be proc allocate from Layout with 256
+    If fld_buf is equal to 0:
+        Return 0
+    End If
+    Let fld_count_ptr be proc allocate from Layout with 8
+    If fld_count_ptr is equal to 0:
+        proc deallocate from Layout with fld_buf
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with fld_count_ptr, 0, 0
+    proc collect_member_fields_for_var with collect_root, recv_name, fld_buf, fld_count_ptr, 32
+    Let fld_count be proc memory_get_int64 from Layout with fld_count_ptr, 0
+
+    Let matched_type be 0
+    Let match_count be 0
+    If fld_count is greater than 0:
+        Let sscope be proc get_current_scope with context
+        While sscope is not equal to 0:
+            Let stypes be proc memory_get_int64 from Layout with sscope, 56
+            Let stype_count be proc memory_get_int64 from Layout with sscope, 64
+            If stypes is not equal to 0:
+                Let sti be 0
+                While sti is less than stype_count:
+                    Let stsym be proc get from List with stypes, sti
+                    If stsym is not equal to 0:
+                        Let sct be proc get_symbol_type with stsym
+                        If sct is not equal to 0:
+                            Let all_present be 1
+                            Let fci be 0
+                            While fci is less than fld_count:
+                                Let fci_off be fci multiplied by 8
+                                Let fname be proc memory_get_int64 from Layout with fld_buf, fci_off
+                                Let fidx be proc resolve_member_index with context, sct, fname
+                                If fidx is equal to negative 1:
+                                    Set all_present to 0
+                                    Set fci to fld_count
+                                End If
+                                Set fci to fci plus 1
+                            End While
+                            If all_present is equal to 1:
+                                Set matched_type to sct
+                                Set match_count to match_count plus 1
+                            End If
+                        End If
+                    End If
+                    Set sti to sti plus 1
+                End While
+            End If
+            Set sscope to proc memory_get_int64 from Layout with sscope, 8
+        End While
+    End If
+
+    proc deallocate from Layout with fld_count_ptr
+    proc deallocate from Layout with fld_buf
+
+    If match_count is equal to 1:
+        Return matched_type
+    End If
+    Return 0
+End Process
+
 Process called "lower_member_expression" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
     Note: Lower member access expression to HIR
 
@@ -2286,9 +2453,45 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
             Set member_index to resolved_index
             Set member_type to resolved_type
         Otherwise:
-            Note: Member not found or ambiguous - this is an error
-            proc add_error with context, line, column, property_name
-            Set member_index to 0  Note: Use 0 as fallback
+            Note: ---------------------------------------------------------------------
+            Note: Pass-3 structural disambiguation (parity with the monolith
+            Note: codegen_resolve_struct_via_structural). The declared type does not
+            Note: uniquely own this field -- zero or multiple in-scope structs declare it
+            Note: (after import merge, common field names such as tokens / functions /
+            Note: error_message have dozens of owners, so the Pass-2 unique-owner scan
+            Note: above sees candidate_count > 1). Resolve by FIELD-SET: the receiver's
+            Note: real struct is the unique in-scope type owning every field accessed on it.
+            Note: Pass A scans the CURRENT process body (precise; avoids pollution from a
+            Note: same-named variable of a different type in another function). If that is
+            Note: ambiguous -- e.g. a test function that only touches lexer.tokens -- Pass B
+            Note: broadens to the whole AST_PROGRAM, where the union set {tokens, lexemes,
+            Note: lines} pins the receiver to its one struct. Adopt only on a unique match.
+            Let struct_resolved be 0
+            If object_ast is not equal to 0:
+                Let recv_type be proc ast_node_get_type from AST with object_ast
+                If recv_type is equal to AST_IDENTIFIER from AST:
+                    Let recv_name be proc ast_node_get_value from AST with object_ast
+                    Let local_body be proc memory_get_int64 from Layout with context, 80
+                    Let matched_struct be proc find_unique_struct_for_var_fields with context, local_body, recv_name
+                    If matched_struct is equal to 0:
+                        Let program_root be proc memory_get_int64 from Layout with context, 88
+                        Set matched_struct to proc find_unique_struct_for_var_fields with context, program_root, recv_name
+                    End If
+                    If matched_struct is not equal to 0:
+                        Let final_idx be proc resolve_member_index with context, matched_struct, property_name
+                        If final_idx is not equal to negative 1:
+                            Set member_index to final_idx
+                            Set member_type to proc resolve_member_type with context, matched_struct, property_name
+                            Set struct_resolved to 1
+                        End If
+                    End If
+                End If
+            End If
+            If struct_resolved is equal to 0:
+                Note: Member not found or genuinely ambiguous - this is an error
+                proc add_error with context, line, column, property_name
+                Set member_index to 0  Note: Use 0 as fallback
+            End If
         End If
     End If
 
@@ -5049,6 +5252,12 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
     Let return_type_ast be proc memory_get_int64 from Layout with ast_node, 104
     Let body_ast be proc memory_get_int64 from Layout with ast_node, 112
 
+    Note: Record the process body for structural member resolution (context offset 80).
+    Note: lower_member_expression's structural fallback walks this body to collect the
+    Note: set of fields accessed on an unresolved-struct receiver and union-matches it
+    Note: to the one in-scope struct owning the whole set. Cleared on process exit.
+    proc memory_set_int64 from Layout with context, 80, body_ast
+
     Note: Lower return type
     Let return_type_hir be 0
     If return_type_ast is not equal to 0:
@@ -5144,6 +5353,7 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
 
     Note: Clear current function
     proc memory_set_int64 from Layout with context, 40, 0
+    proc memory_set_int64 from Layout with context, 80, 0  Note: clear current_process_body
 
     If body_hir is equal to 0:
         Return 0
