@@ -658,6 +658,34 @@ Process called "lower_binary_op" that takes builder as Integer, mir_node as Inte
         Set lir_opcode to LIR_SAR from LIR
     End If
 
+    Note:
+    Floating-point arithmetic lowers to two-address SSE: x86-64 `addsd/subsd/
+    mulsd/divsd src, dst` compute `dst = dst OP src` with both operands in XMM
+    registers. The generic 3-address binary op the integer path emits is not
+    legal for SSE because the backend's emit_sse_binary reads only the result
+    (dst) and operand2 (src). So stage explicitly: move operand2 (right) into a
+    fresh FPR vreg so the SSE source is guaranteed XMM, move operand1 (left) into
+    the result (so the destination already holds the left operand), then emit the
+    SSE op `OP right_fpr, result`. The register moves cross GPR->XMM (`movq`) when
+    a float value currently lives in a GPR (e.g. a memory-loaded operand) and
+    XMM->XMM otherwise; both are legal MOVQ encodings. Mirrors the monolith's
+    float-binop register staging.
+    :End Note
+    If is_float is equal to 1:
+        Let bin_lir_function be proc memory_get_int64 from Layout with builder, 8
+        Let right_fpr be proc lir_create_virtual_register from LIR with bin_lir_function, LIR_REGCLASS_FPR from LIR, 8
+        Let right_fpr_op be proc create_register_operand from LIRNodes with right_fpr, 8
+        Let mv_right be proc create_lir_move from LIRNodes with right_fpr_op, right_operand, 8
+        proc append_lir_instruction with builder, mv_right
+
+        Let mv_left be proc create_lir_move from LIRNodes with dest_operand, left_operand, 8
+        proc append_lir_instruction with builder, mv_left
+
+        Let fbin_inst be proc create_lir_binary_op from LIRNodes with lir_opcode, dest_operand, dest_operand, right_fpr_op, size
+        proc append_lir_instruction with builder, fbin_inst
+        Return 1
+    End If
+
     Note: Create LIR binary operation
     Let lir_inst be proc create_lir_binary_op from LIRNodes with lir_opcode, dest_operand, left_operand, right_operand, size
 
@@ -778,20 +806,55 @@ Process called "lower_comparison" that takes builder as Integer, mir_node as Int
     Let right_reg be proc get_or_create_register_for_value with builder, right_value_id, type_info
 
     Let size be proc get_type_size with type_info
-    Let left_operand be proc create_register_operand from LIRNodes with left_reg, size
-    Let right_operand be proc create_register_operand from LIRNodes with right_reg, size
-
-    Note: Generate compare instruction
     Let is_signed be proc is_signed_type with type_info
-    Let is_float be proc is_float_type with type_info
 
-    If is_float is equal to 1:
-        Let cmp_inst be proc create_lir_compare from LIRNodes with left_operand, right_operand, size, 1
-    Otherwise:
-        Set cmp_inst to proc create_lir_compare from LIRNodes with left_operand, right_operand, size, is_signed
+    Note:
+    Float comparisons cannot be detected from type_info: a comparison's MIR node
+    carries its BOOLEAN result type, not the operand type. Detect float operands
+    from their register class instead — the load/const/arith lowerings assign an
+    FPR (XMM) virtual register to every Float value. When either comparand is FPR,
+    emit a floating-point compare: stage both operands into fresh XMM registers
+    (the move crosses GPR->XMM via `movq` when needed) and emit `ucomisd` via the
+    LIR_FCMP opcode. ucomisd sets CF/ZF/PF (the unsigned seta/setb family), so
+    force the unsigned condition encoding by clearing is_signed; the MIR_GT etc.
+    mapping below then selects LIR_COND_UGT/UGE/ULT/ULE, which the backend renders
+    as seta/setae/setb/setbe. EQ/NE are sign-agnostic and unaffected. Integer
+    comparisons keep the existing signed/unsigned cmp path unchanged.
+    :End Note
+    Let cmp_lir_function be proc memory_get_int64 from Layout with builder, 8
+    Let left_class be proc lir_get_virtual_register_class from LIR with cmp_lir_function, left_reg
+    Let right_class be proc lir_get_virtual_register_class from LIR with cmp_lir_function, right_reg
+    Let is_float_cmp be 0
+    If left_class is equal to LIR_REGCLASS_FPR from LIR:
+        Set is_float_cmp to 1
+    End If
+    If right_class is equal to LIR_REGCLASS_FPR from LIR:
+        Set is_float_cmp to 1
     End If
 
-    proc append_lir_instruction with builder, cmp_inst
+    If is_float_cmp is equal to 1:
+        Let cmp_left_fpr be proc lir_create_virtual_register from LIR with cmp_lir_function, LIR_REGCLASS_FPR from LIR, 8
+        Let cmp_right_fpr be proc lir_create_virtual_register from LIR with cmp_lir_function, LIR_REGCLASS_FPR from LIR, 8
+        Let cmp_left_fpr_op be proc create_register_operand from LIRNodes with cmp_left_fpr, 8
+        Let cmp_right_fpr_op be proc create_register_operand from LIRNodes with cmp_right_fpr, 8
+        Let cmp_src_left be proc create_register_operand from LIRNodes with left_reg, 8
+        Let cmp_src_right be proc create_register_operand from LIRNodes with right_reg, 8
+
+        Let cmp_mv_left be proc create_lir_move from LIRNodes with cmp_left_fpr_op, cmp_src_left, 8
+        proc append_lir_instruction with builder, cmp_mv_left
+        Let cmp_mv_right be proc create_lir_move from LIRNodes with cmp_right_fpr_op, cmp_src_right, 8
+        proc append_lir_instruction with builder, cmp_mv_right
+
+        Let fcmp_inst be proc create_lir_compare from LIRNodes with cmp_left_fpr_op, cmp_right_fpr_op, 8, 0
+        proc memory_set_int64 from Layout with fcmp_inst, 0, LIR_FCMP from LIR
+        proc append_lir_instruction with builder, fcmp_inst
+        Set is_signed to 0
+    Otherwise:
+        Let left_operand be proc create_register_operand from LIRNodes with left_reg, size
+        Let right_operand be proc create_register_operand from LIRNodes with right_reg, size
+        Let cmp_inst be proc create_lir_compare from LIRNodes with left_operand, right_operand, size, is_signed
+        proc append_lir_instruction with builder, cmp_inst
+    End If
 
     Note: Map MIR comparison to LIR condition code
     Let condition be 0
