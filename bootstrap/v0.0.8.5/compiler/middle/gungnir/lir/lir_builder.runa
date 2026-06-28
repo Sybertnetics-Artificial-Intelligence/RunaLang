@@ -665,24 +665,85 @@ Process called "lower_binary_op" that takes builder as Integer, mir_node as Inte
     legal for SSE because the backend's emit_sse_binary reads only the result
     (dst) and operand2 (src). So stage explicitly: move operand2 (right) into a
     fresh FPR vreg so the SSE source is guaranteed XMM, move operand1 (left) into
-    the result (so the destination already holds the left operand), then emit the
-    SSE op `OP right_fpr, result`. The register moves cross GPR->XMM (`movq`) when
-    a float value currently lives in a GPR (e.g. a memory-loaded operand) and
-    XMM->XMM otherwise; both are legal MOVQ encodings. Mirrors the monolith's
-    float-binop register staging.
+    an XMM destination, then emit the SSE op `OP right_fpr, dst`. The register
+    moves cross GPR->XMM (`movq`) when a float value currently lives in a GPR
+    (e.g. a memory-loaded operand or a function-call return value) and XMM->XMM
+    otherwise; both are legal MOVQ encodings. Mirrors the monolith's float-binop
+    register staging.
+
+    Float-ness detection is two-tier. The primary signal is the operation's own
+    Float result type (is_float). But some Float operands carry no Float type on
+    the binary node: a float-returning CALL result, for instance, may reach the
+    binop as a GPR-classed value whose producing call did not propagate the Float
+    return type, leaving is_float (which reads the node's result type) at 0 even
+    though an operand is genuinely floating-point. The fallback therefore also
+    inspects the operand register classes — the load/const/field/arith lowerings
+    assign an FPR (XMM) vreg to every value they KNOW is Float, so an FPR operand
+    is authoritative evidence of a float operation. This mirrors lower_comparison.
+    The fallback only applies to ADD/SUB/MUL/DIV (the SSE-arithmetic opcodes);
+    bitwise/shift/mod on integer-typed float-bit values (softfloat) operate on
+    GPR-typed values and never see an FPR operand, so they stay on the integer
+    path unchanged.
+
+    When the float branch fires via the fallback, the binop's own result vreg may
+    still be GPR (its result type was not Float). In that case the SSE op cannot
+    target it directly, so compute into a fresh XMM and MOVQ the 64-bit result
+    back into the GPR destination (the raw IEEE-754 bits), which downstream GPR
+    consumers handle identically. When the result vreg is already FPR (the
+    is_float type path), write the SSE result straight into it — byte-identical
+    to the prior float lowering.
     :End Note
-    If is_float is equal to 1:
-        Let bin_lir_function be proc memory_get_int64 from Layout with builder, 8
+    Let float_lir_opcode be 0
+    If opcode is equal to MIR_ADD from MIR:
+        Set float_lir_opcode to LIR_FADD from LIR
+    End If
+    If opcode is equal to MIR_SUB from MIR:
+        Set float_lir_opcode to LIR_FSUB from LIR
+    End If
+    If opcode is equal to MIR_MUL from MIR:
+        Set float_lir_opcode to LIR_FMUL from LIR
+    End If
+    If opcode is equal to MIR_DIV from MIR:
+        Set float_lir_opcode to LIR_FDIV from LIR
+    End If
+
+    Let bin_lir_function be proc memory_get_int64 from Layout with builder, 8
+    Let want_float_sse be is_float
+    If want_float_sse is equal to 0:
+        If float_lir_opcode is not equal to 0:
+            Let bin_left_class be proc lir_get_virtual_register_class from LIR with bin_lir_function, left_reg
+            Let bin_right_class be proc lir_get_virtual_register_class from LIR with bin_lir_function, right_reg
+            If bin_left_class is equal to LIR_REGCLASS_FPR from LIR:
+                Set want_float_sse to 1
+            End If
+            If bin_right_class is equal to LIR_REGCLASS_FPR from LIR:
+                Set want_float_sse to 1
+            End If
+        End If
+    End If
+
+    If want_float_sse is equal to 1:
         Let right_fpr be proc lir_create_virtual_register from LIR with bin_lir_function, LIR_REGCLASS_FPR from LIR, 8
         Let right_fpr_op be proc create_register_operand from LIRNodes with right_fpr, 8
         Let mv_right be proc create_lir_move from LIRNodes with right_fpr_op, right_operand, 8
         proc append_lir_instruction with builder, mv_right
 
-        Let mv_left be proc create_lir_move from LIRNodes with dest_operand, left_operand, 8
-        proc append_lir_instruction with builder, mv_left
-
-        Let fbin_inst be proc create_lir_binary_op from LIRNodes with lir_opcode, dest_operand, dest_operand, right_fpr_op, size
-        proc append_lir_instruction with builder, fbin_inst
+        Let result_class be proc lir_get_virtual_register_class from LIR with bin_lir_function, result_reg
+        If result_class is equal to LIR_REGCLASS_FPR from LIR:
+            Let mv_left be proc create_lir_move from LIRNodes with dest_operand, left_operand, 8
+            proc append_lir_instruction with builder, mv_left
+            Let fbin_inst be proc create_lir_binary_op from LIRNodes with float_lir_opcode, dest_operand, dest_operand, right_fpr_op, size
+            proc append_lir_instruction with builder, fbin_inst
+        Otherwise:
+            Let dst_fpr be proc lir_create_virtual_register from LIR with bin_lir_function, LIR_REGCLASS_FPR from LIR, 8
+            Let dst_fpr_op be proc create_register_operand from LIRNodes with dst_fpr, 8
+            Let mv_left_g be proc create_lir_move from LIRNodes with dst_fpr_op, left_operand, 8
+            proc append_lir_instruction with builder, mv_left_g
+            Let fbin_inst_g be proc create_lir_binary_op from LIRNodes with float_lir_opcode, dst_fpr_op, dst_fpr_op, right_fpr_op, size
+            proc append_lir_instruction with builder, fbin_inst_g
+            Let mv_back be proc create_lir_move from LIRNodes with dest_operand, dst_fpr_op, 8
+            proc append_lir_instruction with builder, mv_back
+        End If
         Return 1
     End If
 
@@ -1445,44 +1506,34 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
     :End Note
 
     Note:
-    System V (and Win64) keep TWO independent argument-class counters: a
-    general-purpose counter for integer/pointer arguments (RDI,RSI,RDX,RCX,
-    R8,R9 on SysV) and an SSE counter for floating-point arguments (XMM0-7).
-    The two sequences advance independently of each other and independently
-    of overall argument position. Folding both into a single index (the prior
-    behaviour) mis-assigned every call that interleaved int and float args:
-    the first float would land in XMM<int_position> instead of XMM0, and an
-    int after a float would skip a GP register. lir_get_argument_register is
-    keyed on the PER-CLASS index, so we feed it gp_index for integer args and
-    sse_index for float args, advancing only the consumed class.
+    Float values cross a call boundary as their 64-bit IEEE-754 bit pattern in a
+    GENERAL-PURPOSE argument register — exactly like an integer — matching the
+    monolith reference convention and the monolith-compiled runtime that this
+    code links against. Floats are materialised into XMM only transiently for the
+    arithmetic/compare instructions themselves (see lower_binary_op /
+    lower_comparison), never to pass an argument or return a value. So every
+    argument, regardless of type, draws from the SINGLE System V integer
+    sequence (RDI,RSI,RDX,RCX,R8,R9, then stack); there is no separate SSE
+    argument sequence. A float argument value that currently lives in an XMM vreg
+    is moved into its GP argument register with a `movq %xmm, %r` below.
     :End Note
     Let type_cache be proc memory_get_int64 from Layout with builder, 48
 
     Note:
     First pass: determine how many arguments are passed on the stack. An
     argument spills to the stack exactly when lir_get_argument_register
-    returns -1 for its per-class index (GP regs exhausted past the 6th
-    integer arg, or SSE regs past the 8th float arg). The stack byte count
-    drives a single RSP reservation so the outgoing stack-argument area sits
-    BELOW the return address the callq pushes — without it, the stores would
-    overwrite the slot the return address lands in and corrupt the call.
+    returns -1 for the unified GP index (GP regs exhausted past the 6th
+    argument). The stack byte count drives a single RSP reservation so the
+    outgoing stack-argument area sits BELOW the return address the callq
+    pushes — without it, the stores would overwrite the slot the return
+    address lands in and corrupt the call.
     :End Note
     Let count_gp_index be 0
-    Let count_sse_index be 0
     Let stack_arg_count be 0
     Let scan_index be 0
     While scan_index is less than argument_count:
-        Let scan_value_id be proc get from List with arguments, scan_index
-        Let scan_type be proc omap_get from OrderedMap with type_cache, scan_value_id
-        Let scan_is_float be proc is_float_type with scan_type
-        Let scan_target be -1
-        If scan_is_float is equal to 1:
-            Set scan_target to proc lir_get_argument_register from LIR with calling_convention, count_sse_index, 1
-            Set count_sse_index to count_sse_index plus 1
-        Otherwise:
-            Set scan_target to proc lir_get_argument_register from LIR with calling_convention, count_gp_index, 0
-            Set count_gp_index to count_gp_index plus 1
-        End If
+        Let scan_target be proc lir_get_argument_register from LIR with calling_convention, count_gp_index, 0
+        Set count_gp_index to count_gp_index plus 1
         If scan_target is equal to -1:
             Set stack_arg_count to stack_arg_count plus 1
         End If
@@ -1513,15 +1564,17 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
     End If
 
     Note:
-    Second pass: place each argument. Register args move into their assigned
-    GP/SSE register; stack args store to [rsp + slot*8] starting at slot 0 —
-    the stores are relative to the JUST-reserved RSP, so arg7 lands at
+    Second pass: place each argument. Every argument — integer, pointer, or
+    float (as its 64-bit bit pattern) — moves into its assigned register from
+    the SINGLE GP sequence; stack args store to [rsp + slot*8] starting at slot
+    0 — the stores are relative to the JUST-reserved RSP, so arg7 lands at
     [rsp+0], arg8 at [rsp+8], and so on, with no collision against the return
-    address. The same per-class counters as the scan reproduce the identical
-    register/stack decisions.
+    address. The unified GP index reproduces the identical register/stack
+    decisions the scan made. A float arg whose value lives in an XMM vreg is
+    moved into its GP register with a `movq %xmm, %r` (the create_lir_move
+    backend renders the XMM->GPR MOVQ); an int/pointer arg uses a plain mov.
     :End Note
     Let gp_index be 0
-    Let sse_index be 0
     Let stack_slot be 0
     Let arg_index be 0
     While arg_index is less than argument_count:
@@ -1531,18 +1584,10 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
         Let arg_type be proc omap_get from OrderedMap with type_cache, arg_value_id
 
         Let arg_reg be proc get_or_create_register_for_value with builder, arg_value_id, arg_type
-        Let is_float be proc is_float_type with arg_type
 
-        Note: Resolve the target register from the per-class index, then
-        Note: advance only the class this argument consumed.
-        Let target_reg be -1
-        If is_float is equal to 1:
-            Set target_reg to proc lir_get_argument_register from LIR with calling_convention, sse_index, 1
-            Set sse_index to sse_index plus 1
-        Otherwise:
-            Set target_reg to proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
-            Set gp_index to gp_index plus 1
-        End If
+        Note: Resolve the target register from the unified GP index, then advance.
+        Let target_reg be proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
+        Set gp_index to gp_index plus 1
 
         Let size be proc get_type_size with arg_type
 
@@ -2802,17 +2847,18 @@ so the binding and every parameter use stay in one basic block.
 
 @Implementation
 Iterate the MIR function parameters list. For each parameter, resolve the
-body vreg via get_or_create_register_for_value, classify it as integer or
-float from the cached parameter type, and obtain the ABI argument register
-via lir_get_argument_register keyed on the PER-CLASS index (a GP counter for
-integer/pointer params, an SSE counter for float params). This mirrors the
-caller's lower_call marshalling exactly: integer args occupy RDI..R9 in GP
-order, float args occupy XMM0..XMM7 in SSE order, each sequence independent.
-Append a register-to-register move per register-passed parameter. Parameters
-beyond their class's register set (arg register == -1) are passed on the
-stack by the caller and are addressed directly by the body's stack slots, so
-no binding move is emitted for them; their consumed class counter is still
-advanced so later same-class params get the correct register.
+body vreg via get_or_create_register_for_value, and obtain the ABI argument
+register via lir_get_argument_register keyed on the SINGLE GP index. Every
+parameter — integer, pointer, or float (received as its 64-bit bit pattern) —
+arrives in a general-purpose register, mirroring the caller's lower_call
+marshalling exactly: all args occupy RDI..R9 in one GP sequence (matching the
+monolith reference convention; floats are NOT passed in XMM). Append a
+register-to-register move per register-passed parameter — a plain mov for an
+integer/pointer param, or a GPR->XMM `movq` when the float param's body vreg
+is an XMM (FPR) register. Parameters beyond the GP register set (arg register
+== -1) are passed on the stack by the caller and are addressed directly by the
+body's stack slots, so no binding move is emitted for them; the GP counter is
+still advanced so later params get the correct register.
 @End Implementation
 
 @Performance_Hints
@@ -2843,7 +2889,6 @@ Process called "emit_parameter_binding_prologue" that takes builder as Integer, 
 
     Let parameter_count be proc length from List with mir_parameters
     Let gp_index be 0
-    Let sse_index be 0
     Let stack_param_slot be 0
     Let rbp_reg be LIR_REG_RBP from LIR
     Let p be 0
@@ -2853,19 +2898,20 @@ Process called "emit_parameter_binding_prologue" that takes builder as Integer, 
         If type_cache is not equal to 0:
             Set param_type to proc omap_get from OrderedMap with type_cache, param_value_id
         End If
-        Let param_is_float be proc is_float_type with param_type
         Let param_dest_reg be proc get_or_create_register_for_value with builder, param_value_id, param_type
 
-        Note: Resolve the incoming argument register from the per-class index,
-        Note: then advance only the class this parameter consumed.
-        Let arg_src_reg be -1
-        If param_is_float is equal to 1:
-            Set arg_src_reg to proc lir_get_argument_register from LIR with calling_convention, sse_index, 1
-            Set sse_index to sse_index plus 1
-        Otherwise:
-            Set arg_src_reg to proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
-            Set gp_index to gp_index plus 1
-        End If
+        Note:
+        Resolve the incoming argument register from the SINGLE GP sequence and
+        advance. Every parameter — integer, pointer, or float (received as its
+        64-bit bit pattern) — arrives in a general-purpose register, mirroring
+        the unified GP argument placement in lower_call and the monolith
+        reference convention. The bind move below copies that GP register into
+        the parameter's body vreg; for a float parameter whose body vreg is an
+        XMM (FPR) register the move renders as `movq %r, %xmm` (GPR->XMM MOVQ),
+        delivering the bit pattern to the float register class.
+        :End Note
+        Let arg_src_reg be proc lir_get_argument_register from LIR with calling_convention, gp_index, 0
+        Set gp_index to gp_index plus 1
 
         If arg_src_reg is not equal to 0 minus 1:
             Note: Register-passed parameter: bind its incoming ABI register into
