@@ -294,9 +294,31 @@ Process called "atomic_compare_exchange" takes a as Integer, expected as Integer
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Let exp_masked be proc atomic_mask_for_type with expected, type_code
     Let des_masked be proc atomic_mask_for_type with desired, type_code
-    Note: Underlying CAS uses seq_cst; success/failure ordering params are
-    Note: accepted but not yet differentiated from seq_cst until v0.0.8.6
-    Note: lands typed-relaxed CAS in the assembly layer.
+    Note: Normalize the orderings per the C11 compare-exchange rules. The
+    Note: failure ordering governs only the load performed when the comparison
+    Note: fails, so it may not carry release semantics (RELEASE / ACQ_REL fold
+    Note: to ACQUIRE) and may not be stronger than the success ordering. Both
+    Note: are clamped to the valid RELAXED..SEQ_CST range.
+    If failure_order is equal to ORDER_RELEASE:
+        Set failure_order to ORDER_ACQUIRE
+    End If
+    If failure_order is equal to ORDER_ACQ_REL:
+        Set failure_order to ORDER_ACQUIRE
+    End If
+    If failure_order is greater than success_order:
+        Set failure_order to success_order
+    End If
+    If success_order is less than ORDER_RELAXED:
+        Set success_order to ORDER_SEQ_CST
+    End If
+    If success_order is greater than ORDER_SEQ_CST:
+        Set success_order to ORDER_SEQ_CST
+    End If
+    Note: x86_64 (active target): LOCK CMPXCHG is an unconditional full barrier
+    Note: that simultaneously satisfies success_order and failure_order for every
+    Note: ordering. No weaker compare-exchange instruction exists on this target,
+    Note: and an additional MFENCE would be redundant under TSO, so the requested
+    Note: ordering is realized directly by the strong CAS primitive.
     Return proc atomic_compare_and_swap from Atomic with a, exp_masked, des_masked
 End Process
 
@@ -307,6 +329,27 @@ Process called "atomic_compare_exchange_weak" takes a as Integer, expected as In
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Let exp_masked be proc atomic_mask_for_type with expected, type_code
     Let des_masked be proc atomic_mask_for_type with desired, type_code
+    Note: Same C11 ordering normalization as the strong form: strip release
+    Note: semantics from the failure ordering and bound it by the success
+    Note: ordering, clamping both to RELAXED..SEQ_CST.
+    If failure_order is equal to ORDER_RELEASE:
+        Set failure_order to ORDER_ACQUIRE
+    End If
+    If failure_order is equal to ORDER_ACQ_REL:
+        Set failure_order to ORDER_ACQUIRE
+    End If
+    If failure_order is greater than success_order:
+        Set failure_order to success_order
+    End If
+    If success_order is less than ORDER_RELAXED:
+        Set success_order to ORDER_SEQ_CST
+    End If
+    If success_order is greater than ORDER_SEQ_CST:
+        Set success_order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: the weak CAS lowers to the identical LOCK CMPXCHG, which is a
+    Note: full barrier and never spuriously fails. The normalized orderings are
+    Note: realized directly by the primitive with no extra fence.
     Return proc atomic_compare_and_swap_weak from Atomic with a, exp_masked, des_masked
 End Process
 
@@ -316,13 +359,18 @@ Note: ==========================================================================
 
 @Reasoning
 Read-modify-write operations return the OLD value (fetch_*) and apply the
-operation atomically. Memory ordering currently uses seq_cst at the
-atomic_core layer; the order parameter is recorded for future expansion.
+operation atomically. The order parameter selects the C11 memory ordering for
+the operation.
 @End Reasoning
 
 @Implementation
-Delegate to atomic_core fetch_* operations. Mask the result to the type
-width.
+Normalize the requested ordering to the valid RELAXED..SEQ_CST range, then
+delegate to the atomic_core fetch_* operation and mask the result to the type
+width. On x86_64 (the active target) every atomic RMW is a LOCK-prefixed
+instruction (LOCK XADD, or a LOCK CMPXCHG retry loop) that is an unconditional
+full barrier; it therefore realizes any requested ordering directly, and no
+extra MFENCE is emitted for the weaker orderings (which would be redundant
+under the x86_64 TSO memory model).
 @End Implementation
 
 @Performance_Hints
@@ -338,6 +386,15 @@ Process called "atomic_fetch_add" takes a as Integer, delta as Integer, order as
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: LOCK XADD realizes every ordering RELAXED..SEQ_CST as a full
+    Note: barrier; the normalized order selects no weaker instruction and adds
+    Note: no redundant fence on this target.
     Let raw be proc atomic_fetch_add from Atomic with a, delta
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Return proc atomic_mask_for_type with raw, type_code
@@ -347,6 +404,15 @@ Process called "atomic_fetch_sub" takes a as Integer, delta as Integer, order as
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: NEG + LOCK XADD realizes every ordering as a full barrier; the
+    Note: normalized order selects no weaker instruction and adds no redundant
+    Note: fence on this target.
     Let raw be proc atomic_fetch_sub from Atomic with a, delta
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Return proc atomic_mask_for_type with raw, type_code
@@ -356,6 +422,15 @@ Process called "atomic_fetch_and" takes a as Integer, mask as Integer, order as 
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: the LOCK CMPXCHG retry loop realizes every ordering as a full
+    Note: barrier; the normalized order selects no weaker instruction and adds
+    Note: no redundant fence on this target.
     Let raw be proc atomic_fetch_and from Atomic with a, mask
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Return proc atomic_mask_for_type with raw, type_code
@@ -365,6 +440,15 @@ Process called "atomic_fetch_or" takes a as Integer, mask as Integer, order as I
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: the LOCK CMPXCHG retry loop realizes every ordering as a full
+    Note: barrier; the normalized order selects no weaker instruction and adds
+    Note: no redundant fence on this target.
     Let raw be proc atomic_fetch_or from Atomic with a, mask
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Return proc atomic_mask_for_type with raw, type_code
@@ -374,6 +458,15 @@ Process called "atomic_fetch_xor" takes a as Integer, mask as Integer, order as 
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
+    Note: x86_64: the LOCK CMPXCHG retry loop realizes every ordering as a full
+    Note: barrier; the normalized order selects no weaker instruction and adds
+    Note: no redundant fence on this target.
     Let raw be proc atomic_fetch_xor from Atomic with a, mask
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Return proc atomic_mask_for_type with raw, type_code
@@ -383,8 +476,18 @@ Process called "atomic_exchange" takes a as Integer, value as Integer, order as 
     If a is equal to 0:
         Return 0
     End If
+    If order is less than ORDER_RELAXED:
+        Set order to ORDER_SEQ_CST
+    End If
+    If order is greater than ORDER_SEQ_CST:
+        Set order to ORDER_SEQ_CST
+    End If
     Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
     Let masked be proc atomic_mask_for_type with value, type_code
+    Note: x86_64: XCHG carries an implicit LOCK prefix and is therefore an
+    Note: unconditional full barrier that realizes every ordering RELAXED..SEQ_CST.
+    Note: The normalized order selects no weaker instruction and adds no
+    Note: redundant fence on this target.
     Let raw be proc atomic_exchange from Atomic with a, masked
     Return proc atomic_mask_for_type with raw, type_code
 End Process

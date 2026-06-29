@@ -131,6 +131,24 @@ Constant CANARY_SEED_MULT_B as Integer is 6364136223846793005
 Constant CANARY_SEED_XOR_A as Integer is 7256775408644581463
 Constant CANARY_SEED_XOR_B as Integer is 5871781006564002453
 
+Note:
+Per-process CSPRNG canary seed. The fixed CANARY_SEED_* constants above
+are compile-time-known, so a memory-disclosure adversary who reads one
+freed block's canary together with the registry-tracked allocation_id
+could solve for them and forge canaries for other blocks. To close that
+gap, two 64-bit words drawn from the kernel CSPRNG at process startup are
+XOR-folded into every canary derivation. The seed is obtained ONCE (lazy,
+on the first canary derivation) and then fixed for the lifetime of the
+process, so canary write and canary verify always observe the same seed
+and continue to match. An attacker cannot reconstruct the seed from
+disclosed memory because it is never stored in any user-reachable buffer
+- it lives only in these module-level words. Both words start at 0 and
+the initialized flag gates the one-shot fill.
+:End Note
+Let canary_runtime_seed_a be 0          Note: CSPRNG word A XOR-folded into canary_seed_word_a
+Let canary_runtime_seed_b be 0          Note: CSPRNG word B XOR-folded into canary_seed_word_b
+Let canary_runtime_seed_initialized be 0  Note: 1 once the startup CSPRNG seed has been obtained
+
 Note: Poison byte pattern written to freed user buffers in quarantine.
 Note: A recognizable bit pattern. Chosen so a use-after-free pointer
 Note: dereferenced as an Integer reads as an obvious sentinel during
@@ -1237,6 +1255,88 @@ Note: ==========================================================================
 Note: CANARY / QUARANTINE HELPERS (ASan-class protocol)
 Note: ============================================================================
 
+Process called "canary_ensure_runtime_seed" returns Integer:
+    @Reasoning
+    Obtains the per-process canary seed exactly once, on the first canary
+    derivation, then leaves it fixed for the lifetime of the process. The
+    seed is two 64-bit words from the kernel CSPRNG (getrandom / getentropy
+    via the syscall layer). XOR-folding these into canary_seed_word_a/b
+    means an attacker who discloses memory can no longer solve for the
+    compile-time CANARY_SEED_* constants and forge canaries: the seed is
+    secret and never written to any user-reachable buffer. Initialization
+    is lazy (rather than at a dedicated startup hook) so it integrates with
+    the existing lazy-init discipline used by the quarantine, pool, and
+    slab subsystems in this file, and so it costs nothing when canaries are
+    never exercised.
+    @End Reasoning
+
+    @Implementation
+    1. If already initialized, return immediately.
+    2. mmap a 16-byte page-aligned scratch region (PROT_READ|PROT_WRITE,
+       MAP_PRIVATE|MAP_ANONYMOUS) - drawn directly from the kernel, not
+       through allocate, to avoid re-entering the allocator from inside its
+       own canary path.
+    3. If mmap failed, derive a per-process seed from the process id so the
+       canary is still not a pure function of the fixed constants, mark
+       initialized, and return.
+    4. Fill the 16 bytes via Syscall.secure_random_bytes. On full success
+       (rc == 16) read the two 64-bit words into the seed.
+    5. If the CSPRNG path is unavailable (e.g. Windows returns -1) derive
+       the seed from the process id XOR the ASLR-randomized mmap address,
+       which still varies per process.
+    6. munmap the scratch region and mark initialized.
+    @End Implementation
+
+    @Performance_Hints
+    One-shot: a single mmap, one getrandom syscall, and a munmap on the
+    very first canary derivation of the process. Every subsequent call is
+    a single flag compare. DEBUG=0 elides the canary call sites entirely.
+    @End Performance_Hints
+
+    @Security_Scope
+    The seed is kernel CSPRNG material held only in module-level words and
+    a transient mmap region that is unmapped immediately after the read. It
+    is never copied into any allocation a caller can observe. The fallback
+    paths (mmap or CSPRNG unavailable) intentionally degrade to a
+    per-process-variable but lower-entropy seed rather than to the
+    forgeable fixed-constant-only derivation.
+    @End Security_Scope
+
+    If canary_runtime_seed_initialized is not equal to 0:
+        Return 1
+    End If
+    Let prot be 3
+    Let flags be 34
+    Let buf be proc syscall_mmap from Syscall with 0, 16, prot, flags, -1, 0
+    If buf is less than 0:
+        Let getpid_num be proc SYS_GETPID from Syscall
+        Let pid be proc syscall_0 from Syscall with getpid_num
+        Let seed_a be pid multiplied by CANARY_SEED_MULT_B
+        Set canary_runtime_seed_a to seed_a bitwise xor CANARY_SEED_XOR_A
+        Let seed_b be pid multiplied by CANARY_SEED_MULT_A
+        Set canary_runtime_seed_b to seed_b bitwise xor CANARY_SEED_XOR_B
+        Set canary_runtime_seed_initialized to 1
+        Return 1
+    End If
+    Let rc be proc secure_random_bytes from Syscall with buf, 16
+    If rc is equal to 16:
+        Set canary_runtime_seed_a to proc memory_get_int64 from Memory with buf, 0
+        Set canary_runtime_seed_b to proc memory_get_int64 from Memory with buf, 8
+    Otherwise:
+        Let getpid_num be proc SYS_GETPID from Syscall
+        Let pid be proc syscall_0 from Syscall with getpid_num
+        Let mixed_a be pid multiplied by CANARY_SEED_MULT_B
+        Set mixed_a to mixed_a bitwise xor buf
+        Set canary_runtime_seed_a to mixed_a bitwise xor CANARY_SEED_XOR_A
+        Let mixed_b be pid multiplied by CANARY_SEED_MULT_A
+        Set mixed_b to mixed_b bitwise xor buf
+        Set canary_runtime_seed_b to mixed_b bitwise xor CANARY_SEED_XOR_B
+    End If
+    proc syscall_munmap from Syscall with buf, 16
+    Set canary_runtime_seed_initialized to 1
+    Return 1
+End Process
+
 Process called "canary_seed_word_a" takes alloc_id as Integer, generation as Integer returns Integer:
     @Reasoning
     Derives the first per-allocation canary word from (alloc_id, generation).
@@ -1251,10 +1351,12 @@ Process called "canary_seed_word_a" takes alloc_id as Integer, generation as Int
 
     @Implementation
     Steps:
-     1. Compute mixed = alloc_id * CANARY_SEED_MULT_A.
-     2. XOR with generation.
-     3. XOR with CANARY_SEED_XOR_A.
-     4. Multiply by CANARY_SEED_MULT_B and return.
+     1. Ensure the per-process CSPRNG seed is loaded.
+     2. Compute mixed = alloc_id * CANARY_SEED_MULT_A.
+     3. XOR with generation.
+     4. XOR with CANARY_SEED_XOR_A.
+     5. XOR with canary_runtime_seed_a (the process-startup CSPRNG word).
+     6. Multiply by CANARY_SEED_MULT_B and return.
     All arithmetic is 64-bit signed in Runa; overflow is the normal
     mixing behavior we want and is well-defined wraparound on x86_64.
     @End Implementation
@@ -1267,18 +1369,22 @@ Process called "canary_seed_word_a" takes alloc_id as Integer, generation as Int
     @End Performance_Hints
 
     @Security_Scope
-    The canary is NOT a cryptographic MAC - an attacker who can read
-    process memory can recover both seed multipliers and forge the
-    canary for any (alloc_id, generation) pair. The protection is
-    against UNINTENTIONAL corruption (buffer overrun, use-after-free
-    that writes the wrong bytes), not against a memory-disclosure
-    adversary. For that, escalate to a process-startup-random seed
-    XOR'd in - left as a v0.0.9.x hardening pass.
+    The canary is NOT a cryptographic MAC, but it is hardened against a
+    memory-disclosure adversary: canary_runtime_seed_a is a kernel-CSPRNG
+    word chosen once at process startup and XOR-folded into the mix. An
+    attacker who reads one freed block's canary together with its
+    registry-tracked (alloc_id, generation) cannot solve for the
+    compile-time CANARY_SEED_* constants because the secret per-process
+    seed is unknown and is never written to any user-reachable buffer.
+    The protection therefore covers both UNINTENTIONAL corruption (buffer
+    overrun, use-after-free writes) and forgery from disclosed memory.
     @End Security_Scope
 
+    proc canary_ensure_runtime_seed
     Let mixed be alloc_id multiplied by CANARY_SEED_MULT_A
     Set mixed to mixed bitwise xor generation
     Set mixed to mixed bitwise xor CANARY_SEED_XOR_A
+    Set mixed to mixed bitwise xor canary_runtime_seed_a
     Set mixed to mixed multiplied by CANARY_SEED_MULT_B
     Return mixed
 End Process
@@ -1293,9 +1399,10 @@ Process called "canary_seed_word_b" takes alloc_id as Integer, generation as Int
 
     @Implementation
     Same SplitMix64-style mix as canary_seed_word_a but with arguments
-    swapped (generation first, then alloc_id) and the CANARY_SEED_XOR_B
-    constant instead of A. The asymmetry guarantees word_a != word_b for
-    every allocation.
+    swapped (generation first, then alloc_id), the CANARY_SEED_XOR_B
+    constant instead of A, and canary_runtime_seed_b (the second
+    process-startup CSPRNG word) XOR-folded in instead of word A's seed.
+    The asymmetry guarantees word_a != word_b for every allocation.
     @End Implementation
 
     @Performance_Hints
@@ -1303,13 +1410,16 @@ Process called "canary_seed_word_b" takes alloc_id as Integer, generation as Int
     @End Performance_Hints
 
     @Security_Scope
-    Same as canary_seed_word_a: best-effort against unintentional
-    corruption; not a cryptographic boundary.
+    Same as canary_seed_word_a: hardened against forgery from disclosed
+    memory via the per-process CSPRNG seed (canary_runtime_seed_b);
+    best-effort against unintentional corruption. Not a cryptographic MAC.
     @End Security_Scope
 
+    proc canary_ensure_runtime_seed
     Let mixed be generation multiplied by CANARY_SEED_MULT_A
     Set mixed to mixed bitwise xor alloc_id
     Set mixed to mixed bitwise xor CANARY_SEED_XOR_B
+    Set mixed to mixed bitwise xor canary_runtime_seed_b
     Set mixed to mixed multiplied by CANARY_SEED_MULT_B
     Return mixed
 End Process

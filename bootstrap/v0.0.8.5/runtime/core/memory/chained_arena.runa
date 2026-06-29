@@ -82,7 +82,7 @@ ChainedArena Structure Definitions
 :End Note
 
 Note:
-ChainedArena structure layout (88 bytes, 11 qwords):
+ChainedArena structure layout (112 bytes, 14 qwords):
   Offset  0: memory_block        Pointer to current active block's memory
   Offset  8: current_pos         Bump pointer position within the current block
   Offset 16: size                Logical size of the current block
@@ -94,6 +94,18 @@ ChainedArena structure layout (88 bytes, 11 qwords):
   Offset 64: allocation_count    Lifetime allocation count
   Offset 72: total_allocated     Sum of allocation sizes across all blocks
   Offset 80: peak_usage          High-water mark of total_allocated across lifetime
+  Offset 88: largest_allocation  Maximum single requested size observed (true max)
+  Offset 96: smallest_allocation Minimum single requested size observed (true min)
+  Offset 104: current_allocations Live allocation count since the last reset/clear
+
+Allocation-size extremes (offsets 88/96) and the live count (offset 104) are
+maintained in O(1) by chained_arena_allocate on every successful bump. Because
+ChainedArena has no per-allocation deallocate (lifetime ops are bulk: destroy,
+reset, clear), current_allocations tracks the number of allocations made since
+the last bulk reset and is zeroed alongside allocation_count by create, reset
+and clear. largest_allocation starts at 0 and only ever grows; smallest_allocation
+uses 0 as an "unset" sentinel and is seeded by the first allocation, so the
+extremes reported by chained_arena_get_trace are exact rather than averaged.
 
 The 80-byte offset for peak_usage is new in this migration. Prior to the move
 out of compiler/internal/arena_utils.runa, three readers (peak getter, stats
@@ -131,6 +143,9 @@ Type called "ChainedArena":
     allocation_count as Integer    Note: Number of allocations made
     total_allocated as Integer     Note: Total bytes allocated across all blocks
     peak_usage as Integer          Note: Peak observed usage across lifetime
+    largest_allocation as Integer  Note: Largest single requested allocation size
+    smallest_allocation as Integer Note: Smallest single requested allocation size (0 = unset)
+    current_allocations as Integer Note: Live allocation count since last reset/clear
 End Type
 
 Type called "ArenaBlock":
@@ -176,7 +191,7 @@ Constant ARENA_ALLOCATION_FAILED as Integer is -1
 Constant ARENA_ALLOCATION_OVERFLOW as Integer is -2
 Constant ARENA_ALLOCATION_INVALID as Integer is -3
 
-Constant ARENA_STRUCT_SIZE as Integer is 88
+Constant ARENA_STRUCT_SIZE as Integer is 112
 Constant ARENA_BLOCK_NODE_SIZE as Integer is 32
 
 Note:
@@ -236,7 +251,7 @@ Process called "chained_arena_create" takes initial_size as Integer, alignment a
         Set alignment_to_use to ARENA_ALIGNMENT
     End If
 
-    Note: Allocate ChainedArena structure (88 bytes: 11 qwords)
+    Note: Allocate ChainedArena structure (112 bytes: 14 qwords)
     Let arena_ptr be proc allocate from MemoryLayout with ARENA_STRUCT_SIZE
     If arena_ptr is equal to 0:
         Return 0
@@ -275,6 +290,9 @@ Process called "chained_arena_create" takes initial_size as Integer, alignment a
     Let dummy13 be proc memory_set_integer from MemoryCore with arena_ptr, 64, 0                  Note: allocation_count = 0
     Let dummy14 be proc memory_set_integer from MemoryCore with arena_ptr, 72, 0                  Note: total_allocated = 0
     Let dummy15 be proc memory_set_integer from MemoryCore with arena_ptr, 80, 0                  Note: peak_usage = 0
+    Let dummy16 be proc memory_set_integer from MemoryCore with arena_ptr, 88, 0                  Note: largest_allocation = 0
+    Let dummy17 be proc memory_set_integer from MemoryCore with arena_ptr, 96, 0                  Note: smallest_allocation = 0 (unset sentinel)
+    Let dummy18 be proc memory_set_integer from MemoryCore with arena_ptr, 104, 0                 Note: current_allocations = 0
 
     Return arena_ptr
 End Process
@@ -460,6 +478,11 @@ Process called "chained_arena_reset" takes arena as Integer returns Integer:
     Note: Reset peak usage
     Let dummy9 be proc memory_set_integer from MemoryCore with arena, 80, 0
 
+    Note: Reset allocation-size extremes and live count
+    Let dummy10 be proc memory_set_integer from MemoryCore with arena, 88, 0   Note: largest_allocation = 0
+    Let dummy11 be proc memory_set_integer from MemoryCore with arena, 96, 0   Note: smallest_allocation = 0 (unset)
+    Let dummy12 be proc memory_set_integer from MemoryCore with arena, 104, 0  Note: current_allocations = 0
+
     Return 1
 End Process
 
@@ -534,6 +557,11 @@ Process called "chained_arena_clear" takes arena as Integer returns Integer:
 
     Note: Reset peak usage
     Let dummy8 be proc memory_set_integer from MemoryCore with arena, 80, 0
+
+    Note: Reset allocation-size extremes and live count
+    Let dummy9 be proc memory_set_integer from MemoryCore with arena, 88, 0    Note: largest_allocation = 0
+    Let dummy10 be proc memory_set_integer from MemoryCore with arena, 96, 0   Note: smallest_allocation = 0 (unset)
+    Let dummy11 be proc memory_set_integer from MemoryCore with arena, 104, 0  Note: current_allocations = 0
 
     Return 1
 End Process
@@ -683,6 +711,17 @@ Process called "chained_arena_clone" takes source_arena as Integer returns Integ
     Note: Copy peak usage
     Let peak_usage be proc memory_get_integer from MemoryCore with source_arena, 80
     Let dummy13 be proc memory_set_integer from MemoryCore with new_arena, 80, peak_usage
+
+    Note: Copy allocation-size extremes and live allocation count verbatim so the
+    Note: clone reports the same true min/max/current figures as its source.
+    Let largest_allocation be proc memory_get_integer from MemoryCore with source_arena, 88
+    Let dummy14 be proc memory_set_integer from MemoryCore with new_arena, 88, largest_allocation
+
+    Let smallest_allocation be proc memory_get_integer from MemoryCore with source_arena, 96
+    Let dummy15 be proc memory_set_integer from MemoryCore with new_arena, 96, smallest_allocation
+
+    Let current_allocations be proc memory_get_integer from MemoryCore with source_arena, 104
+    Let dummy16 be proc memory_set_integer from MemoryCore with new_arena, 104, current_allocations
 
     Return new_arena
 End Process
@@ -902,6 +941,34 @@ Process called "chained_arena_allocate" takes arena as Integer, size as Integer,
     Note: maintained because new_total is the freshly stored offset-72
     Note: value and we copy it forward into offset 80 in the same call.
     Let dummy14 be proc memory_set_integer from MemoryCore with arena, 80, new_total
+
+    Note: Track the live allocation count since the last reset/clear. ChainedArena
+    Note: has no per-allocation free, so every successful bump increases the live
+    Note: count by one; it is zeroed together with allocation_count by create,
+    Note: reset and clear.
+    Let current_allocations be proc memory_get_integer from MemoryCore with arena, 104
+    Let new_current be current_allocations plus 1
+    Let dummy15 be proc memory_set_integer from MemoryCore with arena, 104, new_current
+
+    Note: Track the true maximum single requested size. largest_allocation starts
+    Note: at 0 and only grows, so any positive size on the first allocation will
+    Note: set it correctly.
+    Let largest_allocation be proc memory_get_integer from MemoryCore with arena, 88
+    If size is greater than largest_allocation:
+        Let dummy16 be proc memory_set_integer from MemoryCore with arena, 88, size
+    End If
+
+    Note: Track the true minimum single requested size. smallest_allocation uses 0
+    Note: as an "unset" sentinel: the first allocation always seeds it; thereafter
+    Note: it shrinks only when a smaller request arrives.
+    Let smallest_allocation be proc memory_get_integer from MemoryCore with arena, 96
+    If smallest_allocation is equal to 0:
+        Let dummy17 be proc memory_set_integer from MemoryCore with arena, 96, size
+    Otherwise:
+        If size is less than smallest_allocation:
+            Let dummy18 be proc memory_set_integer from MemoryCore with arena, 96, size
+        End If
+    End If
 
     Return alloc_ptr
 End Process
@@ -1478,14 +1545,18 @@ Process called "chained_arena_reset_stats" takes arena as Integer returns Nothin
             1. NULL guard.
             2. Write 0 to offset 64 (allocation_count).
             3. Write 0 to offset 80 (peak_usage).
-            4. Leave structural fields (memory_block, current_pos, size,
+            4. Write 0 to offsets 88/96/104 (largest/smallest/current_allocations)
+               so the allocation-size extremes and live count are per-phase
+               counters that re-seed on the next allocation, consistent with the
+               phase-scoped allocation_count.
+            5. Leave structural fields (memory_block, current_pos, size,
                capacity, alignment, first/current_block, is_active) untouched.
-            5. total_allocated at offset 72 is also left untouched because it
+            6. total_allocated at offset 72 is also left untouched because it
                is a structural-lifetime counter, not a phase counter.
     @End Implementation
 
     @Performance_Hints:
-        O(1). Two memory writes.
+        O(1). Five memory writes.
     @End Performance_Hints
 
     If arena is equal to 0:
@@ -1497,6 +1568,11 @@ Process called "chained_arena_reset_stats" takes arena as Integer returns Nothin
 
     Note: Reset peak usage to 0 (offset 80, the new dedicated peak field)
     Let dummy2 be proc memory_set_integer from MemoryCore with arena, 80, 0
+
+    Note: Reset allocation-size extremes and live count for per-phase counting
+    Let dummy3 be proc memory_set_integer from MemoryCore with arena, 88, 0    Note: largest_allocation = 0
+    Let dummy4 be proc memory_set_integer from MemoryCore with arena, 96, 0    Note: smallest_allocation = 0 (unset)
+    Let dummy5 be proc memory_set_integer from MemoryCore with arena, 104, 0   Note: current_allocations = 0
 
     Note: Structural fields and total_allocated (offset 72) remain intact.
 
@@ -1986,24 +2062,26 @@ End Process
 
 Process called "chained_arena_trace" takes arena as Integer returns Integer:
     @Reasoning:
-        Returns aggregate allocation-history metrics. The bump allocator does
-        not retain per-allocation records, so the trace reports counts and
-        averages rather than per-allocation entries. For a per-allocation
-        trace, instrument the call sites externally.
+        Returns aggregate allocation-history metrics. The arena maintains true
+        per-allocation extremes (largest/smallest single request) and the live
+        allocation count directly in its header, updated in O(1) on every bump
+        by chained_arena_allocate. The trace therefore reports exact min/max and
+        a real live count rather than averaged approximations; the average is
+        still computed as a convenience summary alongside the true extremes.
     @End Reasoning
 
     @Implementation:
         Trace structure layout (48 bytes):
-            offset  0: total_allocations
-            offset  8: total_bytes_allocated (= arena.current_pos as proxy)
-            offset 16: current_allocations  (= total_allocations, no frees)
-            offset 24: largest_allocation   (= average, no per-size tracking)
-            offset 32: smallest_allocation  (= average, no per-size tracking)
-            offset 40: average_allocation_size
+            offset  0: total_allocations    (= arena.allocation_count, offset 64)
+            offset  8: total_bytes_allocated (= arena.total_allocated, offset 72)
+            offset 16: current_allocations  (= arena.current_allocations, offset 104)
+            offset 24: largest_allocation   (= arena.largest_allocation, offset 88)
+            offset 32: smallest_allocation  (= arena.smallest_allocation, offset 96)
+            offset 40: average_allocation_size (total_allocated / allocation_count)
 
-        For bump allocators, individual allocation sizes are not retained,
-        so largest/smallest are reported as the average — explicitly noted
-        as an approximation rather than an exact figure.
+        largest/smallest are the exact extremes recorded across the arena's life
+        (since the last reset/clear). smallest_allocation reads 0 only when no
+        allocation has occurred yet, in which case both extremes are reported as 0.
     @End Implementation
 
     @Performance_Hints:
@@ -2021,27 +2099,30 @@ Process called "chained_arena_trace" takes arena as Integer returns Integer:
         Return 0
     End If
 
-    Note: Get allocation count
+    Note: Get lifetime allocation count
     Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
     Let dummy1 be proc memory_set_integer from MemoryCore with trace_ptr, 0, allocation_count
 
-    Note: Get total bytes allocated (current position is a usable proxy)
-    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
-    Let dummy2 be proc memory_set_integer from MemoryCore with trace_ptr, 8, current_pos
+    Note: Get total bytes requested across all blocks (true sum, offset 72)
+    Let total_allocated be proc memory_get_integer from MemoryCore with arena, 72
+    Let dummy2 be proc memory_set_integer from MemoryCore with trace_ptr, 8, total_allocated
 
-    Note: Current allocations is allocation count (no individual frees in bump allocator)
-    Let dummy3 be proc memory_set_integer from MemoryCore with trace_ptr, 16, allocation_count
+    Note: Live allocation count since the last reset/clear (offset 104)
+    Let current_allocations be proc memory_get_integer from MemoryCore with arena, 104
+    Let dummy3 be proc memory_set_integer from MemoryCore with trace_ptr, 16, current_allocations
 
-    Note: Calculate average allocation size
+    Note: True largest and smallest single requested sizes (offsets 88 and 96)
+    Let largest_allocation be proc memory_get_integer from MemoryCore with arena, 88
+    Let dummy4 be proc memory_set_integer from MemoryCore with trace_ptr, 24, largest_allocation
+
+    Let smallest_allocation be proc memory_get_integer from MemoryCore with arena, 96
+    Let dummy5 be proc memory_set_integer from MemoryCore with trace_ptr, 32, smallest_allocation
+
+    Note: Calculate average allocation size from the true total and count
     Let average_size be 0
     If allocation_count is greater than 0:
-        Set average_size to current_pos divided by allocation_count
+        Set average_size to total_allocated divided by allocation_count
     End If
-
-    Note: For bump allocator, individual allocation sizes are not retained.
-    Note: Report average as the approximation for largest/smallest.
-    Let dummy4 be proc memory_set_integer from MemoryCore with trace_ptr, 24, average_size
-    Let dummy5 be proc memory_set_integer from MemoryCore with trace_ptr, 32, average_size
     Let dummy6 be proc memory_set_integer from MemoryCore with trace_ptr, 40, average_size
 
     Return trace_ptr
