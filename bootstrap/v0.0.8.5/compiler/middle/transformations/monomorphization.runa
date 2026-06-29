@@ -49,6 +49,7 @@ Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
 Import "compiler/middle/transformations/type_instantiation_cache.runa" as Cache
 Import "compiler/middle/transformations/generic_instantiation.runa" as GenericInst
+Import "compiler/internal/time_utils.runa" as Time
 
 Note:
 ========================================
@@ -156,7 +157,7 @@ The 64-byte layout provides:
 - cache_hits (8 bytes): Instantiations reused from cache
 - work_queue_iterations (8 bytes): Number of queue processing loops
 - peak_queue_size (8 bytes): Maximum queue size reached
-- total_instantiation_time (8 bytes): Time spent in instantiation (stub)
+- total_instantiation_time (8 bytes): Elapsed instantiation wall time in nanoseconds, measured with the monotonic runtime clock
 - reserved (24 bytes): Future expansion
 @End Reasoning
 
@@ -438,6 +439,10 @@ Process called "monomorphize_compilation_unit" takes hir as Integer, compilation
     Note: Create monomorphization context
     Let ctx be proc create_monomorphization_context with compilation_unit_id
 
+    Note: Capture the instantiation start timestamp using the monotonic runtime
+    Note: clock so the elapsed-time metric is unaffected by wall-clock adjustments.
+    Let start_time be proc time_now_monotonic from Time with 0
+
     Note: Analyze HIR to discover all generic call sites
     proc discover_generic_call_sites with ctx, hir
 
@@ -446,6 +451,27 @@ Process called "monomorphize_compilation_unit" takes hir as Integer, compilation
 
     Note: Build monomorphized HIR with all instantiated definitions and rewritten call sites
     Let result be proc build_monomorphized_hir with ctx, hir
+
+    Note: Capture the completion timestamp and store the elapsed instantiation
+    Note: time (in nanoseconds) into the context so it surfaces through
+    Note: get_monomorphization_statistics. total_instantiation_time lives in the
+    Note: context's first general-purpose reserved slot at offset 88.
+    Let end_time be proc time_now_monotonic from Time with 0
+    Let elapsed_ns be 0
+    If start_time is not equal to 0:
+        If end_time is not equal to 0:
+            Let start_sec be proc memory_get_int64 from Memory with start_time, 0
+            Let start_nsec be proc memory_get_int64 from Memory with start_time, 8
+            Let end_sec be proc memory_get_int64 from Memory with end_time, 0
+            Let end_nsec be proc memory_get_int64 from Memory with end_time, 8
+            Let sec_delta be end_sec minus start_sec
+            Let nsec_delta be end_nsec minus start_nsec
+            Set elapsed_ns to (sec_delta multiplied by 1000000000) plus nsec_delta
+            proc deallocate from Layout with end_time
+        End If
+        proc deallocate from Layout with start_time
+    End If
+    proc memory_set_int64 from Memory with ctx, 88, elapsed_ns
 
     Note: Destroy context
     proc destroy_monomorphization_context with ctx
@@ -813,12 +839,16 @@ Process called "get_monomorphization_statistics" takes ctx as Integer returns In
     Let hit_count be proc memory_get_int64 from Memory with hit_count_ptr, 0
     Let entry_count be proc memory_get_int64 from Memory with entry_count_ptr, 0
 
+    Note: Read the elapsed instantiation time captured by monomorphize_compilation_unit.
+    Note: It is stored in the context's first general-purpose reserved slot at offset 88.
+    Let total_instantiation_time be proc memory_get_int64 from Memory with ctx, 88
+
     Note: Fill statistics
     proc memory_set_int64 from Memory with stats, 0, entry_count
     proc memory_set_int64 from Memory with stats, 8, hit_count
     proc memory_set_int64 from Memory with stats, 16, 0
     proc memory_set_int64 from Memory with stats, 24, 0
-    proc memory_set_int64 from Memory with stats, 32, 0
+    proc memory_set_int64 from Memory with stats, 32, total_instantiation_time
 
     Note: Zero reserved
     proc memory_set_int64 from Memory with stats, 40, 0
@@ -872,17 +902,22 @@ Process called "build_monomorphized_hir" takes ctx as Integer, original_hir as I
     Let module_count be proc memory_get_int64 from Memory with original_hir, 8
     Let modules_ptr be proc memory_get_int64 from Memory with original_hir, 16
 
-    Note: Get first module (assumption: single module for now)
     If module_count is equal to 0:
         Display "Warning: No modules in HIR during monomorphization"
         Return original_hir
     End If
 
-    Let first_module be proc memory_get_int64 from Memory with modules_ptr, 0
+    Note: Append all instantiated definitions to the root module's function list.
+    Note: Monomorphized definitions are concrete global functions carrying unique
+    Note: mangled names; placing them in a single module ensures each is emitted
+    Note: exactly once and avoids duplicate-symbol hazards. Cross-module call
+    Note: sites bind to these definitions by direct HIR pointer during the rewrite
+    Note: pass below, so physical module placement does not affect call resolution.
+    Let root_module be proc memory_get_int64 from Memory with modules_ptr, 0
 
     Note: Get module's function list (func_count at offset 16, funcs at offset 24)
-    Let func_count be proc memory_get_int64 from Memory with first_module, 16
-    Let funcs_ptr be proc memory_get_int64 from Memory with first_module, 24
+    Let func_count be proc memory_get_int64 from Memory with root_module, 16
+    Let funcs_ptr be proc memory_get_int64 from Memory with root_module, 24
 
     Note: Create new expanded function array (original + instantiated)
     Let new_func_count be func_count plus instantiated_count
@@ -891,7 +926,9 @@ Process called "build_monomorphized_hir" takes ctx as Integer, original_hir as I
 
     Note: Copy original functions to new array
     Let copy_size be func_count multiplied by 8
-    proc memory_copy from Memory with new_funcs, funcs_ptr, copy_size
+    If copy_size is greater than 0:
+        proc memory_copy from Memory with new_funcs, funcs_ptr, copy_size
+    End If
 
     Note: Append instantiated definitions
     Let inst_idx be 0
@@ -902,13 +939,26 @@ Process called "build_monomorphized_hir" takes ctx as Integer, original_hir as I
         Set inst_idx to inst_idx plus 1
     End While
 
-    Note: Update module with new function array
-    proc memory_set_int64 from Memory with first_module, 16, new_func_count
-    proc deallocate from Layout with funcs_ptr
-    proc memory_set_int64 from Memory with first_module, 24, new_funcs
+    Note: Update root module with new function array
+    proc memory_set_int64 from Memory with root_module, 16, new_func_count
+    If funcs_ptr is not equal to 0:
+        proc deallocate from Layout with funcs_ptr
+    End If
+    proc memory_set_int64 from Memory with root_module, 24, new_funcs
 
-    Note: Rewrite all call sites in the HIR to use monomorphized versions
-    proc rewrite_call_sites_in_module with first_module, call_site_map
+    Note: Rewrite call sites across EVERY module so that cross-module generic
+    Note: calls are redirected to their monomorphized instantiations. The call
+    Note: site map is keyed by call-expression pointer and therefore spans all
+    Note: modules of the compilation unit.
+    Let module_idx be 0
+    While module_idx is less than module_count:
+        Let module_ptr_offset be module_idx multiplied by 8
+        Let module be proc memory_get_int64 from Memory with modules_ptr, module_ptr_offset
+        If module is not equal to 0:
+            proc rewrite_call_sites_in_module with module, call_site_map
+        End If
+        Set module_idx to module_idx plus 1
+    End While
 
     Return original_hir
 End Process

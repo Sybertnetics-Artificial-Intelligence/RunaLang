@@ -44,6 +44,8 @@ Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as CallIndirect
+Import "runtime/integration/system_interface/wrappers/environment_manager.runa" as EnvManager
 
 Let ENV_VAR_SIZE be 32
 
@@ -55,30 +57,44 @@ Note: ENV LOOKUP - PROCESS API
 Note: ============================================================================
 
 Note:
-The environment lookup callback is supplied by the host runtime. At
-bootstrap time the v0.0.8.5 compiler does not yet expose a first-class
-getenv-equivalent primitive; the build_runtime environment_manager
-object file exports the symbol. This module declares the API surface
-and a registration hook so the runtime layer can wire the implementation
-without circular imports.
+Environment lookups resolve through two layers, in priority order:
 
-Until the runtime registration is complete, env_lookup_default returns
-ENV_ERR_NOT_FOUND. This is the same fallback path callers exercise for
-genuinely-absent variables, so production code that only consults
-env_get_string_or always gets a usable result.
+  1. A host-registered callback (env_register_callback). When the host
+     runtime installs a callback its function pointer is invoked through
+     the assembly indirect-call intrinsic (call_indirect_1). The callback
+     receives the variable name and returns either 0 (absent) or a
+     pointer that aliases the runtime's environment storage. This lets a
+     specialized runtime override how the environment is read (e.g. a
+     sandbox with a synthetic environment) without recompiling this
+     module.
 
-The registered_callback field is a process-singleton pointer (kept as
-an Integer for now since first-class function values do not yet exist
-in v0.0.8.5).
+  2. The process environment manager (environment_manager.getenv). When
+     no callback is registered, the lookup reads the live process
+     `char** environ` block captured at startup by
+     runtime_set_environment. The returned pointer aliases that block.
+
+Both layers return a BORROWED pointer (caller must not free); the typed
+readers below duplicate it when they need an owned copy. A return of 0
+from either layer is mapped to ENV_ERR_NOT_FOUND so the typed readers
+fall through to their default-value paths. When the process environment
+has not been captured (e.g. the lightweight frontend substrate runs
+without a startup hook), getenv yields 0 and the readers see a clean
+"absent" result rather than an error.
+
+The registered_callback field is a process-singleton pointer (an Integer
+holding the callback's code address, since first-class function values
+are not yet a distinct type in v0.0.8.5).
 :End Note
 
 Let registered_callback be 0
 
 @Reasoning
 Register a runtime-provided env_lookup callback. The callback takes a
-String name and returns either 0 (not found) or a String pointer the
-caller owns. Stored as a singleton so subsequent env_get_* calls
-dispatch through it.
+String name and returns either 0 (not found) or a borrowed String
+pointer that aliases the runtime's environment storage (the caller must
+NOT free it; the typed readers duplicate it when an owned copy is
+required). Stored as a singleton so subsequent env_get_* calls dispatch
+through it ahead of the direct process-environment fallback.
 @End Reasoning
 
 @Implementation
@@ -99,30 +115,50 @@ Process called "env_register_callback" takes callback as Integer returns Integer
 End Process
 
 @Reasoning
-Default env-lookup used until the runtime callback is registered.
-Returns ENV_ERR_NOT_FOUND for every name so callers exercise the
-default-fallback paths.
+Resolve a variable name to a borrowed value pointer. A registered host
+callback takes priority; absent one, the live process environment is
+read directly. A null name is a programming error and returns
+ENV_ERR_NULL_NAME. An absent variable returns ENV_ERR_NOT_FOUND so the
+typed readers take their default-value branch.
 @End Reasoning
 
 @Implementation
-Indirect function calls are not yet first-class in the v0.0.8.5
-bootstrap compiler. The registration mechanism exists so future
-compiler versions can wire indirect dispatch here. Until then this
-routine returns ENV_ERR_NOT_FOUND.
+If a callback is registered, invoke it through the assembly indirect-call
+intrinsic (call_indirect_1), passing the name; the callback returns 0
+for absent or a borrowed pointer otherwise. With no callback, delegate to
+environment_manager.getenv, which scans the captured `char** environ`
+block and returns a pointer into it (or 0). In both cases a 0 result is
+normalized to ENV_ERR_NOT_FOUND; a non-zero result is the borrowed value
+pointer returned verbatim.
 @End Implementation
 
 @Performance_Hints
-Time: O(1). Space: O(1).
+Time: O(1) plus the callback / getenv cost (getenv is O(N) over the
+environ array). Space: O(1).
 @End Performance_Hints
 
 @Security_Scope
-Returns a sentinel that maps to the safe "not found" path.
+Returns a borrowed pointer aliasing untrusted environment storage; the
+caller must not free it and must validate the bytes before use in
+security-sensitive contexts. Absent variables map to the safe
+"not found" sentinel.
 @End Security_Scope
 Process called "env_lookup_raw" takes name as Integer returns Integer:
     If name is equal to 0:
         Return ENV_ERR_NULL_NAME
     End If
-    Return ENV_ERR_NOT_FOUND
+    If registered_callback is not equal to 0:
+        Let cb_result be proc call_indirect_1 from CallIndirect with registered_callback, name
+        If cb_result is equal to 0:
+            Return ENV_ERR_NOT_FOUND
+        End If
+        Return cb_result
+    End If
+    Let direct be proc getenv from EnvManager with name
+    If direct is equal to 0:
+        Return ENV_ERR_NOT_FOUND
+    End If
+    Return direct
 End Process
 
 Note: ============================================================================

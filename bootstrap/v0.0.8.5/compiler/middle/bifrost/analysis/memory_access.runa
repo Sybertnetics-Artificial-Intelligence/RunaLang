@@ -9,6 +9,7 @@ Note: ================================================================
 Import "compiler/middle/bifrost/graph/graph.runa" as Graph
 Import "compiler/middle/bifrost/graph/node.runa" as Node
 Import "compiler/middle/bifrost/graph/edge.runa" as Edge
+Import "compiler/middle/bifrost/analysis/parallelism.runa" as Parallelism
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/core/string_core.runa" as String
@@ -453,8 +454,16 @@ Process called "compute_cache_locality" that takes graph as Integer, memory_ops 
     While i is less than op_count:
         Let mem_op be proc get from List with memory_ops, i
 
-        Note: Get accessed address (simplified - use node pointer as proxy)
-        Let address be mem_op
+        Note: Recover the real access address from the address-computation
+        Note: operands (base buffer + compile-time element offset) instead of
+        Note: the node pointer, so accesses to the same region are bucketed
+        Note: together and reuse / cache-line sharing become observable.
+        Let op_output_type be proc get_node_output_type from Node with mem_op
+        Let op_element_size be proc get_type_size_bytes from Node with op_output_type
+        If op_element_size is less than or equal to 0:
+            Set op_element_size to 1
+        End If
+        Let address be recover_symbolic_address(mem_op, op_element_size)
 
         Note: Track unique addresses for working set
         proc set from Dict with unique_addresses, address, 1
@@ -787,16 +796,40 @@ Process called "infer_memory_space" that takes graph as Integer, node as Integer
         End If
     End If
 
-    Note: Check for sharing opportunity (high reuse, fits in shared mem)
+    Note: Decide SHARED from the temporal-locality / reuse-distance model.
+    Note: Data is only worth promoting to the on-chip scratchpad when the
+    Note: memory operations that consume it exhibit genuine reuse and the
+    Note: working set fits on chip - exactly the predicate computed by
+    Note: detect_shared_memory_opportunity over the consuming accesses.
     Let shared_mem_limit be 49152
     If type_size is less than shared_mem_limit:
-        Note: Would need full reuse analysis here
-        Note: Simplified: check if used by multiple nodes
-        Let users be proc get_node_successors from Graph with graph, node
-        Let user_count be proc length from List with users
+        Let successors be proc get_node_successors from Graph with graph, node
+        Let succ_count be proc length from List with successors
 
-        If user_count is greater than 3:
-            Return MEMORY_SHARED
+        Note: Collect the consumers that are memory operations (Load=40/Store=41);
+        Note: these form the access stream against this datum.
+        Let consumer_mem_ops be proc create from List
+        Let s be 0
+        While s is less than succ_count:
+            Let succ be proc get from List with successors, s
+            Let succ_op be proc get_node_opkind from Node with succ
+            If succ_op is equal to 40:
+                proc append from List with consumer_mem_ops, succ
+            End If
+            If succ_op is equal to 41:
+                proc append from List with consumer_mem_ops, succ
+            End If
+            Set s to s plus 1
+        End While
+
+        Note: Drive the SHARED decision from the reuse-distance / temporal
+        Note: locality analysis already implemented in this module.
+        Let consumer_count be proc length from List with consumer_mem_ops
+        If consumer_count is greater than 0:
+            Let shared_beneficial be detect_shared_memory_opportunity(graph, consumer_mem_ops)
+            If shared_beneficial is equal to true:
+                Return MEMORY_SHARED
+            End If
         End If
     End If
 
@@ -1134,6 +1167,109 @@ Process called "has_indirect_addressing" that takes graph as Integer, address_no
     End If
 
     Return false
+End Process
+
+@Reasoning:
+Recovers a stable compile-time symbolic address for a memory operation so
+locality analysis can bucket accesses by the memory region they touch rather
+than by the always-unique node pointer. Two memory ops that index the same
+base buffer resolve to the same base identity, and any compile-time-constant
+element offset is folded into a byte displacement, so repeated accesses to the
+same buffer/offset register as temporal reuse and accesses that fall within a
+cache line register as spatial reuse. Runtime-varying induction indices
+contribute no displacement (they address the region base), and irregular or
+indirect (gather/scatter) address chains fall back to the address node's own
+identity so they correctly register as having no exploitable locality.
+@End Reasoning
+
+@Implementation:
+1. inputs[0] of the memory op is the address operand edge; its source is the
+   address-computation node. With no inputs, fall back to the op identity.
+2. Constant address node (type 0): return its literal value (offset 8).
+3. Input base (type 1): return the node identity (one buffer = one base).
+4. Add (OpKind 0): base identity from the left operand (Constant literal value
+   or the operand node itself) plus a byte displacement from the right operand
+   when it is a compile-time Constant element index (value * element_size); a
+   Multiply(const, index) or any other runtime form contributes zero
+   displacement (region base).
+5. Multiply (OpKind 2): pure scaled index over the region base, displacement
+   zero -> return 0.
+6. Any other form: return the address node identity (no locality).
+@End Implementation
+
+@Performance_Hints:
+O(1) - examines at most two levels of the address-computation DAG.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of node descriptors and edges. No mutation, no I/O.
+@End Security_Scope
+
+Process called "recover_symbolic_address" that takes mem_op as Integer, element_size as Integer returns Integer:
+    If mem_op is equal to 0:
+        Return 0
+    End If
+
+    Let mem_inputs be proc get_node_inputs from Node with mem_op
+    If proc length from List with mem_inputs is equal to 0:
+        Return mem_op
+    End If
+
+    Let addr_edge be proc get from List with mem_inputs, 0
+    Let address_node be proc get_edge_source from Edge with addr_edge
+    If address_node is equal to 0:
+        Return mem_op
+    End If
+
+    Let node_type be proc get_node_type from Node with address_node
+
+    Note: Constant address node: its literal value IS the access address.
+    If node_type is equal to 0:
+        Let const_addr be proc memory_get_int64 from Layout with address_node, 8
+        Return const_addr
+    End If
+
+    Note: Input base pointer: the node identity is the buffer base.
+    If node_type is equal to 1:
+        Return address_node
+    End If
+
+    Let op_kind be proc get_node_opkind from Node with address_node
+    Let addr_inputs be proc get_node_inputs from Node with address_node
+    Let in_count be proc length from List with addr_inputs
+
+    Note: Add(base, offset): base buffer identity plus a constant displacement.
+    If op_kind is equal to 0:
+        If in_count is greater than or equal to 2:
+            Let base_edge be proc get from List with addr_inputs, 0
+            Let base_src be proc get_edge_source from Edge with base_edge
+
+            Let base_identity be base_src
+            Let base_type be proc get_node_type from Node with base_src
+            If base_type is equal to 0:
+                Set base_identity to proc memory_get_int64 from Layout with base_src, 8
+            End If
+
+            Let displacement be 0
+            Let right_edge be proc get from List with addr_inputs, 1
+            Let right_src be proc get_edge_source from Edge with right_edge
+            Let right_type be proc get_node_type from Node with right_src
+            If right_type is equal to 0:
+                Let index_value be proc memory_get_int64 from Layout with right_src, 8
+                Set displacement to index_value multiplied by element_size
+            End If
+
+            Return base_identity plus displacement
+        End If
+    End If
+
+    Note: Multiply(const, index): pure scaled index over the region base.
+    If op_kind is equal to 2:
+        Return 0
+    End If
+
+    Note: Irregular / indirect address: no exploitable locality.
+    Return address_node
 End Process
 
 @Reasoning:
@@ -1512,12 +1648,54 @@ Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
 End Process
 
 Process called "estimate_execution_time" that takes nodes as Integer returns Integer:
-    Note: Simplified execution time estimation
-    Note: Assume 1ms per node
-    Let node_count be proc length from List with nodes
-    Let time_ms be node_count multiplied by 1
+    @Reasoning
+    Estimates kernel execution time from a per-operation cost model rather
+    than a flat one-unit-per-node count. Each node contributes a cycle weight
+    reflecting its computational class (scalar arithmetic ~1 cycle, vector ~10,
+    matrix/convolution/FFT in the hundreds, memory ops dominated by latency).
+    The accumulated issue cycles are converted to a time estimate through a
+    device throughput factor (sustained parallel issue width), so callers such
+    as bandwidth estimation and scheduling heuristics see a cost proportional
+    to the real work the graph performs instead of a constant per-node figure.
+    The cost weights are sourced from the shared parallelism cost model
+    (estimate_node_cost) so the two analyses stay consistent.
+    @End Reasoning
 
-    Return time_ms
+    @Implementation
+    1. Sum estimate_node_cost over every node, yielding total issue cycles.
+    2. Divide by THROUGHPUT_OPS_PER_TICK (the device's sustained parallel
+       issue width) to model concurrent execution, giving the time estimate.
+       Integer division is used because stage1 Float arithmetic is broken.
+    3. Return the estimate; callers that use it as a divisor floor it at 1.
+    @End Implementation
+
+    @Performance_Hints
+    O(N) over the node list; estimate_node_cost is O(1) per node.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on the caller-provided node list. No I/O, no mutation.
+    @End Security_Scope
+
+    Let node_count be proc length from List with nodes
+
+    Note: Accumulate issue cycles from the per-operation cost model.
+    Let total_cycles be 0
+    Let i be 0
+    While i is less than node_count:
+        Let node be proc get from List with nodes, i
+        Let node_cost be proc estimate_node_cost from Parallelism with node
+        Set total_cycles to total_cycles plus node_cost
+        Set i to i plus 1
+    End While
+
+    Note: Convert issue cycles to a time estimate via the device throughput
+    Note: factor: a warp-width of lanes issue concurrently, so effective time
+    Note: scales with total_cycles / sustained-parallel-issue-width.
+    Let throughput_ops_per_tick be 32
+    Let time_estimate be total_cycles divided by throughput_ops_per_tick
+
+    Return time_estimate
 End Process
 
 Process called "is_power_of_two" that takes n as Integer returns Boolean:
@@ -1525,41 +1703,14 @@ Process called "is_power_of_two" that takes n as Integer returns Boolean:
         Return false
     End If
 
-    Note: Check if n is power of 2 using bitwise trick: n bitwise and (n-1) == 0
+    Note: A positive integer is a power of two iff clearing its lowest set bit
+    Note: yields zero. n bitwise_and (n - 1) removes exactly that lowest set
+    Note: bit, so the result is 0 only for 1, 2, 4, 8, ... and nonzero for any
+    Note: value with two or more set bits. This holds for all magnitudes, not
+    Note: just an enumerated range.
     Let n_minus_1 be n minus 1
-    Let bitwise_and be n modulo by 2
-    If bitwise_and is equal to 0:
-        If n_minus_1 modulo by 2 is not equal to 0:
-            Return true
-        End If
-    End If
-
-    Note: Simplified check for common powers of 2
-    If n is equal to 1:
-        Return true
-    End If
-    If n is equal to 2:
-        Return true
-    End If
-    If n is equal to 4:
-        Return true
-    End If
-    If n is equal to 8:
-        Return true
-    End If
-    If n is equal to 16:
-        Return true
-    End If
-    If n is equal to 32:
-        Return true
-    End If
-    If n is equal to 64:
-        Return true
-    End If
-    If n is equal to 128:
-        Return true
-    End If
-    If n is equal to 256:
+    Let cleared be n bitwise_and n_minus_1
+    If cleared is equal to 0:
         Return true
     End If
 

@@ -79,6 +79,7 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
 Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/text/codepoint.runa" as CodePoint
 
 Note: ============================================================================
 Note: TAG CONSTANTS
@@ -145,6 +146,17 @@ Constant ASCII_BACKSLASH as Integer is 92
 Constant ASCII_COMMA as Integer is 44
 Constant ASCII_UNDERSCORE as Integer is 95
 Constant ASCII_DASH as Integer is 45
+Constant ASCII_CR as Integer is 13
+Constant ASCII_FORMFEED as Integer is 12
+
+Note: Maximum hex digits consumed by a CSS hexadecimal escape (CSS Syntax
+Note: Level 3, "consume an escaped code point").
+Constant CSS_ESCAPE_MAX_HEX_DIGITS as Integer is 6
+
+Note: U+FFFD REPLACEMENT CHARACTER - substituted for a hex escape that names
+Note: U+0000, a surrogate, or a code point above U+10FFFF, per CSS Syntax
+Note: Level 3.
+Constant UNICODE_REPLACEMENT as Integer is 65533
 
 Note: ============================================================================
 Note: RECORD ALLOCATION
@@ -839,18 +851,44 @@ End Process
 @Reasoning
 Read a quoted string literal (single or double quoted).  Returns the
 offset just past the closing quote and writes the duplicated body string
-into the slot pointed at by out_string_slot.  Backslash escapes pass
-through verbatim for now (full CSS escape unescaping is out of scope).
+into the slot pointed at by out_string_slot.  Backslash escapes are
+unescaped per the CSS Syntax Level 3 "consume an escaped code point"
+algorithm (https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point)
+while the body is materialized:
+
+  - "\" followed by one to six hexadecimal digits names a Unicode code
+    point.  After the hex digits a single optional whitespace byte
+    (space, tab, newline, form feed, carriage return) is consumed as the
+    escape terminator.  The code point is encoded to UTF-8 in the result.
+    A hex value of U+0000, a surrogate (U+D800..U+DFFF), or a value above
+    U+10FFFF is replaced with U+FFFD per the CSS algorithm.
+
+  - "\" followed by a newline / carriage return / form feed inside a
+    string literal is a line continuation: both the backslash and the
+    line terminator are removed (CSS Syntax Level 3 "consume a string
+    token").
+
+  - "\" followed by any other character emits that character verbatim
+    (this covers escaped quotes, backslashes, and metacharacters).
+
 Returns -1 on unterminated literal.
 @End Reasoning
 @Implementation
-Walk to matching quote, allocate substring body.
+Walk byte-by-byte from just past the opening quote, appending decoded
+bytes into a StringBuilder.  Hex escapes are decoded to a code point and
+encoded to UTF-8 via codepoint_to_utf8_bytes (which validates surrogate
+and range, returning -1 so the replacement character can be substituted).
+On the closing quote the builder is materialized to an owned string and
+destroyed.
 @End Implementation
 @Performance_Hints
-O(string length).
+O(string length); one StringBuilder allocation plus a 4-byte UTF-8 scratch
+per hex escape.
 @End Performance_Hints
 @Security_Scope
-None.
+The decoded body is untrusted attribute/selector text; the UTF-8 encoder
+rejects surrogates and out-of-range code points so no overlong or invalid
+sequences are produced.
 @End Security_Scope
 Process called "sel_read_string" takes text as Integer, pos as Integer, len as Integer, out_string_slot as Integer returns Integer:
     If pos is greater than or equal to len:
@@ -862,22 +900,126 @@ Process called "sel_read_string" takes text as Integer, pos as Integer, len as I
             Return -1
         End If
     End If
-    Let start be pos plus 1
-    Let p be start
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return -1
+    End If
+    Let p be pos plus 1
     While p is less than len:
         Let b be proc string_char_at from StringCore with text, p
-        If b is equal to ASCII_BACKSLASH:
-            Set p to p plus 2
+        If b is equal to quote:
+            Let body be proc stringbuilder_to_string from SB with sb
+            proc stringbuilder_destroy from SB with sb
+            proc memory_set_int64 from Memory with out_string_slot, 0, body
+            Return p plus 1
         End If
-        If b is not equal to ASCII_BACKSLASH:
-            If b is equal to quote:
-                Let body be proc string_substring from StringPrim with text, start, p minus start
-                proc memory_set_int64 from Memory with out_string_slot, 0, body
-                Return p plus 1
+        If b is equal to ASCII_BACKSLASH:
+            Set p to p plus 1
+            If p is greater than or equal to len:
+                Note: Trailing backslash with no following byte: the literal
+                Note: is unterminated (the closing quote was never reached).
+                proc stringbuilder_destroy from SB with sb
+                Return -1
             End If
+            Let e be proc string_char_at from StringCore with text, p
+            Let is_hex be proc is_hex_digit from Char with e
+            If is_hex is equal to 1:
+                Note: Consume up to six hexadecimal digits into a code point.
+                Let code be 0
+                Let hex_count be 0
+                Let consuming be 1
+                While consuming is equal to 1:
+                    If p is greater than or equal to len:
+                        Set consuming to 0
+                    Otherwise:
+                        Let hc be proc string_char_at from StringCore with text, p
+                        Let hok be proc is_hex_digit from Char with hc
+                        If hok is equal to 0:
+                            Set consuming to 0
+                        Otherwise:
+                            If hex_count is greater than or equal to CSS_ESCAPE_MAX_HEX_DIGITS:
+                                Set consuming to 0
+                            Otherwise:
+                                Let hv be proc hex_digit_value from Char with hc
+                                Set code to code multiplied by 16
+                                Set code to code plus hv
+                                Set hex_count to hex_count plus 1
+                                Set p to p plus 1
+                            End If
+                        End If
+                    End If
+                End While
+                Note: A single trailing whitespace byte terminates the escape
+                Note: and is consumed (CSS Syntax Level 3).
+                If p is less than len:
+                    Let ws be proc string_char_at from StringCore with text, p
+                    Let is_term be 0
+                    If ws is equal to ASCII_SPACE:
+                        Set is_term to 1
+                    End If
+                    If ws is equal to ASCII_TAB:
+                        Set is_term to 1
+                    End If
+                    If ws is equal to ASCII_NEWLINE:
+                        Set is_term to 1
+                    End If
+                    If ws is equal to ASCII_CR:
+                        Set is_term to 1
+                    End If
+                    If ws is equal to ASCII_FORMFEED:
+                        Set is_term to 1
+                    End If
+                    If is_term is equal to 1:
+                        Set p to p plus 1
+                    End If
+                End If
+                Note: U+0000 and out-of-range / surrogate values become U+FFFD.
+                Let target_cp be code
+                If target_cp is equal to 0:
+                    Set target_cp to UNICODE_REPLACEMENT
+                End If
+                Let scratch be proc allocate from Layout with 4
+                If scratch is equal to 0:
+                    proc stringbuilder_destroy from SB with sb
+                    Return -1
+                End If
+                Let nbytes be proc codepoint_to_utf8_bytes from CodePoint with target_cp, scratch, 0
+                If nbytes is less than 0:
+                    Set nbytes to proc codepoint_to_utf8_bytes from CodePoint with UNICODE_REPLACEMENT, scratch, 0
+                End If
+                Let k be 0
+                While k is less than nbytes:
+                    Let eb be proc memory_get_byte from Memory with scratch, k
+                    proc stringbuilder_append_char from SB with sb, eb
+                    Set k to k plus 1
+                End While
+                proc deallocate from Layout with scratch
+            Otherwise:
+                If e is equal to ASCII_NEWLINE:
+                    Note: Line continuation: backslash + newline emits nothing.
+                    Set p to p plus 1
+                Otherwise:
+                    If e is equal to ASCII_CR:
+                        Note: Line continuation: backslash + carriage return.
+                        Set p to p plus 1
+                    Otherwise:
+                        If e is equal to ASCII_FORMFEED:
+                            Note: Line continuation: backslash + form feed.
+                            Set p to p plus 1
+                        Otherwise:
+                            Note: Any other escaped byte is emitted verbatim.
+                            proc stringbuilder_append_char from SB with sb, e
+                            Set p to p plus 1
+                        End If
+                    End If
+                End If
+            End If
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, b
             Set p to p plus 1
         End If
     End While
+    proc stringbuilder_destroy from SB with sb
     Return -1
 End Process
 
