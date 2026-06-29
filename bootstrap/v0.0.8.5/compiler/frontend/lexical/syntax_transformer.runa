@@ -1322,71 +1322,6 @@ Process called "transform_compound_assignment" takes identifier_token as Integer
     Return 0
 End Process
 
-Process called "transform_function_call" takes identifier_token as Integer, left_paren_token as Integer, token_stream as Integer, paren_index as Integer, output_list as Integer returns Integer:
-    Note:
-    Transform function call from Developer to Canonical form.
-
-    Developer: func(arg1, arg2)
-    Canonical: proc func with arg1, arg2
-
-    Developer: func()
-    Canonical: proc func
-
-    Parameters:
-      identifier_token - The function name
-      left_paren_token - The ( token
-      token_stream - Full token stream for lookahead
-      paren_index - Index of ( in token_stream
-      output_list - List to append Canonical tokens to
-
-    Returns:
-      Number of tokens consumed from token_stream (including closing ))
-      Returns 0 on error
-    :End Note
-
-    Note: Extract line and column
-    Let line be proc memory_get_int64 from Layout with left_paren_token, 16
-    Let column be proc memory_get_int64 from Layout with left_paren_token, 24
-
-    Note: Collect argument tokens
-    Let args be proc collect_tokens_until with token_stream, paren_index plus 1, TOKEN_RIGHT_PAREN
-
-    If args is equal to 0:
-        Note: Unmatched parentheses
-        Return 0
-    End If
-
-    Note: Create "proc" keyword token
-    Let proc_str be proc create_from_literal from StringCore with "proc"
-    Let proc_token be proc create_keyword_token with TOKEN_PROC, proc_str, line, column
-
-    Note: Emit: proc function_name
-    Let dummy1 be proc append from List with output_list, proc_token
-    Let dummy2 be proc append from List with output_list, identifier_token
-
-    Note: Check if there are arguments
-    Let arg_count be proc size from List with args
-
-    If arg_count is greater than 0:
-        Note: Emit: with arguments
-        Let with_str be proc create_from_literal from StringCore with "with"
-        Let with_token be proc create_keyword_token with TOKEN_WITH, with_str, line, column plus 5
-
-        Let dummy3 be proc append from List with output_list, with_token
-
-        Note: Append all argument tokens
-        Let i be 0
-        While i is less than arg_count:
-            Let arg_token be proc get from List with args, i
-            Let dummy4 be proc append from List with output_list, arg_token
-            Set i to i plus 1
-        End While
-    End If
-
-    Note: Return tokens consumed: ( + args + )
-    Return arg_count plus 2
-End Process
-
 Process called "transform_method_call" takes object_token as Integer, dot_token as Integer, method_token as Integer, left_paren_token as Integer, token_stream as Integer, paren_index as Integer, output_list as Integer returns Integer:
     Note:
     Transform method call from Developer to Canonical form.
@@ -1883,44 +1818,65 @@ Process called "transform_token_stream" takes input_stream as Integer returns In
             End If
         End If
 
+        Note:
+        Pattern 5b: Parenthesised function call `func(args)`.
+        .
+        Inject the canonical `proc` call introducer BEFORE the function-name
+        identifier, but KEEP the `(` argument-list parentheses in place (do NOT
+        rewrite to the `proc func with args` form). Emitting `proc func ( args )`
+        serves both consumers:
+          - the statement parser recognises a bare call statement by its leading
+            `proc`/`Call` introducer (parse_single_statement routes TOKEN_PROC to
+            parse_proc_call_expression), so a discard-result statement such as
+            `print_string(x)` still parses; and
+          - the expression parser routes a primary TOKEN_PROC to the same
+            parse_proc_call_expression.
+        Crucially, preserving the parens keeps the closing `)` boundary, so
+        parse_proc_call_expression parses the paren argument list at FULL
+        precedence (via parse_argument_list) and stops it at the real `)`. A
+        comparison written INSIDE the parens therefore binds inside the argument,
+        and a comparison written AFTER the `)` binds at the enclosing level —
+        matching the monolith oracle's direct-call semantics.
+        .
+        The earlier `proc func with <args>` rewrite DISCARDED the `)` and parsed
+        the arguments at PRECEDENCE_WITH_ARGUMENT_LEVEL (the floor that lets the
+        canonical `proc f with x, y is equal to 1` statement form bind the
+        comparison OUTSIDE the call). For a paren call that floor truncated an
+        inside-paren comparison and leaked it to the enclosing expression —
+        e.g. `taker(0, inner(2) is less than 5)` mis-parsed as
+        `(taker(0, inner(2))) is less than 5`. Keeping the parens removes that
+        ambiguity entirely. The canonical `with`-form (`proc f with ...`,
+        `f with ...`) is never produced by this branch and is completely
+        unaffected, so its with-argument precedence is preserved.
+        .
+        After emitting `proc func`, the `(` falls through to the keep-as-is
+        emission below and the loop continues into the argument tokens, so any
+        nested list/dict literal, index, or nested call inside the arguments is
+        still transformed.
+        :End Note
         If token_type is equal to TOKEN_LEFT_PAREN:
-            Note: Function call: func(args) or grouping: (expr)
-            Note: Disambiguate based on previous token
             Let is_function_call be 0
-
             If i is greater than 0:
                 Set prev_token to proc get from List with input_stream, i minus 1
                 Set prev_type to proc memory_get_int64 from Layout with prev_token, 0
-
                 If prev_type is equal to TOKEN_IDENTIFIER:
                     Set is_function_call to 1
                 End If
             End If
-
             If is_function_call is equal to 1:
-                Let func_token be proc get from List with input_stream, i minus 1
                 Note: The function-name identifier (input index i-1) was already
-                Note: appended to output_stream by the previous iteration's
-                Note: keep-as-is branch. transform_function_call re-emits it as the
-                Note: callee of the canonical `proc <name> [with args]` form, so the
-                Note: stale copy must be removed first; otherwise the output carries
-                Note: `<name> proc <name>` — a duplicate identifier that strands the
-                Note: enclosing statement (the `proc <name>` call dangles, the parser
-                Note: over-consumes past it, and the whole enclosing Process is
-                Note: dropped from the AST). Pop the already-emitted identifier so the
-                Note: transform owns the single canonical emission.
+                Note: appended to output_stream by the previous keep-as-is
+                Note: iteration. Pop it, emit `proc`, then re-emit the name. The
+                Note: `(`, argument tokens, and `)` are left untouched and flow
+                Note: through the loop verbatim (and are themselves transformed).
+                Let func_token be proc get from List with input_stream, i minus 1
                 proc remove_last from List with output_stream
-                Set consumed to proc transform_function_call with func_token, current_token, input_stream, i, output_stream
-
-                If consumed is greater than 0:
-                    Set i to i plus consumed
-                    Continue
-                Otherwise:
-                    Note: Transform declined (unmatched parens): restore the popped
-                    Note: identifier so it is not lost, then let the default keep-as-is
-                    Note: branch handle the '(' token unchanged.
-                    proc append from List with output_stream, func_token
-                End If
+                Let pc_proc_str be proc create_from_literal from StringCore with "proc"
+                Let pc_line be proc memory_get_int64 from Layout with func_token, 16
+                Let pc_col be proc memory_get_int64 from Layout with func_token, 24
+                Let pc_proc_token be proc create_keyword_token with TOKEN_PROC, pc_proc_str, pc_line, pc_col
+                proc append from List with output_stream, pc_proc_token
+                proc append from List with output_stream, func_token
             End If
         End If
 
