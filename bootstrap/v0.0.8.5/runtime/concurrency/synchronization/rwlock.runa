@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,389 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles reader-writer lock implementation and reader-writer lock management for the Runa runtime concurrency system.
+Runtime reader-writer lock API — the public shared/exclusive synchronization
+object for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process reader-writer lock implementation and reader-writer lock management
-- Handle read lock and write lock operations
-- Manage reader-writer coordination and reader-writer synchronization
-- Process reader-writer error handling and reader-writer feedback
+This is the runtime-facing object layer. The actual locking mechanism is the
+completed cross-platform synchronization facade (sync_core), which itself
+delegates to the per-architecture OS rwlock / futex primitives. This module
+does NOT re-implement locking; it wraps the sync_core rwlock handle in a
+runtime RuntimeRwLock object and adds the semantics a runtime contract requires
+that the raw facade does not provide:
 
-This file is essential because of the following reasons:
-- rwlock enables comprehensive reader-writer lock implementation and reader-writer lock management
-- Proper reader-writer lock handling ensures correct reader-writer synchronization and user experience
-- rwlock support enables Runa compilation for reader-writer lock-based workflows
+  - SHARED VS EXCLUSIVE ACCESS: many readers may hold the lock concurrently
+    (read acquire) while a writer requires exclusive ownership (write acquire).
+    The facade enforces the actual reader/writer arbitration; this layer
+    exposes it through a single, documented status contract.
+  - POISONING: a holder that detects an unrecoverable error in the data it is
+    protecting marks the lock poisoned. Subsequent acquirers (readers or
+    writers) still obtain the lock — access is still needed to inspect or
+    repair the data — but are told RWLOCK_ERR_POISONED so they can decide
+    whether to recover or abort. This mirrors the poison model used by mature
+    systems runtimes and is the standard way to surface "a previous critical
+    section left this state inconsistent" without unwinding.
+  - STANDARDIZED STATUS CODES: every entry point returns an RWLOCK_* status so
+    callers branch on a single, documented contract rather than the facade's
+    raw 1/0 platform results.
 
-This file consists of the following functions/features/operation types:
-- Reader-writer lock implementation and reader-writer lock management
-- Read lock and write lock operations
-- Reader-writer coordination and reader-writer synchronization
-- Reader-writer error handling and reader-writer feedback
+RuntimeRwLock layout (16 bytes):
+    offset 0:  handle    — the sync_core rwlock_ptr (the real lock)
+    offset 8:  poisoned  — 0 healthy, 1 poisoned
 :End Note
 
-Note: TODO - Implement rwlock functionality
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: RuntimeRwLock object layout
+Constant RT_RWLOCK_SIZE as Integer is 16
+Constant RT_RWLOCK_OFF_HANDLE as Integer is 0
+Constant RT_RWLOCK_OFF_POISONED as Integer is 8
+
+Note: Status codes returned by the runtime reader-writer lock API
+Constant RWLOCK_OK as Integer is 0
+Constant RWLOCK_ERR_NULL as Integer is 0 minus 1
+Constant RWLOCK_ERR_POISONED as Integer is 0 minus 2
+Constant RWLOCK_ERR_LOCK_FAILED as Integer is 0 minus 3
+Constant RWLOCK_ERR_BUSY as Integer is 0 minus 4
+
+Process called "rwlock_new" returns Integer:
+    @Reasoning
+    Create a runtime reader-writer lock object. Mechanism (the OS shared/
+    exclusive lock) comes from sync_core; this layer adds the poison flag and a
+    stable object identity callers hold.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 16-byte RuntimeRwLock, create the underlying sync_core rwlock,
+    store its handle, and initialize the poison flag to healthy (0). On any
+    allocation/creation failure, release whatever was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one sync_core rwlock_create (which allocates its
+    own 24-byte control block and an OS rwlock). Cold path: done once per lock.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let r be proc allocate from Memory with RT_RWLOCK_SIZE
+    If r is equal to 0:
+        Return 0
+    End If
+
+    Let handle be proc rwlock_create from Sync
+    If handle is equal to 0:
+        proc deallocate from Memory with r
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE, handle
+    proc memory_set_int64 from Memory with r, RT_RWLOCK_OFF_POISONED, 0
+    Return r
+End Process
+
+Process called "rwlock_read_acquire" takes r as Integer returns Integer:
+    @Reasoning
+    Block until shared (read) access is held, then report whether the protected
+    state is trustworthy. The lock is acquired even when poisoned because the
+    caller still needs access to inspect or repair the inconsistent data.
+    @End Reasoning
+
+    @Implementation
+    Delegate the blocking shared acquire to sync_core rwlock_read_lock. A result
+    other than 1 means the lock is NOT held and we return RWLOCK_ERR_LOCK_FAILED.
+    Once held, return RWLOCK_ERR_POISONED when the poison flag is set (the lock
+    is still held and must be released), otherwise RWLOCK_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_read_lock (fast user-space path uncontended; OS wait
+    only when a writer holds or is queued) plus two field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL without touching memory. When RWLOCK_OK
+    or RWLOCK_ERR_POISONED is returned the lock IS held and the caller owns the
+    obligation to release it.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    Let result be proc rwlock_read_lock from Sync with handle
+    If result is not equal to 1:
+        Return RWLOCK_ERR_LOCK_FAILED
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return RWLOCK_ERR_POISONED
+    End If
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_try_read_acquire" takes r as Integer returns Integer:
+    @Reasoning
+    Non-blocking shared acquire for callers that must make progress rather than
+    wait for a writer to release.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core rwlock_try_read_lock. A result other than 1 means a
+    writer holds (or is being granted) the lock, so we return RWLOCK_ERR_BUSY.
+    On success, surface poison state exactly as rwlock_read_acquire does so the
+    held/poison contract is identical on both paths.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_try_read_lock (single attempt, never blocks) plus field
+    loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL. The lock is held only when RWLOCK_OK or
+    RWLOCK_ERR_POISONED is returned.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    Let result be proc rwlock_try_read_lock from Sync with handle
+    If result is not equal to 1:
+        Return RWLOCK_ERR_BUSY
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return RWLOCK_ERR_POISONED
+    End If
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_write_acquire" takes r as Integer returns Integer:
+    @Reasoning
+    Block until exclusive (write) access is held, then report whether the
+    protected state is trustworthy. Exclusive access excludes all other readers
+    and writers for the duration the lock is held.
+    @End Reasoning
+
+    @Implementation
+    Delegate the blocking exclusive acquire to sync_core rwlock_write_lock. A
+    result other than 1 means the lock is NOT held and we return
+    RWLOCK_ERR_LOCK_FAILED. Once held, return RWLOCK_ERR_POISONED when the
+    poison flag is set (the lock is still held and must be released), otherwise
+    RWLOCK_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_write_lock (fast user-space path uncontended; OS wait
+    while readers or another writer hold) plus two field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL without touching memory. When RWLOCK_OK
+    or RWLOCK_ERR_POISONED is returned the lock IS held exclusively and the
+    caller owns the obligation to release it.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    Let result be proc rwlock_write_lock from Sync with handle
+    If result is not equal to 1:
+        Return RWLOCK_ERR_LOCK_FAILED
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return RWLOCK_ERR_POISONED
+    End If
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_try_write_acquire" takes r as Integer returns Integer:
+    @Reasoning
+    Non-blocking exclusive acquire for callers that must make progress rather
+    than wait for readers or another writer to release.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core rwlock_try_write_lock. A result other than 1 means the
+    lock is currently held by readers or another writer, so we return
+    RWLOCK_ERR_BUSY. On success, surface poison state exactly as
+    rwlock_write_acquire does so the held/poison contract is identical on both
+    paths.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_try_write_lock (single attempt, never blocks) plus
+    field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL. The lock is held exclusively only when
+    RWLOCK_OK or RWLOCK_ERR_POISONED is returned.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    Let result be proc rwlock_try_write_lock from Sync with handle
+    If result is not equal to 1:
+        Return RWLOCK_ERR_BUSY
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return RWLOCK_ERR_POISONED
+    End If
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_release" takes r as Integer returns Integer:
+    @Reasoning
+    Release a held lock, whether it was acquired for shared (read) or exclusive
+    (write) access. Must be called exactly once per successful acquire
+    (including the RWLOCK_ERR_POISONED acquire, which still holds the lock).
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core rwlock_unlock, which decrements the reader count or
+    clears the writer-owner tracking and releases the OS lock as appropriate.
+    Return RWLOCK_OK on success.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_unlock (user-space update on the uncontended path; a
+    wake of waiting readers or a writer when present).
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL. Releasing a lock not held by the caller
+    is a logic error surfaced by the underlying facade.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    proc rwlock_unlock from Sync with handle
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_is_poisoned" takes r as Integer returns Integer:
+    @Reasoning
+    Report whether a previous critical section flagged the protected data as
+    inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Read the poison flag (1 poisoned, 0 healthy).
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_POISONED
+End Process
+
+Process called "rwlock_poison" takes r as Integer returns Integer:
+    @Reasoning
+    Mark the lock poisoned. A holder that detects an unrecoverable failure in
+    the protected state calls this before releasing so later acquirers are
+    warned the data may be inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 1.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the lock (ideally a write acquire) so the
+    flag is published before the next acquirer observes it.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with r, RT_RWLOCK_OFF_POISONED, 1
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_clear_poison" takes r as Integer returns Integer:
+    @Reasoning
+    Clear the poison flag after a caller has repaired the protected state,
+    returning the lock to normal service.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 0.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the lock for exclusive (write) access, after
+    the inconsistent state has actually been repaired.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with r, RT_RWLOCK_OFF_POISONED, 0
+    Return RWLOCK_OK
+End Process
+
+Process called "rwlock_destroy" takes r as Integer returns Integer:
+    @Reasoning
+    Release the OS lock and free the runtime object. Must not be called while
+    the lock is held by any reader or writer.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core rwlock_destroy (which frees the facade control block
+    and the OS rwlock), then deallocate the RuntimeRwLock object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core rwlock_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns RWLOCK_ERR_NULL. Destroying a held lock is a logic error.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return RWLOCK_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with r, RT_RWLOCK_OFF_HANDLE
+    proc rwlock_destroy from Sync with handle
+    proc deallocate from Memory with r
+    Return RWLOCK_OK
+End Process

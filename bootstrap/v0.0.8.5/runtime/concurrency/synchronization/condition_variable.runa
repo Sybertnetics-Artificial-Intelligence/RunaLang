@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,373 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles condition variable implementation and condition variable management for the Runa runtime concurrency system.
+Runtime condition-variable API — the public condition-coordination object for
+the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process condition variable implementation and condition variable management
-- Handle condition waiting and condition notification
-- Manage condition coordination and condition synchronization
-- Process condition error handling and condition feedback
+This is the runtime-facing object layer. The actual wait/wake mechanism is the
+completed cross-platform synchronization facade (sync_core), which itself
+delegates to the per-architecture OS futex / ulock / SRW primitives. This
+module does NOT re-implement the wait or notify mechanism; it wraps the
+sync_core condvar handle in a runtime RuntimeCondVar object and adds the
+semantics a runtime contract requires that the raw facade does not provide:
 
-This file is essential because of the following reasons:
-- condition_variable enables comprehensive condition variable implementation and condition variable management
-- Proper condition variable handling ensures correct condition-based synchronization and user experience
-- condition_variable support enables Runa compilation for condition-based workflows
+  - MUTEX PAIRING: a condition variable is meaningless without an associated
+    mutex. Every wait atomically releases a held mutex, blocks until notified,
+    and re-acquires the mutex before returning. The caller passes the
+    RuntimeMutex object (from mutex.runa). This module extracts that mutex's
+    underlying sync_core handle (stored at RuntimeMutex offset 0) and hands the
+    raw handle to the facade, so the runtime object layer of the condvar and
+    the runtime object layer of the mutex compose without either knowing the
+    other's internals beyond the published handle offset.
+  - STANDARDIZED STATUS CODES: every entry point returns a CONDVAR_* status so
+    callers branch on a single, documented contract rather than the facade's
+    raw 1/0 platform results. The facade reports 1 for a successful wake, and
+    0 for a timeout on the bounded wait (the Windows SRW path returns the BOOL
+    directly — nonzero wake, zero timeout — and the futex / ulock / umtx paths
+    follow the same nonzero-is-success convention); this layer translates those
+    into CONDVAR_OK and CONDVAR_ERR_TIMEOUT.
+  - POISONING: a coordinator that detects an unrecoverable error in the data
+    protected by the paired mutex marks the condition variable poisoned, so
+    waking threads can inspect condvar_is_poisoned and decide whether to
+    recover or abort. This mirrors the poison model of the runtime mutex and
+    keeps the two cooperating objects symmetric.
 
-This file consists of the following functions/features/operation types:
-- Condition variable implementation and condition variable management
-- Condition waiting and condition notification
-- Condition coordination and condition synchronization
-- Condition error handling and condition feedback
+RuntimeCondVar layout (16 bytes):
+    offset 0:  handle    — the sync_core condvar handle (the real wait queue)
+    offset 8:  poisoned  — 0 healthy, 1 poisoned
 :End Note
 
-Note: TODO - Implement condition_variable functionality
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: RuntimeCondVar object layout
+Constant RT_CONDVAR_SIZE as Integer is 16
+Constant RT_CONDVAR_OFF_HANDLE as Integer is 0
+Constant RT_CONDVAR_OFF_POISONED as Integer is 8
+
+Note:
+Offset of the underlying sync_core handle inside a RuntimeMutex object. This
+matches mutex.runa's RuntimeMutex layout (RT_MUTEX_OFF_HANDLE is 0), and is the
+single point of coupling between the condvar object layer and the mutex object
+layer: a wait reads the paired mutex's sync_core handle from this offset and
+passes it to the facade.
+:End Note
+Constant RT_MUTEX_OFF_HANDLE as Integer is 0
+
+Note: Facade success convention — sync_core reports 1 for a successful wake
+Constant SYNC_SUCCESS as Integer is 1
+Note: Facade timeout convention — the bounded wait reports 0 when the deadline expires
+Constant SYNC_TIMEOUT as Integer is 0
+
+Note: Status codes returned by the runtime condition-variable API
+Constant CONDVAR_OK as Integer is 0
+Constant CONDVAR_ERR_NULL as Integer is 0 minus 1
+Constant CONDVAR_ERR_POISONED as Integer is 0 minus 2
+Constant CONDVAR_ERR_WAIT_FAILED as Integer is 0 minus 3
+Constant CONDVAR_ERR_TIMEOUT as Integer is 0 minus 4
+
+Process called "condvar_new" returns Integer:
+    @Reasoning
+    Create a runtime condition variable. Mechanism (the OS wait queue) comes
+    from sync_core; this layer adds the poison flag and a stable object identity
+    callers hold and pair with a RuntimeMutex.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 16-byte RuntimeCondVar, create the underlying sync_core
+    condvar, store its handle, and initialize the poison flag to healthy (0).
+    On any allocation/creation failure, release whatever was acquired and
+    return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one sync_core condvar_create (which allocates its
+    own control block and an OS wait word). Cold path: done once per condvar.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let cv be proc allocate from Memory with RT_CONDVAR_SIZE
+    If cv is equal to 0:
+        Return 0
+    End If
+
+    Let handle be proc condvar_create from Sync
+    If handle is equal to 0:
+        proc deallocate from Memory with cv
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE, handle
+    proc memory_set_int64 from Memory with cv, RT_CONDVAR_OFF_POISONED, 0
+    Return cv
+End Process
+
+Process called "condvar_wait" takes cv as Integer, m as Integer returns Integer:
+    @Reasoning
+    Atomically release the paired mutex, block until another thread signals or
+    broadcasts this condition variable, then re-acquire the mutex before
+    returning. The mutex must be held by the caller on entry and is held again
+    on return.
+    @End Reasoning
+
+    @Implementation
+    Validate both the condvar object and the mutex object. Read this condvar's
+    sync_core handle (offset 0) and the paired RuntimeMutex's sync_core handle
+    (RT_MUTEX_OFF_HANDLE), then delegate the atomic release/wait/re-acquire to
+    sync_core condvar_wait. The facade reports 1 on a successful wake; any other
+    result means the wait did not complete normally and is surfaced as
+    CONDVAR_ERR_WAIT_FAILED.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core condvar_wait: a futex / ulock / SRW sleep that parks the
+    thread until notified, bracketed by the facade's mutex release and
+    re-acquire. No busy-waiting.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null condvar or null mutex returns CONDVAR_ERR_NULL without touching
+    memory or the wait queue. On return (CONDVAR_OK or CONDVAR_ERR_WAIT_FAILED)
+    the paired mutex is held again and the caller owns the obligation to release
+    it.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    If m is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+
+    Let cv_handle be proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE
+    Let mutex_handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Let r be proc condvar_wait from Sync with cv_handle, mutex_handle
+    If r is not equal to SYNC_SUCCESS:
+        Return CONDVAR_ERR_WAIT_FAILED
+    End If
+    Return CONDVAR_OK
+End Process
+
+Process called "condvar_timed_wait" takes cv as Integer, m as Integer, timeout_us as Integer returns Integer:
+    @Reasoning
+    Bounded variant of condvar_wait: release the paired mutex and wait until
+    either the condition is notified or the timeout elapses, then re-acquire the
+    mutex. Callers that must make forward progress instead of blocking
+    indefinitely use this entry point and branch on CONDVAR_ERR_TIMEOUT.
+    @End Reasoning
+
+    @Implementation
+    Validate both objects, extract the condvar's sync_core handle (offset 0) and
+    the paired RuntimeMutex's sync_core handle (RT_MUTEX_OFF_HANDLE), then
+    delegate to sync_core condvar_timed_wait with the microsecond timeout. The
+    facade returns 1 when woken by a signal/broadcast and 0 when the deadline
+    expires; map those to CONDVAR_OK and CONDVAR_ERR_TIMEOUT respectively, and
+    treat any other result as CONDVAR_ERR_WAIT_FAILED.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core condvar_timed_wait: a timed futex / ulock / SRW sleep. Adds
+    deadline setup to condvar_wait's cost; still no busy-waiting.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null condvar or null mutex returns CONDVAR_ERR_NULL without touching the
+    wait queue. On every non-null return the paired mutex is held again and the
+    caller owns the obligation to release it, including on the timeout path.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    If m is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+
+    Let cv_handle be proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE
+    Let mutex_handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Let r be proc condvar_timed_wait from Sync with cv_handle, mutex_handle, timeout_us
+    If r is equal to SYNC_SUCCESS:
+        Return CONDVAR_OK
+    End If
+    If r is equal to SYNC_TIMEOUT:
+        Return CONDVAR_ERR_TIMEOUT
+    End If
+    Return CONDVAR_ERR_WAIT_FAILED
+End Process
+
+Process called "condvar_signal" takes cv as Integer returns Integer:
+    @Reasoning
+    Wake exactly one thread waiting on this condition variable. Used when a
+    single waiter can make progress on the state change the signaller just
+    published.
+    @End Reasoning
+
+    @Implementation
+    Read the sync_core handle and delegate to sync_core condvar_signal, which
+    advances the wait sequence and wakes one parked waiter. Signalling a
+    condvar with no waiters is a well-defined no-op at the facade, so the only
+    failure surfaced here is a null object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core condvar_signal: an atomic sequence bump plus a single futex /
+    ulock / SRW wake.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns CONDVAR_ERR_NULL. Should be called while holding the
+    paired mutex so the state change is published before a waiter is released.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    Let handle be proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE
+    proc condvar_signal from Sync with handle
+    Return CONDVAR_OK
+End Process
+
+Process called "condvar_broadcast" takes cv as Integer returns Integer:
+    @Reasoning
+    Wake every thread waiting on this condition variable. Used when a state
+    change may let more than one waiter make progress, or when the specific
+    waiters that can proceed are not known.
+    @End Reasoning
+
+    @Implementation
+    Read the sync_core handle and delegate to sync_core condvar_broadcast, which
+    advances the wait sequence and wakes all parked waiters. Broadcasting a
+    condvar with no waiters is a well-defined no-op at the facade, so the only
+    failure surfaced here is a null object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core condvar_broadcast: an atomic sequence bump plus a single
+    wake-all futex / ulock / SRW operation. Woken threads then contend for the
+    paired mutex one at a time.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns CONDVAR_ERR_NULL. Should be called while holding the
+    paired mutex so the state change is published before the waiters are
+    released.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    Let handle be proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE
+    proc condvar_broadcast from Sync with handle
+    Return CONDVAR_OK
+End Process
+
+Process called "condvar_is_poisoned" takes cv as Integer returns Integer:
+    @Reasoning
+    Report whether a coordinator flagged the state guarded by the paired mutex
+    as inconsistent. A thread woken from a wait checks this before trusting the
+    shared data.
+    @End Reasoning
+
+    @Implementation
+    Read the poison flag (1 poisoned, 0 healthy).
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_POISONED
+End Process
+
+Process called "condvar_poison" takes cv as Integer returns Integer:
+    @Reasoning
+    Mark the condition variable poisoned. A coordinator that detects an
+    unrecoverable failure in the protected state calls this (then typically
+    broadcasts) so waking threads are warned the data may be inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 1.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the paired mutex so the flag is published
+    before any waiter observes it.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with cv, RT_CONDVAR_OFF_POISONED, 1
+    Return CONDVAR_OK
+End Process
+
+Process called "condvar_clear_poison" takes cv as Integer returns Integer:
+    @Reasoning
+    Clear the poison flag after a caller has repaired the protected state,
+    returning the condition variable to normal service.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 0.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the paired mutex, after the inconsistent
+    state has actually been repaired.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with cv, RT_CONDVAR_OFF_POISONED, 0
+    Return CONDVAR_OK
+End Process
+
+Process called "condvar_destroy" takes cv as Integer returns Integer:
+    @Reasoning
+    Release the OS wait queue and free the runtime object. Must not be called
+    while any thread is waiting on the condition variable.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core condvar_destroy (which frees the facade control block
+    and the OS wait word), then deallocate the RuntimeCondVar object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core condvar_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns CONDVAR_ERR_NULL. Destroying a condvar with active
+    waiters is a logic error.
+    @End Security_Scope
+
+    If cv is equal to 0:
+        Return CONDVAR_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with cv, RT_CONDVAR_OFF_HANDLE
+    proc condvar_destroy from Sync with handle
+    proc deallocate from Memory with cv
+    Return CONDVAR_OK
+End Process

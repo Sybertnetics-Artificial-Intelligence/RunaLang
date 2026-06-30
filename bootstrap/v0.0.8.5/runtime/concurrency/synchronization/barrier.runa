@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,247 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles barrier synchronization and barrier management for the Runa runtime concurrency system.
+Runtime cyclic-barrier API — the public rendezvous object for the Runa runtime
+concurrency system.
 
-This file performs the following tasks:
-- Process barrier synchronization and barrier management
-- Handle barrier coordination and barrier synchronization
-- Manage barrier waiting and barrier coordination
-- Process barrier error handling and barrier feedback
+A cyclic (reusable) barrier holds back a fixed number of cooperating threads
+(the "parties") until all of them have arrived, then releases them all at once
+and immediately resets itself for the next round. Unlike the mutex and condvar
+wrappers in this directory, sync_core exposes NO barrier primitive: there is no
+underlying OS barrier handle to delegate to. This module therefore BUILDS a real
+barrier out of the two lower-level primitives sync_core does provide — a mutex
+and a condition variable — implementing the arrival count, the trip logic, and
+the generation counter itself.
 
-This file is essential because of the following reasons:
-- barrier enables comprehensive barrier synchronization and barrier management
-- Proper barrier handling ensures correct barrier-based synchronization and user experience
-- barrier support enables Runa compilation for barrier-based workflows
+RuntimeBarrier layout (48 bytes):
+    offset 0:  mutex      — sync_core mutex handle guarding all barrier state
+    offset 8:  condvar    — sync_core condvar handle threads block on
+    offset 16: parties    — N, the number of threads each cycle waits for
+    offset 24: count      — threads that have arrived in the CURRENT generation
+    offset 32: generation — monotonically increasing cycle id
 
-This file consists of the following functions/features/operation types:
-- Barrier synchronization and barrier management
-- Barrier coordination and barrier synchronization
-- Barrier waiting and barrier coordination
-- Barrier error handling and barrier feedback
+THE REUSE RACE AND ITS DEFENSE:
+The classic broken barrier waits on a predicate like "count == 0" after the
+trip. That races: the last thread resets count to 0 and broadcasts, but a
+released waiter can re-enter barrier_wait for the NEXT round and increment count
+before an earlier-released waiter has even woken from its condvar_wait. The slow
+waiter then re-tests its predicate, still sees a small count, and blocks again —
+permanently stranded one generation behind. The fix is a generation counter:
+each waiting thread records the generation it arrived in (my_gen) and blocks
+while generation is still equal to my_gen. The trip advances generation exactly
+once, so every waiter from that cycle observes the change and leaves, while any
+thread that has already moved on to the next cycle is operating on a strictly
+greater generation and is unaffected by the stale count it might briefly see.
 :End Note
 
-Note: TODO - Implement barrier functionality
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: RuntimeBarrier object layout
+Constant RT_BARRIER_SIZE as Integer is 48
+Constant RT_BARRIER_OFF_MUTEX as Integer is 0
+Constant RT_BARRIER_OFF_CONDVAR as Integer is 8
+Constant RT_BARRIER_OFF_PARTIES as Integer is 16
+Constant RT_BARRIER_OFF_COUNT as Integer is 24
+Constant RT_BARRIER_OFF_GENERATION as Integer is 32
+
+Note: Status codes returned by the runtime barrier API
+Constant BARRIER_OK as Integer is 0
+Constant BARRIER_LEADER as Integer is 1
+Constant BARRIER_ERR_NULL as Integer is 0 minus 1
+Constant BARRIER_ERR_INVALID as Integer is 0 minus 2
+
+Process called "barrier_new" takes parties as Integer returns Integer:
+    @Reasoning
+    Construct a reusable barrier for exactly "parties" threads. The synchronizing
+    machinery (a mutex and a condition variable) is supplied by sync_core; this
+    layer owns the counting, the trip decision, and the generation bookkeeping
+    that turn those two primitives into a correct cyclic barrier.
+    @End Reasoning
+
+    @Implementation
+    Reject a non-positive party count (a barrier of zero or negative width has no
+    meaning) by returning 0. Allocate the 48-byte object, then create the
+    sync_core mutex and condvar. Each acquired resource is released on a later
+    failure so no handle or allocation leaks on the error path. Initialize count
+    and generation to 0: the first cycle is generation 0 with no arrivals yet.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one sync_core mutex_create and one condvar_create
+    (each allocates its own control block and an OS primitive). Cold path: run
+    once per barrier lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Any failure returns 0 (NULL) after fully unwinding partial construction;
+    callers MUST check the result before use.
+    @End Security_Scope
+
+    If parties is less than 1:
+        Return 0
+    End If
+
+    Let b be proc allocate from Memory with RT_BARRIER_SIZE
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with b
+        Return 0
+    End If
+
+    Let cv be proc condvar_create from Sync
+    If cv is equal to 0:
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with b
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_MUTEX, mtx
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_CONDVAR, cv
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_PARTIES, parties
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_COUNT, 0
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_GENERATION, 0
+    Return b
+End Process
+
+Process called "barrier_wait" takes b as Integer returns Integer:
+    @Reasoning
+    Block the calling thread until all parties have arrived at this barrier, then
+    release the whole cohort together and arm the barrier for its next use. The
+    final arrival of each cycle is designated the leader so a caller can run a
+    single-threaded "phase boundary" action (merge results, advance an epoch)
+    without external coordination.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex so all reads and writes to count and generation are atomic
+    with respect to other parties. Snapshot the current generation into my_gen,
+    then register this arrival by incrementing count.
+
+    If count now equals parties, this thread is the last arrival and TRIPS the
+    barrier: it advances generation (publishing the trip to every blocked waiter),
+    clears count to 0 for the next cycle, broadcasts the condvar to wake all
+    waiters, releases the mutex, and returns BARRIER_LEADER. Exactly one thread
+    per cycle reaches this branch, so exactly one leader is named per round.
+
+    Otherwise this thread is an early arrival and must wait. It loops on
+    condvar_wait while generation is still equal to my_gen. The loop is mandatory:
+    condition variables permit spurious wakeups, and re-testing the generation on
+    every wake means a thread only proceeds once the barrier has genuinely
+    tripped. Because the predicate is the generation — not the count — a waiter
+    that wakes after later threads have already begun the next cycle still sees
+    generation advanced past my_gen and exits correctly, which is precisely what
+    defeats the cyclic-barrier reuse race. condvar_wait atomically releases and
+    re-acquires the mutex, so the mutex is held again on loop exit and is released
+    before returning BARRIER_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex lock/unlock per call. Early arrivals block in the OS via condvar
+    until the trip; the leader performs one broadcast that wakes the cohort. No
+    busy-waiting and no per-thread allocation on the hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null barrier returns BARRIER_ERR_NULL without touching memory. On every
+    non-null path the mutex is released before the Process returns, so no caller
+    leaves this Process still holding the lock.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return BARRIER_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_CONDVAR
+    Let lock_result be proc mutex_lock from Sync with mtx
+    If lock_result is not equal to 1:
+        Return BARRIER_ERR_INVALID
+    End If
+
+    Let my_gen be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_GENERATION
+    Let parties be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_PARTIES
+
+    Let count be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_COUNT
+    Let new_count be count plus 1
+    proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_COUNT, new_count
+
+    If new_count is equal to parties:
+        Let next_gen be my_gen plus 1
+        proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_GENERATION, next_gen
+        proc memory_set_int64 from Memory with b, RT_BARRIER_OFF_COUNT, 0
+        proc condvar_broadcast from Sync with cv
+        proc mutex_unlock from Sync with mtx
+        Return BARRIER_LEADER
+    Otherwise:
+        Let current_gen be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_GENERATION
+        While current_gen is equal to my_gen:
+            proc condvar_wait from Sync with cv, mtx
+            Set current_gen to proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_GENERATION
+        End While
+        proc mutex_unlock from Sync with mtx
+        Return BARRIER_OK
+    End If
+End Process
+
+Process called "barrier_parties" takes b as Integer returns Integer:
+    @Reasoning
+    Report the fixed width of the barrier — the number of parties each cycle waits
+    for. Useful for diagnostics and for callers that size worker pools to match.
+    @End Reasoning
+
+    @Implementation
+    Read the parties field. The value is immutable after construction, so this
+    read needs no lock.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null barrier returns 0. Pure read; no state is modified.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_PARTIES
+End Process
+
+Process called "barrier_destroy" takes b as Integer returns Integer:
+    @Reasoning
+    Tear down a barrier that is no longer in use, releasing the underlying
+    sync_core mutex and condvar and the runtime object itself.
+    @End Reasoning
+
+    @Implementation
+    Destroy the sync_core condvar and mutex (each frees its facade control block
+    and the OS primitive), then deallocate the RuntimeBarrier. Must only be called
+    once no thread is blocked in or about to enter barrier_wait.
+    @End Implementation
+
+    @Performance_Hints
+    One condvar_destroy plus one mutex_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null barrier returns BARRIER_ERR_NULL. Destroying a barrier with waiters
+    still parked on it is a caller logic error.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return BARRIER_ERR_NULL
+    End If
+
+    Let cv be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_CONDVAR
+    Let mtx be proc memory_get_int64 from Memory with b, RT_BARRIER_OFF_MUTEX
+    proc condvar_destroy from Sync with cv
+    proc mutex_destroy from Sync with mtx
+    proc deallocate from Memory with b
+    Return BARRIER_OK
+End Process

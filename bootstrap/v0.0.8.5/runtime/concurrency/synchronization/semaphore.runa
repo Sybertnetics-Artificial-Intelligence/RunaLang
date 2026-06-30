@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,314 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles semaphore implementation and semaphore management for the Runa runtime concurrency system.
+Runtime semaphore API — the public counting-semaphore object for the Runa
+runtime concurrency system.
 
-This file performs the following tasks:
-- Process semaphore implementation and semaphore management
-- Handle semaphore acquisition and semaphore release
-- Manage semaphore coordination and semaphore synchronization
-- Process semaphore error handling and semaphore feedback
+This is the runtime-facing object layer. The actual counting mechanism is the
+completed cross-platform synchronization facade (sync_core), which itself
+delegates to the per-architecture OS semaphore / futex primitives. This module
+does NOT re-implement the semaphore; it wraps the sync_core handle in a runtime
+RuntimeSemaphore object and adds the semantics a runtime contract requires that
+the raw facade does not provide:
 
-This file is essential because of the following reasons:
-- semaphore enables comprehensive semaphore implementation and semaphore management
-- Proper semaphore handling ensures correct semaphore-based synchronization and user experience
-- semaphore support enables Runa compilation for semaphore-based workflows
+  - COUNTING PERMITS: a semaphore admits up to its current permit count of
+    concurrent acquirers. semaphore_acquire blocks until a permit is available
+    and consumes it; semaphore_release returns a permit, potentially waking a
+    blocked acquirer. semaphore_try_acquire takes a permit only when one is
+    immediately available, never blocking.
+  - POISONING: a counting semaphore needs no poison flag to function, but the
+    flag is carried here for contract symmetry with the other synchronization
+    modules and to let a permit holder surface "a holder corrupted the state
+    this semaphore guards access to" without unwinding. Later acquirers still
+    obtain a permit (admission is still needed to inspect/repair the state) but
+    are told SEM_ERR_POISONED so they can decide whether to recover or abort.
+  - STANDARDIZED STATUS CODES: every entry point returns a SEM_* status so
+    callers branch on a single, documented contract rather than the facade's
+    raw 1/0 platform results.
 
-This file consists of the following functions/features/operation types:
-- Semaphore implementation and semaphore management
-- Semaphore acquisition and semaphore release
-- Semaphore coordination and semaphore synchronization
-- Semaphore error handling and semaphore feedback
+RuntimeSemaphore layout (16 bytes):
+    offset 0:  handle    — the sync_core sem_ptr (the real counting semaphore)
+    offset 8:  poisoned  — 0 healthy, 1 poisoned
 :End Note
 
-Note: TODO - Implement semaphore functionality
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: RuntimeSemaphore object layout
+Constant RT_SEM_SIZE as Integer is 16
+Constant RT_SEM_OFF_HANDLE as Integer is 0
+Constant RT_SEM_OFF_POISONED as Integer is 8
+
+Note: Status codes returned by the runtime semaphore API
+Constant SEM_OK as Integer is 0
+Constant SEM_ERR_NULL as Integer is 0 minus 1
+Constant SEM_ERR_POISONED as Integer is 0 minus 2
+Constant SEM_ERR_WAIT_FAILED as Integer is 0 minus 3
+Constant SEM_ERR_BUSY as Integer is 0 minus 4
+
+Process called "semaphore_new" takes initial_count as Integer returns Integer:
+    @Reasoning
+    Create a runtime semaphore object with a starting permit count. Mechanism
+    (the OS counting semaphore) comes from sync_core; this layer adds the poison
+    flag and a stable object identity callers hold.
+    @End Reasoning
+
+    @Implementation
+    Reject a negative initial_count by returning 0 — permit counts are
+    non-negative by definition and the facade cannot represent a negative seed.
+    Allocate the 16-byte RuntimeSemaphore, create the underlying sync_core
+    semaphore with initial_count, store its handle, and initialize the poison
+    flag to healthy (0). On any allocation/creation failure, release whatever
+    was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one sync_core semaphore_create (which allocates
+    its own 16-byte control block and an OS semaphore). Cold path: done once
+    per semaphore.
+    @End Performance_Hints
+
+    @Security_Scope
+    Negative initial_count and any failure return 0 (NULL); callers MUST check
+    before use.
+    @End Security_Scope
+
+    If initial_count is less than 0:
+        Return 0
+    End If
+
+    Let s be proc allocate from Memory with RT_SEM_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+
+    Let handle be proc semaphore_create from Sync with initial_count
+    If handle is equal to 0:
+        proc deallocate from Memory with s
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with s, RT_SEM_OFF_HANDLE, handle
+    proc memory_set_int64 from Memory with s, RT_SEM_OFF_POISONED, 0
+    Return s
+End Process
+
+Process called "semaphore_acquire" takes s as Integer returns Integer:
+    @Reasoning
+    Block until a permit is available, consume it, then report whether the
+    guarded state is trustworthy. The permit is taken even when poisoned because
+    the caller still needs admission to inspect or repair the inconsistent data.
+    @End Reasoning
+
+    @Implementation
+    Delegate the blocking acquire to sync_core semaphore_wait. If that fails to
+    report success, no permit was taken and we return SEM_ERR_WAIT_FAILED. Once
+    a permit is held, return SEM_ERR_POISONED when the poison flag is set (the
+    permit is still held and must be released), otherwise SEM_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core semaphore_wait (fast permit decrement on the available path;
+    OS wait only when no permit is available) plus two field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns SEM_ERR_NULL without touching memory. When SEM_OK or
+    SEM_ERR_POISONED is returned a permit IS held and the caller owns the
+    obligation to release it.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with s, RT_SEM_OFF_HANDLE
+    Let r be proc semaphore_wait from Sync with handle
+    If r is not equal to 1:
+        Return SEM_ERR_WAIT_FAILED
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with s, RT_SEM_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return SEM_ERR_POISONED
+    End If
+    Return SEM_OK
+End Process
+
+Process called "semaphore_try_acquire" takes s as Integer returns Integer:
+    @Reasoning
+    Non-blocking acquire for callers that must make progress rather than wait
+    for a permit to become available.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core semaphore_try_wait. A non-success result means no
+    permit was immediately available (SEM_ERR_BUSY). On success, surface poison
+    state exactly as semaphore_acquire does so the held/poison contract is
+    identical on both paths.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core semaphore_try_wait (single permit-decrement attempt, never
+    blocks) plus field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns SEM_ERR_NULL. A permit is held only when SEM_OK or
+    SEM_ERR_POISONED is returned.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with s, RT_SEM_OFF_HANDLE
+    Let r be proc semaphore_try_wait from Sync with handle
+    If r is not equal to 1:
+        Return SEM_ERR_BUSY
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with s, RT_SEM_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return SEM_ERR_POISONED
+    End If
+    Return SEM_OK
+End Process
+
+Process called "semaphore_release" takes s as Integer returns Integer:
+    @Reasoning
+    Return a permit. Must be called exactly once per successful acquire
+    (including the SEM_ERR_POISONED acquire, which still holds a permit) so the
+    permit count stays balanced.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core semaphore_signal, which increments the permit count
+    and wakes a blocked acquirer if one is present. Return SEM_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core semaphore_signal (user-space increment on the uncontended
+    path; a single OS wake when waiters are present).
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns SEM_ERR_NULL. Releasing more permits than were acquired
+    raises the permit ceiling and is a caller logic error.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with s, RT_SEM_OFF_HANDLE
+    proc semaphore_signal from Sync with handle
+    Return SEM_OK
+End Process
+
+Process called "semaphore_is_poisoned" takes s as Integer returns Integer:
+    @Reasoning
+    Report whether a previous permit holder flagged the guarded data as
+    inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Read the poison flag (1 poisoned, 0 healthy).
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with s, RT_SEM_OFF_POISONED
+End Process
+
+Process called "semaphore_poison" takes s as Integer returns Integer:
+    @Reasoning
+    Mark the semaphore poisoned. A permit holder that detects an unrecoverable
+    failure in the guarded state calls this before releasing so later acquirers
+    are warned the data may be inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 1.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding a permit so the flag is published before the
+    next acquirer observes it.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with s, RT_SEM_OFF_POISONED, 1
+    Return SEM_OK
+End Process
+
+Process called "semaphore_clear_poison" takes s as Integer returns Integer:
+    @Reasoning
+    Clear the poison flag after a caller has repaired the guarded state,
+    returning the semaphore to normal service.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 0.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding a permit, after the inconsistent state has
+    actually been repaired.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with s, RT_SEM_OFF_POISONED, 0
+    Return SEM_OK
+End Process
+
+Process called "semaphore_destroy" takes s as Integer returns Integer:
+    @Reasoning
+    Release the OS semaphore and free the runtime object. Must not be called
+    while permits are still outstanding to a blocked acquirer.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core semaphore_destroy (which frees the facade control
+    block and the OS semaphore), then deallocate the RuntimeSemaphore object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core semaphore_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns SEM_ERR_NULL. Destroying a semaphore with blocked
+    waiters is a logic error.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return SEM_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with s, RT_SEM_OFF_HANDLE
+    proc semaphore_destroy from Sync with handle
+    proc deallocate from Memory with s
+    Return SEM_OK
+End Process
