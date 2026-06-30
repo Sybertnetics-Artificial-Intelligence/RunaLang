@@ -69,24 +69,23 @@ HIGHER-ORDER OPERATION DISPATCH
 
 The functor / monadic helpers (map, map_err, and_then, or_else, fold,
 recover) take an Integer-shaped function-pointer argument and invoke
-it through the __builtin_call_indirect_1 intrinsic.  The intrinsic is
-defined in compiler/frontend/primitives/intrinsics/builtins.runa as a
-type-checking stub whose codegen path is intentionally rerouted to an
-indirect-call instruction sequence (CALL %rax / BLR X9 / etc.) once
-the bootstrap codegen wires up EXPR_INDIRECT_CALL dispatch by name.
+it through call_indirect_1 from compiler/frontend/primitives/assembly/
+call_indirect.runa.  That primitive loads the function pointer into rax,
+marshals the single argument into rdi per the System V x86_64 calling
+convention, and issues `call rax` -- a real indirect branch that runs
+the supplied function and returns its result.  The function pointer is
+obtained at the call site with the `$function_name` operator, which the
+compiler lowers to `leaq <label>(%rip)` (the function's address).
 
-In stage1 today the intrinsic resolves to the stub (which returns 0),
-so map/and_then mappers that do real work will not be invoked until
-the codegen rewrite lands.  The control-flow shape of these procs is
-already correct, so callers can adopt them today and the closures
-will activate transparently in the next stage1 update.  Callers that
-need guaranteed dispatch in stage1 should use the explicit
-is_ok / unwrap pattern instead of map.
+This is the same proven indirect-call path used by the async, task, and
+config subsystems.  map / and_then / or_else / fold / recover therefore
+dispatch their mappers for real: a mapper that does work is executed and
+its value flows back through the combinator.
 :End Note
 
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
-Import "compiler/frontend/primitives/intrinsics/builtins.runa" as Builtins
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as CallIndirect
 
 Note: ============================================================================
 Note: Layout offsets and tag values
@@ -428,7 +427,7 @@ Process called "result_map" takes result as Integer, mapper as Integer returns I
     Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
     If tag is equal to RESULT_TAG_OK:
         Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
-        Let new_value be __builtin_call_indirect_1(mapper, value)
+        Let new_value be proc call_indirect_1 from CallIndirect with mapper, value
         Return ok(new_value)
     End If
     Let error be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
@@ -460,7 +459,7 @@ Process called "result_map_err" takes result as Integer, mapper as Integer retur
     Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
     If tag is equal to RESULT_TAG_ERR:
         Let error_value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
-        Let new_error be __builtin_call_indirect_1(mapper, error_value)
+        Let new_error be proc call_indirect_1 from CallIndirect with mapper, error_value
         Return err(new_error)
     End If
     Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
@@ -497,7 +496,7 @@ Process called "result_and_then" takes result as Integer, mapper as Integer retu
     Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
     If tag is equal to RESULT_TAG_OK:
         Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
-        Return __builtin_call_indirect_1(mapper, value)
+        Return proc call_indirect_1 from CallIndirect with mapper, value
     End If
     Let error be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
     Return err(error)
@@ -528,7 +527,7 @@ Process called "result_or_else" takes result as Integer, recovery as Integer ret
     Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
     If tag is equal to RESULT_TAG_ERR:
         Let error_value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
-        Return __builtin_call_indirect_1(recovery, error_value)
+        Return proc call_indirect_1 from CallIndirect with recovery, error_value
     End If
     Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
     Return ok(value)
@@ -663,7 +662,7 @@ Process called "option_map" takes option as Integer, mapper as Integer returns I
     Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
     If tag is equal to OPTION_TAG_SOME:
         Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
-        Let new_value be __builtin_call_indirect_1(mapper, value)
+        Let new_value be proc call_indirect_1 from CallIndirect with mapper, value
         Return some(new_value)
     End If
     Return none()
@@ -693,7 +692,7 @@ Process called "option_and_then" takes option as Integer, mapper as Integer retu
     Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
     If tag is equal to OPTION_TAG_SOME:
         Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
-        Return __builtin_call_indirect_1(mapper, value)
+        Return proc call_indirect_1 from CallIndirect with mapper, value
     End If
     Return none()
 End Process
@@ -718,11 +717,11 @@ Process called "option_or_else" takes option as Integer, fallback as Integer ret
     @End Security_Scope
 
     If option is equal to 0:
-        Return __builtin_call_indirect_1(fallback, 0)
+        Return proc call_indirect_1 from CallIndirect with fallback, 0
     End If
     Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
     If tag is equal to OPTION_TAG_NONE:
-        Return __builtin_call_indirect_1(fallback, 0)
+        Return proc call_indirect_1 from CallIndirect with fallback, 0
     End If
     Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
     Return some(value)
@@ -951,10 +950,10 @@ Process called "either_fold" takes either as Integer, left_fn as Integer, right_
     Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
     Let value be Memory.memory_get_int64(either, ADT_PAYLOAD_A_OFF)
     If tag is equal to EITHER_TAG_LEFT:
-        Return __builtin_call_indirect_1(left_fn, value)
+        Return proc call_indirect_1 from CallIndirect with left_fn, value
     End If
     If tag is equal to EITHER_TAG_RIGHT:
-        Return __builtin_call_indirect_1(right_fn, value)
+        Return proc call_indirect_1 from CallIndirect with right_fn, value
     End If
     Return 0
 End Process
@@ -1161,7 +1160,7 @@ Process called "try_recover" takes t as Integer, recovery as Integer returns Int
     Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
     If tag is equal to TRY_TAG_ERR:
         Let message be Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
-        Return __builtin_call_indirect_1(recovery, message)
+        Return proc call_indirect_1 from CallIndirect with recovery, message
     End If
     Let value be Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
     Return try_ok(value)
