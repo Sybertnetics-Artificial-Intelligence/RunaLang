@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,596 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles thread pool implementation and thread pool management for the Runa runtime concurrency system.
+Runtime thread-pool API — a fixed-size pool of worker threads draining a
+shared FIFO task queue for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process thread pool implementation and thread pool management
-- Handle thread pool allocation and thread pool coordination
-- Manage thread pool execution and thread pool synchronization
-- Process thread pool error handling and thread pool feedback
+This is the runtime-facing object layer. It composes three already-complete
+lower layers and adds no new locking or scheduling mechanism of its own:
 
-This file is essential because of the following reasons:
-- thread_pool enables comprehensive thread pool implementation and thread pool management
-- Proper thread pool handling ensures correct thread pool execution and user experience
-- thread_pool support enables Runa compilation for thread pool-based workflows
+  - WORKERS come from thread_core (which delegates to the per-architecture OS
+    thread primitives). Each worker is an OS thread that runs the module-level
+    pool_worker_main entry point. Its address is taken with the $name
+    function-pointer operator, which the codegen lowers to a RIP-relative
+    address computation, exactly as the actor subsystem spawns its threads.
+  - MUTUAL EXCLUSION over the shared queue comes from the runtime RuntimeMutex
+    (mutex.runa). One RuntimeMutex guards every field of the pool that more
+    than one thread touches: the ring buffer, its head/tail/count, the
+    shutdown flag and the pending-task counter.
+  - CONDITION COORDINATION comes from two runtime RuntimeCondVar objects
+    (condition_variable.runa), both paired with the single queue mutex:
+      * not_empty — workers block on it while the queue is empty and no
+        shutdown has been requested; pool_submit signals it after enqueuing a
+        task and pool_shutdown broadcasts it to release every parked worker.
+      * drained  — pool_wait_idle blocks on it until every submitted task has
+        completed; a worker broadcasts it when it drives the pending counter
+        to zero.
+    Per the condvar contract, the RuntimeMutex object handle is passed to
+    condvar_wait (it extracts the inner sync_core handle at offset 0), and
+    every wait is wrapped in a predicate loop so spurious or broadcast wakes
+    re-check the shared state before proceeding.
 
-This file consists of the following functions/features/operation types:
-- Thread pool implementation and thread pool management
-- Thread pool allocation and thread pool coordination
-- Thread pool execution and thread pool synchronization
-- Thread pool error handling and thread pool feedback
+A task is two Integers stored contiguously in the ring buffer: a function
+pointer (fn, a $name address) and an opaque argument pointer (arg). A worker
+runs a task by invoking call_indirect_1(fn, arg).
+
+The ring buffer is a contiguous array of fixed 16-byte slots. It starts at
+POOL_INITIAL_CAPACITY slots and DOUBLES on demand: when pool_submit finds the
+ring full it allocates a ring of twice the capacity, copies the live tasks
+into it in FIFO order (re-basing head to 0), frees the old ring, and pushes
+into the grown ring. The pool therefore never drops or blocks a submission
+because of a transient queue-size limit.
+
+Shutdown is clean and lossless: pool_shutdown sets the shutdown flag, wakes
+every worker, and joins them. A worker only exits once the queue is fully
+drained AND shutdown is set, so every task already submitted is executed
+before the pool tears down. Only then are the condition variables, the mutex,
+the ring, the worker-id array and the pool object released.
+
+ThreadPool layout (96 bytes):
+    offset  0:  mutex       — RuntimeMutex guarding all shared fields
+    offset  8:  not_empty   — RuntimeCondVar workers wait on for tasks
+    offset 16:  drained     — RuntimeCondVar pool_wait_idle waits on
+    offset 24:  ring        — pointer to the task ring buffer
+    offset 32:  head        — index of the oldest queued task
+    offset 40:  tail        — index where the next task is written
+    offset 48:  count       — number of tasks currently in the ring
+    offset 56:  capacity    — ring capacity in slots
+    offset 64:  shutdown    — 0 running, 1 shutting down
+    offset 72:  pending     — submitted tasks not yet completed
+    offset 80:  workers     — number of worker threads
+    offset 88:  tids        — pointer to the worker thread-id array
+
+Task ring slot layout (16 bytes):
+    offset 0:  fn   — task function pointer
+    offset 8:  arg  — task argument pointer
 :End Note
 
-Note: TODO - Implement thread_pool functionality
+Import "compiler/frontend/primitives/threading/thread_core.runa" as Thread
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: ThreadPool object layout
+Constant POOL_SIZE as Integer is 96
+Constant POOL_OFF_MUTEX as Integer is 0
+Constant POOL_OFF_NOT_EMPTY as Integer is 8
+Constant POOL_OFF_DRAINED as Integer is 16
+Constant POOL_OFF_RING as Integer is 24
+Constant POOL_OFF_HEAD as Integer is 32
+Constant POOL_OFF_TAIL as Integer is 40
+Constant POOL_OFF_COUNT as Integer is 48
+Constant POOL_OFF_CAPACITY as Integer is 56
+Constant POOL_OFF_SHUTDOWN as Integer is 64
+Constant POOL_OFF_PENDING as Integer is 72
+Constant POOL_OFF_WORKERS as Integer is 80
+Constant POOL_OFF_TIDS as Integer is 88
+
+Note: Task ring slot layout
+Constant POOL_SLOT_SIZE as Integer is 16
+Constant POOL_SLOT_OFF_FN as Integer is 0
+Constant POOL_SLOT_OFF_ARG as Integer is 8
+
+Note: Size of a single worker thread-id entry in the tids array
+Constant POOL_TID_SIZE as Integer is 8
+
+Note: Initial ring capacity in slots; doubled on demand when the ring fills
+Constant POOL_INITIAL_CAPACITY as Integer is 256
+
+Note: Status codes returned by the runtime thread-pool API
+Constant POOL_OK as Integer is 0
+Constant POOL_ERR_NULL as Integer is 0 minus 1
+Constant POOL_ERR_ALLOC as Integer is 0 minus 2
+
+Process called "pool_worker_main" takes pool as Integer returns Integer:
+    @Reasoning
+    The per-worker run loop. Every worker thread executes this same body:
+    block until work arrives, take exactly one task off the head of the FIFO
+    ring, run it outside the lock so sibling workers can proceed in parallel,
+    then account for its completion. The loop is the only consumer side of the
+    queue, so all dequeue bookkeeping lives here under the single queue mutex.
+    @End Reasoning
+
+    @Implementation
+    Read the shared mutex and condvar handles once (they never change for the
+    life of the pool). Then loop forever:
+      1. Acquire the queue mutex.
+      2. Wait on not_empty while the queue is empty and shutdown is not set.
+         The wait is wrapped in a predicate loop (should_wait) so a broadcast
+         or spurious wake re-evaluates count and shutdown before proceeding,
+         and condvar_wait receives the RuntimeMutex object (it extracts the
+         inner sync_core handle itself).
+      3. If the queue is drained and shutdown is set, release the mutex and
+         return — this is the only exit, and it cannot strand queued work
+         because it requires count to be zero.
+      4. Pop the head slot, advancing head with wraparound and decrementing
+         count, then release the mutex.
+      5. Run the task via call_indirect_1(fn, arg) with no lock held.
+      6. Re-acquire the mutex, decrement pending, and broadcast drained when
+         pending reaches zero so pool_wait_idle can return.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex acquire/release pair per task plus a second short critical
+    section for completion accounting. Idle workers park on the OS futex via
+    condvar_wait and consume no CPU. The task itself runs entirely outside the
+    lock, so worker parallelism is bounded only by the work, not the queue.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null pool returns immediately. The function pointer invoked is supplied
+    by pool_submit's caller; this layer performs the indirect call faithfully
+    and does not validate the target, matching call_indirect_1's contract.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with pool, POOL_OFF_MUTEX
+    Let not_empty be proc memory_get_int64 from Memory with pool, POOL_OFF_NOT_EMPTY
+    Let drained be proc memory_get_int64 from Memory with pool, POOL_OFF_DRAINED
+
+    Loop forever:
+        proc mutex_acquire from Mutex with mtx
+
+        Note: Block until a task is queued or a shutdown has been requested.
+        Let should_wait be 1
+        While should_wait is equal to 1:
+            Let queued be proc memory_get_int64 from Memory with pool, POOL_OFF_COUNT
+            Let shutting_down be proc memory_get_int64 from Memory with pool, POOL_OFF_SHUTDOWN
+            If queued is not equal to 0:
+                Set should_wait to 0
+            Otherwise:
+                If shutting_down is not equal to 0:
+                    Set should_wait to 0
+                Otherwise:
+                    proc condvar_wait from CondVar with not_empty, mtx
+                End If
+            End If
+        End While
+
+        Note: Exit only once the queue is fully drained and shutdown is set.
+        Let count_now be proc memory_get_int64 from Memory with pool, POOL_OFF_COUNT
+        Let shutdown_now be proc memory_get_int64 from Memory with pool, POOL_OFF_SHUTDOWN
+        If count_now is equal to 0:
+            If shutdown_now is not equal to 0:
+                proc mutex_release from Mutex with mtx
+                Return 0
+            End If
+        End If
+
+        Note: Pop one task from the head of the ring (FIFO order).
+        Let head be proc memory_get_int64 from Memory with pool, POOL_OFF_HEAD
+        Let capacity be proc memory_get_int64 from Memory with pool, POOL_OFF_CAPACITY
+        Let ring be proc memory_get_int64 from Memory with pool, POOL_OFF_RING
+        Let slot_offset be head multiplied by POOL_SLOT_SIZE
+        Let slot_addr be ring plus slot_offset
+        Let fn be proc memory_get_int64 from Memory with slot_addr, POOL_SLOT_OFF_FN
+        Let arg be proc memory_get_int64 from Memory with slot_addr, POOL_SLOT_OFF_ARG
+
+        Let new_head be head plus 1
+        If new_head is equal to capacity:
+            Set new_head to 0
+        End If
+        proc memory_set_int64 from Memory with pool, POOL_OFF_HEAD, new_head
+
+        Let count_after be count_now minus 1
+        proc memory_set_int64 from Memory with pool, POOL_OFF_COUNT, count_after
+
+        proc mutex_release from Mutex with mtx
+
+        Note: Run the task with no lock held so other workers can proceed.
+        proc call_indirect_1 from Call with fn, arg
+
+        Note: Account for completion; wake pool_wait_idle when fully drained.
+        proc mutex_acquire from Mutex with mtx
+        Let pending be proc memory_get_int64 from Memory with pool, POOL_OFF_PENDING
+        Let pending_after be pending minus 1
+        proc memory_set_int64 from Memory with pool, POOL_OFF_PENDING, pending_after
+        If pending_after is equal to 0:
+            proc condvar_broadcast from CondVar with drained
+        End If
+        proc mutex_release from Mutex with mtx
+    End Loop
+
+    Return 0
+End Process
+
+Process called "pool_new" takes worker_count as Integer returns Integer:
+    @Reasoning
+    Construct a ready-to-use pool. The caller either fixes the worker count or
+    passes a non-positive value to let the pool size itself to the hardware's
+    concurrency. Construction allocates every owned resource, initializes the
+    shared state, and only then spawns the workers so each worker observes a
+    fully formed pool from its first instruction.
+    @End Reasoning
+
+    @Implementation
+    Resolve the worker count (falling back to thread_hardware_concurrency,
+    floored at 1). Allocate the pool object, the initial ring, and the
+    worker-id array; create the queue mutex and both condition variables. On
+    any failure, unwind exactly the resources already acquired and return 0.
+    Initialize all layout fields (empty ring, zero counters, running state),
+    then spawn each worker on pool_worker_main with the pool as its argument,
+    recording the returned thread id in the tids array.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: a handful of allocations, one mutex and two condvar creations,
+    and N OS thread spawns. Done once per pool. The ring is sized to absorb a
+    burst of POOL_INITIAL_CAPACITY submissions before the first grow.
+    @End Performance_Hints
+
+    @Security_Scope
+    Every allocation and creation is checked; partial failure frees what was
+    acquired and returns 0 (NULL), so callers MUST check the result before
+    use. No field is published to a worker until the whole pool is initialized.
+    @End Security_Scope
+
+    Let workers be worker_count
+    If workers is less than or equal to 0:
+        Set workers to proc thread_hardware_concurrency from Thread
+        If workers is less than 1:
+            Set workers to 1
+        End If
+    End If
+
+    Let pool be proc allocate from Memory with POOL_SIZE
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Let ring_bytes be POOL_INITIAL_CAPACITY multiplied by POOL_SLOT_SIZE
+    Let ring be proc allocate from Memory with ring_bytes
+    If ring is equal to 0:
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let tids_bytes be workers multiplied by POOL_TID_SIZE
+    Let tids be proc allocate from Memory with tids_bytes
+    If tids is equal to 0:
+        proc deallocate from Memory with ring
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with ring
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let not_empty be proc condvar_new from CondVar
+    If not_empty is equal to 0:
+        proc mutex_destroy from Mutex with mtx
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with ring
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let drained be proc condvar_new from CondVar
+    If drained is equal to 0:
+        proc condvar_destroy from CondVar with not_empty
+        proc mutex_destroy from Mutex with mtx
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with ring
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Note: Publish a fully formed, empty, running pool before any worker starts.
+    proc memory_set_int64 from Memory with pool, POOL_OFF_MUTEX, mtx
+    proc memory_set_int64 from Memory with pool, POOL_OFF_NOT_EMPTY, not_empty
+    proc memory_set_int64 from Memory with pool, POOL_OFF_DRAINED, drained
+    proc memory_set_int64 from Memory with pool, POOL_OFF_RING, ring
+    proc memory_set_int64 from Memory with pool, POOL_OFF_HEAD, 0
+    proc memory_set_int64 from Memory with pool, POOL_OFF_TAIL, 0
+    proc memory_set_int64 from Memory with pool, POOL_OFF_COUNT, 0
+    proc memory_set_int64 from Memory with pool, POOL_OFF_CAPACITY, POOL_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with pool, POOL_OFF_SHUTDOWN, 0
+    proc memory_set_int64 from Memory with pool, POOL_OFF_PENDING, 0
+    proc memory_set_int64 from Memory with pool, POOL_OFF_WORKERS, workers
+    proc memory_set_int64 from Memory with pool, POOL_OFF_TIDS, tids
+
+    Note: Spawn the workers. The $name operator yields pool_worker_main's
+    Note: real entry address, which the codegen lowers to a RIP-relative load.
+    Let worker_fn be $pool_worker_main
+    Let i be 0
+    While i is less than workers:
+        Let tid be proc thread_create from Thread with worker_fn, pool
+        Let tid_offset be i multiplied by POOL_TID_SIZE
+        proc memory_set_int64 from Memory with tids, tid_offset, tid
+        Set i to i plus 1
+    End While
+
+    Return pool
+End Process
+
+Process called "pool_submit" takes pool as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Enqueue one task for asynchronous execution by a worker. Submission never
+    fails because of a full queue: the ring grows on demand, so the only hard
+    failure is exhausting memory while growing.
+    @End Reasoning
+
+    @Implementation
+    Under the queue mutex, if the ring is full, double it: allocate a new ring,
+    copy the live tasks into it in FIFO order (oldest at index 0), free the old
+    ring, and re-base head to 0 and tail to the live count. Then write (fn,arg)
+    into the tail slot, advance tail with wraparound, increment both the queued
+    count and the pending count, signal not_empty to release one parked worker,
+    and release the mutex.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path (no grow): one mutex acquire/release, two field stores for the
+    slot, four counter updates, and one condvar_signal (a single futex wake).
+    Grow path is amortized O(1): it copies count entries but only when the ring
+    has doubled, so total copy work is linear in tasks submitted.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns POOL_ERR_NULL. A failed grow allocation releases the lock
+    and returns POOL_ERR_ALLOC without mutating the queue, leaving the pool
+    fully usable. The lock is always released on every return path.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return POOL_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with pool, POOL_OFF_MUTEX
+    Let not_empty be proc memory_get_int64 from Memory with pool, POOL_OFF_NOT_EMPTY
+    proc mutex_acquire from Mutex with mtx
+
+    Let count be proc memory_get_int64 from Memory with pool, POOL_OFF_COUNT
+    Let capacity be proc memory_get_int64 from Memory with pool, POOL_OFF_CAPACITY
+
+    If count is equal to capacity:
+        Note: Ring is full — grow it to double capacity, copying in FIFO order.
+        Let old_ring be proc memory_get_int64 from Memory with pool, POOL_OFF_RING
+        Let head be proc memory_get_int64 from Memory with pool, POOL_OFF_HEAD
+        Let new_capacity be capacity multiplied by 2
+        Let new_bytes be new_capacity multiplied by POOL_SLOT_SIZE
+        Let new_ring be proc allocate from Memory with new_bytes
+        If new_ring is equal to 0:
+            proc mutex_release from Mutex with mtx
+            Return POOL_ERR_ALLOC
+        End If
+
+        Let j be 0
+        While j is less than count:
+            Let src_index be head plus j
+            Set src_index to src_index modulo by capacity
+            Let src_offset be src_index multiplied by POOL_SLOT_SIZE
+            Let src_addr be old_ring plus src_offset
+            Let copied_fn be proc memory_get_int64 from Memory with src_addr, POOL_SLOT_OFF_FN
+            Let copied_arg be proc memory_get_int64 from Memory with src_addr, POOL_SLOT_OFF_ARG
+            Let dst_offset be j multiplied by POOL_SLOT_SIZE
+            Let dst_addr be new_ring plus dst_offset
+            proc memory_set_int64 from Memory with dst_addr, POOL_SLOT_OFF_FN, copied_fn
+            proc memory_set_int64 from Memory with dst_addr, POOL_SLOT_OFF_ARG, copied_arg
+            Set j to j plus 1
+        End While
+
+        proc deallocate from Memory with old_ring
+        proc memory_set_int64 from Memory with pool, POOL_OFF_RING, new_ring
+        proc memory_set_int64 from Memory with pool, POOL_OFF_HEAD, 0
+        proc memory_set_int64 from Memory with pool, POOL_OFF_TAIL, count
+        proc memory_set_int64 from Memory with pool, POOL_OFF_CAPACITY, new_capacity
+        Set capacity to new_capacity
+    End If
+
+    Note: Push (fn, arg) into the tail slot and advance tail with wraparound.
+    Let tail be proc memory_get_int64 from Memory with pool, POOL_OFF_TAIL
+    Let ring be proc memory_get_int64 from Memory with pool, POOL_OFF_RING
+    Let push_offset be tail multiplied by POOL_SLOT_SIZE
+    Let push_addr be ring plus push_offset
+    proc memory_set_int64 from Memory with push_addr, POOL_SLOT_OFF_FN, fn
+    proc memory_set_int64 from Memory with push_addr, POOL_SLOT_OFF_ARG, arg
+
+    Let new_tail be tail plus 1
+    If new_tail is equal to capacity:
+        Set new_tail to 0
+    End If
+    proc memory_set_int64 from Memory with pool, POOL_OFF_TAIL, new_tail
+
+    Let count_inc be count plus 1
+    proc memory_set_int64 from Memory with pool, POOL_OFF_COUNT, count_inc
+
+    Let pending be proc memory_get_int64 from Memory with pool, POOL_OFF_PENDING
+    Let pending_inc be pending plus 1
+    proc memory_set_int64 from Memory with pool, POOL_OFF_PENDING, pending_inc
+
+    proc condvar_signal from CondVar with not_empty
+    proc mutex_release from Mutex with mtx
+    Return POOL_OK
+End Process
+
+Process called "pool_pending" takes pool as Integer returns Integer:
+    @Reasoning
+    Report how many submitted tasks have not yet finished — those still queued
+    plus those currently executing in a worker. Read under the lock so the
+    count is a coherent snapshot rather than a torn read.
+    @End Reasoning
+
+    @Implementation
+    Acquire the queue mutex, read the pending counter, release, and return it.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex acquire/release and a single field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns POOL_ERR_NULL. Advisory: the count may change the instant
+    the lock is released.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return POOL_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with pool, POOL_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+    Let pending be proc memory_get_int64 from Memory with pool, POOL_OFF_PENDING
+    proc mutex_release from Mutex with mtx
+    Return pending
+End Process
+
+Process called "pool_wait_idle" takes pool as Integer returns Integer:
+    @Reasoning
+    Block the calling thread until every submitted task has completed. This is
+    the join point for callers that fan work out to the pool and must observe
+    all results before proceeding.
+    @End Reasoning
+
+    @Implementation
+    Acquire the queue mutex and wait on the drained condition variable while
+    the pending counter is above zero, re-reading pending after each wake (a
+    worker broadcasts drained exactly when it drives pending to zero). The wait
+    receives the RuntimeMutex object, which condvar_wait atomically releases and
+    re-acquires. Release the mutex once pending has reached zero.
+    @End Implementation
+
+    @Performance_Hints
+    Parks on the OS futex via condvar_wait with no busy-waiting. Returns
+    immediately when no tasks are pending.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns POOL_ERR_NULL. On return the lock is released and all
+    work submitted before the call has finished executing.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return POOL_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with pool, POOL_OFF_MUTEX
+    Let drained be proc memory_get_int64 from Memory with pool, POOL_OFF_DRAINED
+    proc mutex_acquire from Mutex with mtx
+
+    Let pending be proc memory_get_int64 from Memory with pool, POOL_OFF_PENDING
+    While pending is greater than 0:
+        proc condvar_wait from CondVar with drained, mtx
+        Set pending to proc memory_get_int64 from Memory with pool, POOL_OFF_PENDING
+    End While
+
+    proc mutex_release from Mutex with mtx
+    Return POOL_OK
+End Process
+
+Process called "pool_worker_count" takes pool as Integer returns Integer:
+    @Reasoning
+    Report the number of worker threads the pool was constructed with, for
+    diagnostics and for callers that size their work distribution to the pool.
+    @End Reasoning
+
+    @Implementation
+    Read the immutable worker-count field. It is fixed at construction and
+    never mutated thereafter, so no lock is required.
+    @End Implementation
+
+    @Performance_Hints
+    A single field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns POOL_ERR_NULL. Pure read.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return POOL_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with pool, POOL_OFF_WORKERS
+End Process
+
+Process called "pool_shutdown" takes pool as Integer returns Integer:
+    @Reasoning
+    Drain, stop, and destroy the pool. Every task already submitted runs to
+    completion before any worker exits, so shutdown is lossless. After the
+    workers have joined, every owned resource is released.
+    @End Reasoning
+
+    @Implementation
+    Under the queue mutex, set the shutdown flag and broadcast not_empty so
+    every parked worker wakes, observes shutdown, and either drains a remaining
+    task or exits once the queue is empty. Release the mutex, then join every
+    worker thread (thread_join tolerates a zero id, so a failed spawn is
+    skipped safely). With all workers stopped and no thread left touching the
+    pool, destroy both condition variables and the mutex, then deallocate the
+    ring, the worker-id array, and the pool object.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one broadcast, N thread joins, two condvar destroys, one mutex
+    destroy, and three deallocations. Blocks until the queue is fully drained.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns POOL_ERR_NULL. After this call the pool pointer is
+    invalid and MUST NOT be reused. Calling it concurrently with itself on the
+    same pool is a logic error.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return POOL_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with pool, POOL_OFF_MUTEX
+    Let not_empty be proc memory_get_int64 from Memory with pool, POOL_OFF_NOT_EMPTY
+    Let drained be proc memory_get_int64 from Memory with pool, POOL_OFF_DRAINED
+
+    Note: Request shutdown and release every worker parked on not_empty.
+    proc mutex_acquire from Mutex with mtx
+    proc memory_set_int64 from Memory with pool, POOL_OFF_SHUTDOWN, 1
+    proc condvar_broadcast from CondVar with not_empty
+    proc mutex_release from Mutex with mtx
+
+    Note: Join every worker so no thread touches the pool after teardown.
+    Let workers be proc memory_get_int64 from Memory with pool, POOL_OFF_WORKERS
+    Let tids be proc memory_get_int64 from Memory with pool, POOL_OFF_TIDS
+    Let i be 0
+    While i is less than workers:
+        Let tid_offset be i multiplied by POOL_TID_SIZE
+        Let tid be proc memory_get_int64 from Memory with tids, tid_offset
+        proc thread_join from Thread with tid
+        Set i to i plus 1
+    End While
+
+    Note: All workers stopped — release every owned resource.
+    Let ring be proc memory_get_int64 from Memory with pool, POOL_OFF_RING
+    proc condvar_destroy from CondVar with not_empty
+    proc condvar_destroy from CondVar with drained
+    proc mutex_destroy from Mutex with mtx
+    proc deallocate from Memory with ring
+    proc deallocate from Memory with tids
+    proc deallocate from Memory with pool
+    Return POOL_OK
+End Process

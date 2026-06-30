@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,668 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles thread synchronization and thread coordination for the Runa runtime concurrency system.
+High-level thread-coordination API — the public phase/rendezvous objects for
+the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process thread synchronization and thread coordination
-- Handle thread coordination and thread synchronization
-- Manage thread coordination and thread synchronization
-- Process thread synchronization error handling and thread synchronization feedback
+This is the runtime-facing coordination layer. It does NOT touch OS futexes or
+the cross-platform synchronization facade directly. Instead it COMPOSES the
+already-completed runtime mutex (mutex.runa) and runtime condition variable
+(condition_variable.runa) object layers into three classic coordination
+primitives, each of which couples a counter (or a flag) with the
+mutex+condvar pair so threads can rendezvous on a shared milestone:
 
-This file is essential because of the following reasons:
-- thread_synchronization enables comprehensive thread synchronization and thread coordination
-- Proper thread synchronization handling ensures correct thread coordination and user experience
-- thread_synchronization support enables Runa compilation for thread synchronization-based workflows
+  - WAITGROUP (Go-style): a monotonic work counter. Producers register pending
+    work with waitgroup_add, each unit of work calls waitgroup_done as it
+    completes, and one or more coordinators block in waitgroup_wait until the
+    counter drains to zero. Used to join a dynamic fan-out of tasks without
+    knowing their thread identities.
+  - COUNTDOWNLATCH: a single-use gate initialized with a fixed count. Each
+    arriving party calls latch_count_down once; threads in latch_wait are
+    released together when the count reaches zero. Used for one-shot "wait until
+    N things have happened" barriers (startup readiness, phase completion).
+  - ONCE: an idempotent initializer. once_do runs a supplied function pointer
+    exactly one time across every caller and every thread; all later calls
+    observe that it already ran and return without re-invoking. Used for lazy
+    one-time setup (singletons, global tables) that must not race.
 
-This file consists of the following functions/features/operation types:
-- Thread synchronization and thread coordination
-- Thread coordination and thread synchronization
-- Thread coordination and thread synchronization
-- Thread synchronization error handling and thread synchronization feedback
+COMPOSITION CONTRACT: every wait re-checks its predicate inside a While loop
+around condvar_wait, so a spurious wakeup (a wake delivered without the
+predicate actually being satisfied) simply re-blocks rather than escaping the
+loop. The RuntimeMutex handle returned by mutex_new IS the object handed to
+condvar_wait — condvar_wait extracts the underlying sync_core handle from the
+mutex's offset 0 itself, so this layer stores and passes the mutex handle
+directly and never reaches below the object API.
+
+WaitGroup layout (24 bytes):
+    offset 0:   mutex     — RuntimeMutex handle guarding the counter
+    offset 8:   condvar   — RuntimeCondVar handle signalled when the counter drains
+    offset 16:  counter   — outstanding work units
+
+CountDownLatch layout (24 bytes):
+    offset 0:   mutex     — RuntimeMutex handle guarding the count
+    offset 8:   condvar   — RuntimeCondVar handle signalled when the count hits zero
+    offset 16:  count     — parties still to arrive
+
+Once layout (16 bytes):
+    offset 0:   mutex     — RuntimeMutex handle guarding the done flag and the run
+    offset 8:   done      — 0 not yet run, 1 already run
 :End Note
 
-Note: TODO - Implement thread_synchronization functionality
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: WaitGroup object layout
+Constant WG_SIZE as Integer is 24
+Constant WG_OFF_MUTEX as Integer is 0
+Constant WG_OFF_CONDVAR as Integer is 8
+Constant WG_OFF_COUNTER as Integer is 16
+
+Note: Status codes returned by the WaitGroup API
+Constant WG_OK as Integer is 0
+Constant WG_ERR_NULL as Integer is 0 minus 1
+
+Note: CountDownLatch object layout
+Constant LATCH_SIZE as Integer is 24
+Constant LATCH_OFF_MUTEX as Integer is 0
+Constant LATCH_OFF_CONDVAR as Integer is 8
+Constant LATCH_OFF_COUNT as Integer is 16
+
+Note: Status codes returned by the CountDownLatch API
+Constant LATCH_OK as Integer is 0
+Constant LATCH_ERR_NULL as Integer is 0 minus 1
+
+Note: Once object layout
+Constant ONCE_SIZE as Integer is 16
+Constant ONCE_OFF_MUTEX as Integer is 0
+Constant ONCE_OFF_DONE as Integer is 8
+
+Note: Status codes returned by the Once API
+Constant ONCE_OK as Integer is 0
+Constant ONCE_ERR_NULL as Integer is 0 minus 1
+
+Note: ============================================================================
+Note: WaitGroup — Go-style dynamic work-counter join
+Note: ============================================================================
+
+Process called "waitgroup_new" returns Integer:
+    @Reasoning
+    Create a WaitGroup object. The synchronization mechanism comes entirely from
+    a composed RuntimeMutex (guarding the counter) and a RuntimeCondVar (waking
+    coordinators when the counter drains); this layer adds the counter and a
+    stable object identity callers hold.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 24-byte WaitGroup, create the underlying runtime mutex and
+    condvar, store both handles, and initialize the counter to 0. On any
+    allocation/creation failure, release whatever was acquired in reverse order
+    and return 0 so no half-built object escapes.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one mutex_new and one condvar_new (each of which
+    allocates its own control block and an OS primitive). Cold path: done once
+    per WaitGroup.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use. No partially
+    initialized object is ever returned.
+    @End Security_Scope
+
+    Let wg be proc allocate from Memory with WG_SIZE
+    If wg is equal to 0:
+        Return 0
+    End If
+
+    Let m be proc mutex_new from Mutex
+    If m is equal to 0:
+        proc deallocate from Memory with wg
+        Return 0
+    End If
+
+    Let cv be proc condvar_new from CondVar
+    If cv is equal to 0:
+        proc mutex_destroy from Mutex with m
+        proc deallocate from Memory with wg
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with wg, WG_OFF_MUTEX, m
+    proc memory_set_int64 from Memory with wg, WG_OFF_CONDVAR, cv
+    proc memory_set_int64 from Memory with wg, WG_OFF_COUNTER, 0
+    Return wg
+End Process
+
+Process called "waitgroup_add" takes wg as Integer, delta as Integer returns Integer:
+    @Reasoning
+    Register additional (or, with a negative delta, retire) outstanding work
+    before launching it. Adjusting the counter must be atomic with respect to
+    waitgroup_done and waitgroup_wait, so it happens under the WaitGroup mutex.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, load the counter, add delta, store it back. If the new
+    value is at or below zero, the group is already satisfied, so broadcast the
+    condvar to release any coordinators currently waiting before releasing the
+    mutex. Return WG_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair plus two field accesses; a single
+    condvar_broadcast only on the transition that drains the counter.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns WG_ERR_NULL without touching memory. The counter is only
+    ever read or written while the mutex is held, so concurrent adds and dones
+    cannot interleave a torn update.
+    @End Security_Scope
+
+    If wg is equal to 0:
+        Return WG_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with wg, WG_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with wg, WG_OFF_CONDVAR
+    proc mutex_acquire from Mutex with m
+
+    Let counter be proc memory_get_int64 from Memory with wg, WG_OFF_COUNTER
+    Let new_counter be counter plus delta
+    proc memory_set_int64 from Memory with wg, WG_OFF_COUNTER, new_counter
+    If new_counter is less than or equal to 0:
+        proc condvar_broadcast from CondVar with cv
+    End If
+
+    proc mutex_release from Mutex with m
+    Return WG_OK
+End Process
+
+Process called "waitgroup_done" takes wg as Integer returns Integer:
+    @Reasoning
+    Signal that one unit of registered work has completed. When the last unit
+    finishes the counter reaches zero and every coordinator blocked in
+    waitgroup_wait must be released.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, decrement the counter by one, store it back, and when it
+    reaches (or has already fallen to) zero broadcast the condvar so all waiters
+    re-evaluate their predicate. Release the mutex and return WG_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair plus two field accesses; a single
+    condvar_broadcast only on the draining transition.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns WG_ERR_NULL. The decrement and the zero test are
+    performed under the mutex so the broadcast is published atomically with the
+    counter reaching zero.
+    @End Security_Scope
+
+    If wg is equal to 0:
+        Return WG_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with wg, WG_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with wg, WG_OFF_CONDVAR
+    proc mutex_acquire from Mutex with m
+
+    Let counter be proc memory_get_int64 from Memory with wg, WG_OFF_COUNTER
+    Let new_counter be counter minus 1
+    proc memory_set_int64 from Memory with wg, WG_OFF_COUNTER, new_counter
+    If new_counter is less than or equal to 0:
+        proc condvar_broadcast from CondVar with cv
+    End If
+
+    proc mutex_release from Mutex with m
+    Return WG_OK
+End Process
+
+Process called "waitgroup_wait" takes wg as Integer returns Integer:
+    @Reasoning
+    Block the calling coordinator until all registered work has completed, i.e.
+    until the counter drains to zero. Multiple coordinators may wait at once and
+    are all released together when the group is satisfied.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, then loop: while the counter is still greater than zero,
+    condvar_wait on the WaitGroup's condvar paired with its mutex. The mutex
+    handle stored at offset 0 is passed directly to condvar_wait, which extracts
+    the underlying sync_core handle itself. The While loop re-checks the counter
+    after every wake, so a spurious wakeup simply re-blocks instead of returning
+    early. Once the counter is zero, release the mutex and return WG_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair. The thread parks in condvar_wait
+    with no busy-waiting and is woken only by the draining broadcast; the loop
+    re-acquires the mutex once per wake to re-test the predicate.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns WG_ERR_NULL without touching the wait queue. The counter
+    predicate is only ever evaluated while the mutex is held, and condvar_wait
+    re-acquires that same mutex before returning, so the held/predicate contract
+    is preserved across every iteration.
+    @End Security_Scope
+
+    If wg is equal to 0:
+        Return WG_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with wg, WG_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with wg, WG_OFF_CONDVAR
+    proc mutex_acquire from Mutex with m
+
+    Let counter be proc memory_get_int64 from Memory with wg, WG_OFF_COUNTER
+    While counter is greater than 0:
+        proc condvar_wait from CondVar with cv, m
+        Set counter to proc memory_get_int64 from Memory with wg, WG_OFF_COUNTER
+    End While
+
+    proc mutex_release from Mutex with m
+    Return WG_OK
+End Process
+
+Process called "waitgroup_destroy" takes wg as Integer returns Integer:
+    @Reasoning
+    Release the composed mutex and condvar and free the WaitGroup object. Must
+    not be called while any coordinator is still waiting on the group.
+    @End Reasoning
+
+    @Implementation
+    Read both composed handles, delegate to condvar_destroy and mutex_destroy
+    (each of which frees its facade control block and OS primitive), then
+    deallocate the WaitGroup object.
+    @End Implementation
+
+    @Performance_Hints
+    One condvar_destroy, one mutex_destroy, and one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns WG_ERR_NULL. Destroying a WaitGroup with active waiters
+    is a logic error.
+    @End Security_Scope
+
+    If wg is equal to 0:
+        Return WG_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with wg, WG_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with wg, WG_OFF_CONDVAR
+    proc condvar_destroy from CondVar with cv
+    proc mutex_destroy from Mutex with m
+    proc deallocate from Memory with wg
+    Return WG_OK
+End Process
+
+Note: ============================================================================
+Note: CountDownLatch — single-use "wait until N events" gate
+Note: ============================================================================
+
+Process called "latch_new" takes count as Integer returns Integer:
+    @Reasoning
+    Create a CountDownLatch initialized to a fixed number of expected events.
+    The mechanism is a composed RuntimeMutex (guarding the count) and
+    RuntimeCondVar (waking waiters when the count reaches zero); this layer adds
+    the count and a stable object identity.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 24-byte latch, create the underlying mutex and condvar, store
+    both handles, and initialize the count to the requested value. On any
+    allocation/creation failure, release whatever was acquired in reverse order
+    and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one mutex_new and one condvar_new. Cold path: done
+    once per latch.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use. A latch created with
+    a count of zero is already open: latch_wait returns immediately.
+    @End Security_Scope
+
+    Let l be proc allocate from Memory with LATCH_SIZE
+    If l is equal to 0:
+        Return 0
+    End If
+
+    Let m be proc mutex_new from Mutex
+    If m is equal to 0:
+        proc deallocate from Memory with l
+        Return 0
+    End If
+
+    Let cv be proc condvar_new from CondVar
+    If cv is equal to 0:
+        proc mutex_destroy from Mutex with m
+        proc deallocate from Memory with l
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with l, LATCH_OFF_MUTEX, m
+    proc memory_set_int64 from Memory with l, LATCH_OFF_CONDVAR, cv
+    proc memory_set_int64 from Memory with l, LATCH_OFF_COUNT, count
+    Return l
+End Process
+
+Process called "latch_count_down" takes l as Integer returns Integer:
+    @Reasoning
+    Record the arrival of one expected event. When the final event arrives the
+    count reaches zero and the gate opens, releasing every waiter together. The
+    count never drops below zero, so extra count-downs after the gate has opened
+    are harmless no-ops.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, load the count, and only when it is still greater than
+    zero decrement it and store it back; once it reaches zero broadcast the
+    condvar to release all waiters. Decrementing below zero is suppressed so a
+    late arrival cannot re-close an already-open gate. Release the mutex and
+    return LATCH_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair plus field accesses; a single
+    condvar_broadcast only on the transition that opens the gate.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns LATCH_ERR_NULL. The count test, decrement, and broadcast
+    are all performed under the mutex so the gate opens atomically with the count
+    reaching zero.
+    @End Security_Scope
+
+    If l is equal to 0:
+        Return LATCH_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with l, LATCH_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with l, LATCH_OFF_CONDVAR
+    proc mutex_acquire from Mutex with m
+
+    Let count be proc memory_get_int64 from Memory with l, LATCH_OFF_COUNT
+    If count is greater than 0:
+        Let new_count be count minus 1
+        proc memory_set_int64 from Memory with l, LATCH_OFF_COUNT, new_count
+        If new_count is equal to 0:
+            proc condvar_broadcast from CondVar with cv
+        End If
+    End If
+
+    proc mutex_release from Mutex with m
+    Return LATCH_OK
+End Process
+
+Process called "latch_wait" takes l as Integer returns Integer:
+    @Reasoning
+    Block the caller until the latch has counted all the way down to zero. Any
+    number of threads may wait; they are all released together when the gate
+    opens. A latch already at zero releases the caller immediately.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, then loop: while the count is still greater than zero,
+    condvar_wait on the latch's condvar paired with its mutex (the mutex handle
+    is passed directly; condvar_wait extracts the sync_core handle itself). The
+    While loop re-reads the count after every wake, so a spurious wakeup simply
+    re-blocks. Once the count is zero, release the mutex and return LATCH_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair. The thread parks in condvar_wait
+    with no busy-waiting and is woken only by the gate-opening broadcast.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns LATCH_ERR_NULL without touching the wait queue. The count
+    predicate is only evaluated while the mutex is held, and condvar_wait
+    re-acquires that same mutex before returning.
+    @End Security_Scope
+
+    If l is equal to 0:
+        Return LATCH_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with l, LATCH_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with l, LATCH_OFF_CONDVAR
+    proc mutex_acquire from Mutex with m
+
+    Let count be proc memory_get_int64 from Memory with l, LATCH_OFF_COUNT
+    While count is greater than 0:
+        proc condvar_wait from CondVar with cv, m
+        Set count to proc memory_get_int64 from Memory with l, LATCH_OFF_COUNT
+    End While
+
+    proc mutex_release from Mutex with m
+    Return LATCH_OK
+End Process
+
+Process called "latch_get_count" takes l as Integer returns Integer:
+    @Reasoning
+    Report how many events remain before the gate opens. Used for diagnostics
+    and progress reporting; callers must not build control flow on the value
+    because it can change the instant the call returns.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, read the count into a local, release the mutex, and return
+    the captured value so the read is never torn against a concurrent
+    count-down.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair plus one field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns 0. Advisory only; the count may change immediately after
+    the call returns.
+    @End Security_Scope
+
+    If l is equal to 0:
+        Return 0
+    End If
+
+    Let m be proc memory_get_int64 from Memory with l, LATCH_OFF_MUTEX
+    proc mutex_acquire from Mutex with m
+    Let count be proc memory_get_int64 from Memory with l, LATCH_OFF_COUNT
+    proc mutex_release from Mutex with m
+    Return count
+End Process
+
+Process called "latch_destroy" takes l as Integer returns Integer:
+    @Reasoning
+    Release the composed mutex and condvar and free the latch object. Must not be
+    called while any thread is still waiting on the latch.
+    @End Reasoning
+
+    @Implementation
+    Read both composed handles, delegate to condvar_destroy and mutex_destroy,
+    then deallocate the latch object.
+    @End Implementation
+
+    @Performance_Hints
+    One condvar_destroy, one mutex_destroy, and one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns LATCH_ERR_NULL. Destroying a latch with active waiters is
+    a logic error.
+    @End Security_Scope
+
+    If l is equal to 0:
+        Return LATCH_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with l, LATCH_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with l, LATCH_OFF_CONDVAR
+    proc condvar_destroy from CondVar with cv
+    proc mutex_destroy from Mutex with m
+    proc deallocate from Memory with l
+    Return LATCH_OK
+End Process
+
+Note: ============================================================================
+Note: Once — run a function pointer exactly one time across all threads
+Note: ============================================================================
+
+Process called "once_new" returns Integer:
+    @Reasoning
+    Create a Once object. The mechanism is a single composed RuntimeMutex that
+    serializes the first-run race; this layer adds a done flag and a stable
+    object identity. No condvar is needed because once_do never blocks waiting
+    for another party — it only needs mutual exclusion around the flag test and
+    the single invocation.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 16-byte Once, create the underlying mutex, store its handle, and
+    initialize the done flag to 0 (not yet run). On any allocation/creation
+    failure, release whatever was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one mutex_new. Cold path: done once per Once.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let o be proc allocate from Memory with ONCE_SIZE
+    If o is equal to 0:
+        Return 0
+    End If
+
+    Let m be proc mutex_new from Mutex
+    If m is equal to 0:
+        proc deallocate from Memory with o
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with o, ONCE_OFF_MUTEX, m
+    proc memory_set_int64 from Memory with o, ONCE_OFF_DONE, 0
+    Return o
+End Process
+
+Process called "once_do" takes o as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Run the supplied initializer function pointer exactly once, no matter how
+    many callers or threads invoke once_do. The first caller to win the mutex
+    observes the cleared done flag, runs fn, and sets the flag; every later
+    caller observes the set flag under the same mutex and skips the call. This is
+    the idempotent-initialization guarantee used for lazy singletons and global
+    setup.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex. If the done flag is still 0, invoke the function pointer
+    via call_indirect_1 with the caller's argument, then set the done flag to 1
+    so no subsequent caller re-runs it. The flag test and the invocation happen
+    under the same lock, so concurrent first callers cannot both enter the body.
+    Release the mutex and return ONCE_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair. The wrapped function runs only on the
+    very first call; every later call is just a flag load plus the lock
+    round-trip with no indirect call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns ONCE_ERR_NULL without touching memory or invoking fn. The
+    initializer runs while the Once mutex is held, so an initializer that itself
+    calls once_do on the SAME Once would deadlock — callers must not re-enter the
+    same Once from within its own initializer.
+    @End Security_Scope
+
+    If o is equal to 0:
+        Return ONCE_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with o, ONCE_OFF_MUTEX
+    proc mutex_acquire from Mutex with m
+
+    Let done be proc memory_get_int64 from Memory with o, ONCE_OFF_DONE
+    If done is equal to 0:
+        proc call_indirect_1 from Call with fn, arg
+        proc memory_set_int64 from Memory with o, ONCE_OFF_DONE, 1
+    End If
+
+    proc mutex_release from Mutex with m
+    Return ONCE_OK
+End Process
+
+Process called "once_has_run" takes o as Integer returns Integer:
+    @Reasoning
+    Report whether the one-time initializer has already executed. Callers that
+    can take a fast path once setup is complete use this to avoid the once_do
+    lock round-trip.
+    @End Reasoning
+
+    @Implementation
+    Acquire the mutex, read the done flag into a local, release the mutex, and
+    return the captured value so the read cannot race the first runner's flag
+    store.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_acquire / mutex_release pair plus one field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns 0. The returned value is a stable snapshot: once it is 1
+    it can never revert, so a true result is permanently authoritative.
+    @End Security_Scope
+
+    If o is equal to 0:
+        Return 0
+    End If
+
+    Let m be proc memory_get_int64 from Memory with o, ONCE_OFF_MUTEX
+    proc mutex_acquire from Mutex with m
+    Let done be proc memory_get_int64 from Memory with o, ONCE_OFF_DONE
+    proc mutex_release from Mutex with m
+    Return done
+End Process
+
+Process called "once_destroy" takes o as Integer returns Integer:
+    @Reasoning
+    Release the composed mutex and free the Once object. Must not be called while
+    another thread may still invoke once_do on it.
+    @End Reasoning
+
+    @Implementation
+    Read the mutex handle, delegate to mutex_destroy, then deallocate the Once
+    object.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns ONCE_ERR_NULL. Destroying a Once that another thread may
+    still call is a logic error.
+    @End Security_Scope
+
+    If o is equal to 0:
+        Return ONCE_ERR_NULL
+    End If
+
+    Let m be proc memory_get_int64 from Memory with o, ONCE_OFF_MUTEX
+    proc mutex_destroy from Mutex with m
+    proc deallocate from Memory with o
+    Return ONCE_OK
+End Process

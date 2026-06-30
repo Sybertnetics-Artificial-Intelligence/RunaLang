@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1094 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles work stealing implementation and work stealing management for the Runa runtime concurrency system.
+Work-stealing thread pool — the public load-balancing executor for the Runa
+runtime concurrency system.
 
-This file performs the following tasks:
-- Process work stealing implementation and work stealing management
-- Handle work stealing coordination and work stealing synchronization
-- Manage work stealing execution and work stealing coordination
-- Process work stealing error handling and work stealing feedback
+A work-stealing pool spreads independent tasks across a fixed set of worker
+threads while keeping every core busy. Each worker owns a private double-ended
+task queue (a deque). The owner of a deque pushes and pops at its BOTTOM; an
+idle worker that has drained its own deque STEALS from the TOP of another
+worker's deque. Touching opposite ends keeps the owner and the thief out of
+each other's way almost all of the time, so contention stays low even though
+the design is fully synchronous and verifiable.
 
-This file is essential because of the following reasons:
-- work_stealing enables comprehensive work stealing implementation and work stealing management
-- Proper work stealing handling ensures correct work stealing execution and user experience
-- work_stealing support enables Runa compilation for work stealing-based workflows
+CORRECTNESS-FIRST DESIGN — MUTEX-PROTECTED DEQUES, NOT LOCK-FREE:
+This module deliberately protects each deque with its own RuntimeMutex rather
+than implementing a lock-free Chase-Lev deque. The owner locks its OWN deque to
+push/pop the bottom; a thief locks the VICTIM'S deque to steal from the top.
+Because every read and every write of a deque's head/tail/count/ring happens
+under that deque's single mutex, every deque operation is a complete critical
+section: no two threads ever observe or mutate the same deque's indices
+concurrently, which makes the classic owner-vs-thief and thief-vs-thief races
+impossible by construction. A subtly racy lock-free deque is worse than a
+correct locked one; the per-deque lock is the production-correct choice, and it
+stays cheap because a worker overwhelmingly touches only its own deque.
 
-This file consists of the following functions/features/operation types:
-- Work stealing implementation and work stealing management
-- Work stealing coordination and work stealing synchronization
-- Work stealing execution and work stealing coordination
-- Work stealing error handling and work stealing feedback
+IDLE-WAIT SIGNAL — ONE COUNTING SEMAPHORE:
+A single counting semaphore ("tasks available") spans all deques. Every submit
+releases one permit; every worker iteration acquires one permit before looking
+for work, so idle workers BLOCK on the OS instead of spinning the CPU. Permit
+accounting is exact: submit releases exactly one permit per task and shutdown
+releases exactly one permit per worker, so every task is executed exactly once
+and every worker receives exactly one "no work, shutting down" wake and exits.
+
+DRAIN SIGNAL — PENDING COUNTER + CONDITION VARIABLE:
+A mutex-guarded pending counter tracks tasks submitted but not yet completed.
+ws_wait_idle blocks on a condition variable until pending reaches zero; the
+worker that completes the last task broadcasts that condition. The round-robin
+submit cursor lives under the same pending mutex.
+
+WorkStealingPool layout (80 bytes):
+    offset 0:  worker_count   — number of worker threads / deques
+    offset 8:  deques         — pointer to worker_count deque pointers
+    offset 16: tids           — pointer to worker_count thread-id pointers
+    offset 24: contexts       — pointer to worker_count worker-context pointers
+    offset 32: tasks_sem      — RuntimeSemaphore "tasks available" signal
+    offset 40: shutdown       — 0 running, 1 draining-then-exit
+    offset 48: pending        — tasks submitted but not yet completed
+    offset 56: pending_mutex  — RuntimeMutex guarding pending + rr cursor
+    offset 64: drained_cv     — RuntimeCondVar signalled when pending hits 0
+    offset 72: rr_cursor      — round-robin index for submit placement
+
+WorkerContext layout (16 bytes):
+    offset 0:  pool           — the owning WorkStealingPool
+    offset 8:  worker_index   — this worker's index into the deque array
+
+Deque layout (48 bytes):
+    offset 0:  mutex          — RuntimeMutex guarding this deque
+    offset 8:  ring           — pointer to capacity (fn,arg) task slots
+    offset 16: head           — index of the steal (top) end
+    offset 24: tail           — index of the push/pop (bottom) end
+    offset 32: count          — number of tasks currently held
+    offset 40: capacity       — number of task slots in the ring
+
+Task slot layout (16 bytes): fn pointer at +0, arg pointer at +8.
 :End Note
 
-Note: TODO - Implement work_stealing functionality
+Import "compiler/frontend/primitives/threading/thread_core.runa" as Thread
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/semaphore.runa" as Sem
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: Status codes returned by the work-stealing pool API
+Constant WS_OK as Integer is 0
+Constant WS_ERR_NULL as Integer is 0 minus 1
+Constant WS_ERR_ALLOC as Integer is 0 minus 2
+
+Note: WorkStealingPool object layout
+Constant WS_POOL_SIZE as Integer is 80
+Constant WS_POOL_OFF_WORKER_COUNT as Integer is 0
+Constant WS_POOL_OFF_DEQUES as Integer is 8
+Constant WS_POOL_OFF_TIDS as Integer is 16
+Constant WS_POOL_OFF_CONTEXTS as Integer is 24
+Constant WS_POOL_OFF_SEM as Integer is 32
+Constant WS_POOL_OFF_SHUTDOWN as Integer is 40
+Constant WS_POOL_OFF_PENDING as Integer is 48
+Constant WS_POOL_OFF_PENDING_MUTEX as Integer is 56
+Constant WS_POOL_OFF_DRAINED_CV as Integer is 64
+Constant WS_POOL_OFF_RR as Integer is 72
+
+Note: WorkerContext object layout
+Constant WS_CTX_SIZE as Integer is 16
+Constant WS_CTX_OFF_POOL as Integer is 0
+Constant WS_CTX_OFF_INDEX as Integer is 8
+
+Note: Deque object layout
+Constant WS_DQ_SIZE as Integer is 48
+Constant WS_DQ_OFF_MUTEX as Integer is 0
+Constant WS_DQ_OFF_RING as Integer is 8
+Constant WS_DQ_OFF_HEAD as Integer is 16
+Constant WS_DQ_OFF_TAIL as Integer is 24
+Constant WS_DQ_OFF_COUNT as Integer is 32
+Constant WS_DQ_OFF_CAPACITY as Integer is 40
+
+Note: Task slot geometry and the initial per-deque capacity
+Constant WS_TASK_SIZE as Integer is 16
+Constant WS_TASK_OFF_FN as Integer is 0
+Constant WS_TASK_OFF_ARG as Integer is 8
+Constant WS_DQ_INIT_CAP as Integer is 64
+
+Note: Pointer-array element stride (one 8-byte pointer per worker)
+Constant WS_PTR_SIZE as Integer is 8
+
+Process called "ws_deque_new" returns Integer:
+    @Reasoning
+    Build one worker's private deque: its guarding mutex and a growable ring of
+    (fn,arg) task slots. The deque starts empty with head and tail at zero.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 48-byte deque header, create its RuntimeMutex, allocate the
+    initial ring of WS_DQ_INIT_CAP task slots, and initialise head, tail, and
+    count to zero with capacity set to the initial size. Any allocation failure
+    unwinds every resource acquired so far and returns 0.
+    @End Implementation
+
+    @Performance_Hints
+    Two allocations plus one mutex_new. Cold path: run once per worker at pool
+    construction, never on the steal/submit hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns 0 on any failure; callers MUST check before storing the deque.
+    @End Security_Scope
+
+    Let dq be proc allocate from Memory with WS_DQ_SIZE
+    If dq is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc deallocate from Memory with dq
+        Return 0
+    End If
+
+    Let ring_bytes be WS_DQ_INIT_CAP multiplied by WS_TASK_SIZE
+    Let ring be proc allocate from Memory with ring_bytes
+    If ring is equal to 0:
+        proc mutex_destroy from Mutex with mtx
+        proc deallocate from Memory with dq
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_MUTEX, mtx
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_RING, ring
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_HEAD, 0
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_TAIL, 0
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_COUNT, 0
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_CAPACITY, WS_DQ_INIT_CAP
+    Return dq
+End Process
+
+Process called "ws_deque_destroy" takes dq as Integer returns Integer:
+    @Reasoning
+    Release every resource a deque owns: its ring buffer, its mutex, and the
+    deque header itself. Called only during pool teardown, after all workers
+    have stopped, so no thread can be inside the deque's critical section.
+    @End Reasoning
+
+    @Implementation
+    Free the ring, destroy the mutex, then deallocate the header. Each field is
+    null-checked so a partially constructed deque can be torn down safely.
+    @End Implementation
+
+    @Performance_Hints
+    One deallocate, one mutex_destroy, one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null deque is a no-op returning WS_OK. Destroying a deque while a worker
+    could still touch it is a caller logic error prevented by joining first.
+    @End Security_Scope
+
+    If dq is equal to 0:
+        Return WS_OK
+    End If
+
+    Let ring be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_RING
+    If ring is not equal to 0:
+        proc deallocate from Memory with ring
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_MUTEX
+    If mtx is not equal to 0:
+        proc mutex_destroy from Mutex with mtx
+    End If
+
+    proc deallocate from Memory with dq
+    Return WS_OK
+End Process
+
+Process called "ws_deque_grow" takes dq as Integer returns Integer:
+    @Reasoning
+    Double a full deque's ring so a push never has to drop a task. The live
+    tasks form a logical sequence from head forward (wrapping at capacity); the
+    grow copies that sequence into a fresh contiguous buffer and re-bases the
+    indices so head is 0 and tail is count.
+    @End Reasoning
+
+    @Implementation
+    Allocate a buffer of twice the current capacity. Walk the count live tasks
+    in logical order starting at head (modulo old capacity), copying each
+    (fn,arg) pair into slot i of the new buffer. Publish the new ring, reset
+    head to 0 and tail to count, store the new capacity, and free the old ring.
+    Caller holds the deque mutex, so the resize is atomic with respect to every
+    other deque operation. Returns WS_ERR_ALLOC if the new buffer cannot be
+    allocated, leaving the original ring intact.
+    @End Implementation
+
+    @Performance_Hints
+    One allocation plus a count-element copy. Amortised O(1) per push because
+    capacity doubles, so the copy cost is spread across the inserts since the
+    last grow. Rare on steady-state workloads sized near the initial capacity.
+    @End Performance_Hints
+
+    @Security_Scope
+    Must be called while holding the deque mutex. On allocation failure the
+    deque is unchanged and remains fully usable.
+    @End Security_Scope
+
+    Let old_cap be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_CAPACITY
+    Let new_cap be old_cap multiplied by 2
+    Let old_ring be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_RING
+    Let cnt be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_COUNT
+    Let head be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_HEAD
+
+    Let new_bytes be new_cap multiplied by WS_TASK_SIZE
+    Let new_ring be proc allocate from Memory with new_bytes
+    If new_ring is equal to 0:
+        Return WS_ERR_ALLOC
+    End If
+
+    Let i be 0
+    While i is less than cnt:
+        Let logical be head plus i
+        Let src_idx be logical modulo by old_cap
+        Let src_off be src_idx multiplied by WS_TASK_SIZE
+        Let src_fn_off be src_off plus WS_TASK_OFF_FN
+        Let src_arg_off be src_off plus WS_TASK_OFF_ARG
+        Let fn be proc memory_get_int64 from Memory with old_ring, src_fn_off
+        Let arg be proc memory_get_int64 from Memory with old_ring, src_arg_off
+
+        Let dst_off be i multiplied by WS_TASK_SIZE
+        Let dst_fn_off be dst_off plus WS_TASK_OFF_FN
+        Let dst_arg_off be dst_off plus WS_TASK_OFF_ARG
+        proc memory_set_int64 from Memory with new_ring, dst_fn_off, fn
+        proc memory_set_int64 from Memory with new_ring, dst_arg_off, arg
+
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_RING, new_ring
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_HEAD, 0
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_TAIL, cnt
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_CAPACITY, new_cap
+    proc deallocate from Memory with old_ring
+    Return WS_OK
+End Process
+
+Process called "ws_deque_push_bottom" takes dq as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Append a task at the deque's bottom — the end the owning worker (and a
+    submitter routing work here) uses. Growing first guarantees the push always
+    succeeds when memory is available.
+    @End Reasoning
+
+    @Implementation
+    Lock the deque. If it is full, grow it (and refresh the capacity). Store the
+    (fn,arg) pair at the tail slot, advance tail modulo capacity, bump count,
+    and unlock. Returns WS_ERR_ALLOC (without inserting) if a needed grow fails.
+    The internal deque mutex is never poisoned by this module, so the acquire
+    always returns with the lock held.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex round-trip plus two stores on the common path; an extra resize
+    only when the ring is full.
+    @End Performance_Hints
+
+    @Security_Scope
+    The lock is always released before returning on every path, including the
+    grow-failure path.
+    @End Security_Scope
+
+    Let mtx be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+
+    Let cnt be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_COUNT
+    Let cap be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_CAPACITY
+    If cnt is greater than or equal to cap:
+        Let g be proc ws_deque_grow with dq
+        If g is not equal to WS_OK:
+            proc mutex_release from Mutex with mtx
+            Return g
+        End If
+        Set cap to proc memory_get_int64 from Memory with dq, WS_DQ_OFF_CAPACITY
+    End If
+
+    Let ring be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_RING
+    Let tail be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_TAIL
+    Let off be tail multiplied by WS_TASK_SIZE
+    Let fn_off be off plus WS_TASK_OFF_FN
+    Let arg_off be off plus WS_TASK_OFF_ARG
+    proc memory_set_int64 from Memory with ring, fn_off, fn
+    proc memory_set_int64 from Memory with ring, arg_off, arg
+
+    Let next_tail_raw be tail plus 1
+    Let next_tail be next_tail_raw modulo by cap
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_TAIL, next_tail
+    Let new_count be cnt plus 1
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_COUNT, new_count
+
+    proc mutex_release from Mutex with mtx
+    Return WS_OK
+End Process
+
+Process called "ws_deque_pop_bottom" takes dq as Integer, out_buf as Integer returns Integer:
+    @Reasoning
+    The owning worker takes its most recently pushed task from the bottom. LIFO
+    on the owner's own end gives good cache locality and leaves the older tasks
+    at the top for thieves, so owners and thieves rarely touch the same slot.
+    @End Reasoning
+
+    @Implementation
+    Lock the deque. If empty, unlock and report 0. Otherwise step tail back one
+    slot modulo capacity, read the (fn,arg) pair there into out_buf, decrement
+    count, unlock, and report 1.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex round-trip plus two loads. The owner's hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    out_buf must point to at least 16 writable bytes. The lock is released on
+    both the empty and the success path. Returns 1 when a task was written,
+    0 when the deque was empty.
+    @End Security_Scope
+
+    Let mtx be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+
+    Let cnt be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_COUNT
+    If cnt is equal to 0:
+        proc mutex_release from Mutex with mtx
+        Return 0
+    End If
+
+    Let cap be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_CAPACITY
+    Let tail be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_TAIL
+    Let tail_back be tail plus cap
+    Set tail_back to tail_back minus 1
+    Let new_tail be tail_back modulo by cap
+
+    Let ring be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_RING
+    Let off be new_tail multiplied by WS_TASK_SIZE
+    Let fn_off be off plus WS_TASK_OFF_FN
+    Let arg_off be off plus WS_TASK_OFF_ARG
+    Let fn be proc memory_get_int64 from Memory with ring, fn_off
+    Let arg be proc memory_get_int64 from Memory with ring, arg_off
+
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_TAIL, new_tail
+    Let new_count be cnt minus 1
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_COUNT, new_count
+
+    proc memory_set_int64 from Memory with out_buf, WS_TASK_OFF_FN, fn
+    proc memory_set_int64 from Memory with out_buf, WS_TASK_OFF_ARG, arg
+
+    proc mutex_release from Mutex with mtx
+    Return 1
+End Process
+
+Process called "ws_deque_steal_top" takes dq as Integer, out_buf as Integer returns Integer:
+    @Reasoning
+    A thief takes the OLDEST task from a victim deque's top. Stealing the
+    opposite end from where the owner works minimises contention and tends to
+    move a larger sub-tree of work to the idle thief in divide-and-conquer
+    workloads.
+    @End Reasoning
+
+    @Implementation
+    Lock the victim deque. If empty, unlock and report 0. Otherwise read the
+    (fn,arg) pair at head into out_buf, advance head one slot modulo capacity,
+    decrement count, unlock, and report 1.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex round-trip plus two loads. Runs only when a worker has drained its
+    own deque, so it is off the common path.
+    @End Performance_Hints
+
+    @Security_Scope
+    out_buf must point to at least 16 writable bytes. The lock is released on
+    both the empty and the success path. Returns 1 when a task was written,
+    0 when the victim was empty.
+    @End Security_Scope
+
+    Let mtx be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+
+    Let cnt be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_COUNT
+    If cnt is equal to 0:
+        proc mutex_release from Mutex with mtx
+        Return 0
+    End If
+
+    Let cap be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_CAPACITY
+    Let head be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_HEAD
+    Let ring be proc memory_get_int64 from Memory with dq, WS_DQ_OFF_RING
+    Let off be head multiplied by WS_TASK_SIZE
+    Let fn_off be off plus WS_TASK_OFF_FN
+    Let arg_off be off plus WS_TASK_OFF_ARG
+    Let fn be proc memory_get_int64 from Memory with ring, fn_off
+    Let arg be proc memory_get_int64 from Memory with ring, arg_off
+
+    Let next_head_raw be head plus 1
+    Let next_head be next_head_raw modulo by cap
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_HEAD, next_head
+    Let new_count be cnt minus 1
+    proc memory_set_int64 from Memory with dq, WS_DQ_OFF_COUNT, new_count
+
+    proc memory_set_int64 from Memory with out_buf, WS_TASK_OFF_FN, fn
+    proc memory_set_int64 from Memory with out_buf, WS_TASK_OFF_ARG, arg
+
+    proc mutex_release from Mutex with mtx
+    Return 1
+End Process
+
+Process called "ws_try_get_task" takes pool as Integer, my_index as Integer, out_buf as Integer returns Integer:
+    @Reasoning
+    Find one task for a worker: prefer the worker's own deque (LIFO, cache-warm),
+    and only when it is empty steal from someone else. The steal scan visits
+    EVERY other worker before giving up so no runnable task is ever overlooked.
+    @End Reasoning
+
+    @Implementation
+    Pop the bottom of the worker's own deque first; on success report 1. On an
+    empty own deque, walk the other workers round-robin starting at the next
+    index (my_index + 1 .. my_index + worker_count - 1, each modulo
+    worker_count) and try to steal each victim's top. Report 1 as soon as a
+    steal succeeds, or 0 after every other deque has been checked and found
+    empty.
+    @End Implementation
+
+    @Performance_Hints
+    One own-deque pop on the common path. The steal scan costs up to
+    worker_count - 1 lock attempts and runs only when a worker is otherwise
+    idle, so it never burdens the busy case.
+    @End Performance_Hints
+
+    @Security_Scope
+    out_buf must point to at least 16 writable bytes. Pure work-finding: touches
+    only deque state through their own locks.
+    @End Security_Scope
+
+    Let n be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT
+    Let deques be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DEQUES
+
+    Let own_off be my_index multiplied by WS_PTR_SIZE
+    Let own_dq be proc memory_get_int64 from Memory with deques, own_off
+    Let got be proc ws_deque_pop_bottom with own_dq, out_buf
+    If got is equal to 1:
+        Return 1
+    End If
+
+    Let i be 1
+    While i is less than n:
+        Let raw be my_index plus i
+        Let victim_idx be raw modulo by n
+        Let victim_off be victim_idx multiplied by WS_PTR_SIZE
+        Let victim_dq be proc memory_get_int64 from Memory with deques, victim_off
+        Let stolen be proc ws_deque_steal_top with victim_dq, out_buf
+        If stolen is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "ws_complete_one" takes pool as Integer returns Integer:
+    @Reasoning
+    Record that one task finished. When the count of outstanding tasks reaches
+    zero, any thread blocked in ws_wait_idle must be woken, so completion of the
+    last task broadcasts the drained condition.
+    @End Reasoning
+
+    @Implementation
+    Under the pending mutex, decrement the pending counter; if it reached zero,
+    broadcast the drained condition variable while still holding the mutex so
+    the wake is published before any waiter re-checks the predicate. Release the
+    mutex and return.
+    @End Implementation
+
+    @Performance_Hints
+    One short critical section per completed task: a decrement and an occasional
+    broadcast only on the final task.
+    @End Performance_Hints
+
+    @Security_Scope
+    Must balance exactly one ws_complete_one against each counted submit so the
+    pending counter cannot underflow.
+    @End Security_Scope
+
+    Let pm be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX
+    proc mutex_acquire from Mutex with pm
+
+    Let pending be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+    Let new_pending be pending minus 1
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_PENDING, new_pending
+    If new_pending is equal to 0:
+        Let cv be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DRAINED_CV
+        proc condvar_broadcast from CondVar with cv
+    End If
+
+    proc mutex_release from Mutex with pm
+    Return WS_OK
+End Process
+
+Process called "ws_worker_main" takes ctx as Integer returns Integer:
+    @Reasoning
+    The body each worker thread runs. A worker blocks on the shared semaphore
+    until a task exists (or shutdown wakes it), claims one task from its own
+    deque or by stealing, runs it, and accounts for its completion — looping
+    until shutdown leaves no work anywhere.
+    @End Reasoning
+
+    @Implementation
+    Read the pool and this worker's index from the context, cache the semaphore,
+    and allocate one 16-byte scratch buffer reused for every claimed task. Then
+    loop forever: acquire one permit (blocking while idle), try to get a task
+    (own pop then exhaustive steal scan). If a task is obtained, invoke it via
+    call_indirect_1(fn, arg) and call ws_complete_one. If no task is found and
+    shutdown is set, free the scratch buffer and exit; if no task is found while
+    still running, yield and loop to re-block. Permit accounting guarantees every
+    counted task is run exactly once and every worker receives exactly one
+    shutdown wake on which it exits.
+    @End Implementation
+
+    @Performance_Hints
+    The hot path is one semaphore acquire, one own-deque pop, one indirect call,
+    and one counter decrement. Idle workers sleep in the OS on the semaphore
+    rather than spinning; the defensive yield only runs on the rare race where a
+    permit's task was already claimed by a peer.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null context returns immediately. The scratch buffer is freed on the
+    shutdown exit path so a cleanly shut-down pool leaks nothing.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let pool be proc memory_get_int64 from Memory with ctx, WS_CTX_OFF_POOL
+    Let my_index be proc memory_get_int64 from Memory with ctx, WS_CTX_OFF_INDEX
+    Let sem be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_SEM
+
+    Let task_buf be proc allocate from Memory with WS_TASK_SIZE
+    If task_buf is equal to 0:
+        Return 0
+    End If
+
+    Loop forever:
+        proc semaphore_acquire from Sem with sem
+
+        Let got be proc ws_try_get_task with pool, my_index, task_buf
+        If got is equal to 1:
+            Let fn be proc memory_get_int64 from Memory with task_buf, WS_TASK_OFF_FN
+            Let arg be proc memory_get_int64 from Memory with task_buf, WS_TASK_OFF_ARG
+            proc call_indirect_1 from Call with fn, arg
+            proc ws_complete_one with pool
+        Otherwise:
+            Let sd be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_SHUTDOWN
+            If sd is not equal to 0:
+                proc deallocate from Memory with task_buf
+                Return 0
+            End If
+            proc thread_yield from Thread
+        End If
+    End Loop
+
+    Return 0
+End Process
+
+Process called "ws_free_pool_memory" takes pool as Integer returns Integer:
+    @Reasoning
+    Release every resource a fully-initialised pool owns once no worker is
+    running: each deque, each worker context, the three pointer arrays, the
+    semaphore, the pending mutex, the drained condition variable, and the pool
+    header. Used both by the failure-cleanup paths in ws_new and by ws_shutdown
+    after all workers have been joined.
+    @End Reasoning
+
+    @Implementation
+    Iterate the deque array destroying each non-null deque, then free that array.
+    Iterate the context array deallocating each non-null context, then free that
+    array. Free the tids array (the thread structures themselves are freed by
+    thread_join). Destroy the semaphore, pending mutex, and drained condvar if
+    present. Finally deallocate the pool header. Every field is null-checked so
+    a pool whose worker/deque arrays were only partially populated (with the
+    unused slots pre-zeroed) tears down safely.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in worker_count. Cold path: runs once per pool at shutdown or on a
+    construction failure.
+    @End Performance_Hints
+
+    @Security_Scope
+    Requires that no worker thread is still running against this pool. ws_new
+    only calls it after joining any spawned workers; ws_shutdown joins first.
+    @End Security_Scope
+
+    Let n be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT
+
+    Let deques be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DEQUES
+    If deques is not equal to 0:
+        Let i be 0
+        While i is less than n:
+            Let off be i multiplied by WS_PTR_SIZE
+            Let dq be proc memory_get_int64 from Memory with deques, off
+            If dq is not equal to 0:
+                proc ws_deque_destroy with dq
+            End If
+            Set i to i plus 1
+        End While
+        proc deallocate from Memory with deques
+    End If
+
+    Let contexts be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_CONTEXTS
+    If contexts is not equal to 0:
+        Let j be 0
+        While j is less than n:
+            Let coff be j multiplied by WS_PTR_SIZE
+            Let c be proc memory_get_int64 from Memory with contexts, coff
+            If c is not equal to 0:
+                proc deallocate from Memory with c
+            End If
+            Set j to j plus 1
+        End While
+        proc deallocate from Memory with contexts
+    End If
+
+    Let tids be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_TIDS
+    If tids is not equal to 0:
+        proc deallocate from Memory with tids
+    End If
+
+    Let sem be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_SEM
+    If sem is not equal to 0:
+        proc semaphore_destroy from Sem with sem
+    End If
+
+    Let pm be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX
+    If pm is not equal to 0:
+        proc mutex_destroy from Mutex with pm
+    End If
+
+    Let cv be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DRAINED_CV
+    If cv is not equal to 0:
+        proc condvar_destroy from CondVar with cv
+    End If
+
+    proc deallocate from Memory with pool
+    Return WS_OK
+End Process
+
+Process called "ws_new" takes worker_count as Integer returns Integer:
+    @Reasoning
+    Construct a ready-to-run work-stealing pool: per-worker deques, the shared
+    task semaphore, the pending mutex and drained condition variable, one
+    context per worker, and one running worker thread per deque. A non-positive
+    worker_count defers to the hardware thread count so the pool fills the
+    machine by default.
+    @End Reasoning
+
+    @Implementation
+    Normalise worker_count (<=0 becomes thread_hardware_concurrency, floored at
+    1). Allocate the pool header, the deque/tids/context pointer arrays, the
+    semaphore seeded at 0, the pending mutex, and the drained condvar, unwinding
+    cleanly on any early failure. Initialise every pool field and pre-zero the
+    three arrays so partial cleanup is safe. Create each deque; on failure tear
+    down via ws_free_pool_memory. Then, for each worker, allocate its context,
+    store it, take ws_worker_main's address with the $ function-pointer operator,
+    and spawn the thread; on a spawn failure set shutdown, release one permit per
+    already-spawned worker, join them, and free everything. Return the pool, or 0
+    on any failure.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path run once. Allocations are O(worker_count); thread creation
+    dominates. Workers immediately block on the empty semaphore until work is
+    submitted, so construction adds no busy-wait.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns 0 on every failure with all partial resources released and any
+    already-spawned workers joined, so a failed construction leaks nothing and
+    leaves no threads running.
+    @End Security_Scope
+
+    Let n be worker_count
+    If n is less than or equal to 0:
+        Set n to proc thread_hardware_concurrency from Thread
+        If n is less than 1:
+            Set n to 1
+        End If
+    End If
+
+    Let pool be proc allocate from Memory with WS_POOL_SIZE
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Let arr_bytes be n multiplied by WS_PTR_SIZE
+
+    Let deques be proc allocate from Memory with arr_bytes
+    If deques is equal to 0:
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let tids be proc allocate from Memory with arr_bytes
+    If tids is equal to 0:
+        proc deallocate from Memory with deques
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let contexts be proc allocate from Memory with arr_bytes
+    If contexts is equal to 0:
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with deques
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let sem be proc semaphore_new from Sem with 0
+    If sem is equal to 0:
+        proc deallocate from Memory with contexts
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with deques
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let pm be proc mutex_new from Mutex
+    If pm is equal to 0:
+        proc semaphore_destroy from Sem with sem
+        proc deallocate from Memory with contexts
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with deques
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    Let cv be proc condvar_new from CondVar
+    If cv is equal to 0:
+        proc mutex_destroy from Mutex with pm
+        proc semaphore_destroy from Sem with sem
+        proc deallocate from Memory with contexts
+        proc deallocate from Memory with tids
+        proc deallocate from Memory with deques
+        proc deallocate from Memory with pool
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT, n
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_DEQUES, deques
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_TIDS, tids
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_CONTEXTS, contexts
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_SEM, sem
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_SHUTDOWN, 0
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_PENDING, 0
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX, pm
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_DRAINED_CV, cv
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_RR, 0
+
+    Let z be 0
+    While z is less than n:
+        Let zoff be z multiplied by WS_PTR_SIZE
+        proc memory_set_int64 from Memory with deques, zoff, 0
+        proc memory_set_int64 from Memory with tids, zoff, 0
+        proc memory_set_int64 from Memory with contexts, zoff, 0
+        Set z to z plus 1
+    End While
+
+    Let d be 0
+    While d is less than n:
+        Let dq be proc ws_deque_new
+        If dq is equal to 0:
+            proc ws_free_pool_memory with pool
+            Return 0
+        End If
+        Let doff be d multiplied by WS_PTR_SIZE
+        proc memory_set_int64 from Memory with deques, doff, dq
+        Set d to d plus 1
+    End While
+
+    Let w be 0
+    While w is less than n:
+        Let ctx be proc allocate from Memory with WS_CTX_SIZE
+        If ctx is equal to 0:
+            proc memory_set_int64 from Memory with pool, WS_POOL_OFF_SHUTDOWN, 1
+            Let r1 be 0
+            While r1 is less than w:
+                proc semaphore_release from Sem with sem
+                Set r1 to r1 plus 1
+            End While
+            Let j1 be 0
+            While j1 is less than w:
+                Let joff be j1 multiplied by WS_PTR_SIZE
+                Let t be proc memory_get_int64 from Memory with tids, joff
+                If t is not equal to 0:
+                    proc thread_join from Thread with t
+                    proc memory_set_int64 from Memory with tids, joff, 0
+                End If
+                Set j1 to j1 plus 1
+            End While
+            proc ws_free_pool_memory with pool
+            Return 0
+        End If
+
+        proc memory_set_int64 from Memory with ctx, WS_CTX_OFF_POOL, pool
+        proc memory_set_int64 from Memory with ctx, WS_CTX_OFF_INDEX, w
+        Let woff be w multiplied by WS_PTR_SIZE
+        proc memory_set_int64 from Memory with contexts, woff, ctx
+
+        Let entry be $ws_worker_main
+        Let tid be proc thread_create from Thread with entry, ctx
+        If tid is equal to 0:
+            proc memory_set_int64 from Memory with pool, WS_POOL_OFF_SHUTDOWN, 1
+            Let r2 be 0
+            While r2 is less than w:
+                proc semaphore_release from Sem with sem
+                Set r2 to r2 plus 1
+            End While
+            Let j2 be 0
+            While j2 is less than w:
+                Let joff2 be j2 multiplied by WS_PTR_SIZE
+                Let t2 be proc memory_get_int64 from Memory with tids, joff2
+                If t2 is not equal to 0:
+                    proc thread_join from Thread with t2
+                    proc memory_set_int64 from Memory with tids, joff2, 0
+                End If
+                Set j2 to j2 plus 1
+            End While
+            proc ws_free_pool_memory with pool
+            Return 0
+        End If
+
+        proc memory_set_int64 from Memory with tids, woff, tid
+        Set w to w plus 1
+    End While
+
+    Return pool
+End Process
+
+Process called "ws_submit" takes pool as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Hand a task to the pool. Tasks are spread across deques round-robin so the
+    initial load is balanced; work stealing then re-balances dynamically as
+    workers finish at different rates. The pending count rises and a permit is
+    released so a sleeping worker wakes to run the task.
+    @End Reasoning
+
+    @Implementation
+    Under the pending mutex, read and advance the round-robin cursor (modulo
+    worker_count) and increment pending. Push the (fn,arg) task onto the chosen
+    deque's bottom, growing its ring if needed. If the push fails to allocate,
+    roll the pending counter back (broadcasting drained if it returns to zero so
+    a waiter is not stranded) and return the error without releasing a permit.
+    On success, release one semaphore permit and return WS_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One short pending-mutex critical section, one deque push (lock plus two
+    stores on the common path), and one semaphore signal. No busy-waiting.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns WS_ERR_NULL. The pending counter is kept exactly balanced
+    against completions even on the allocation-failure path.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return WS_ERR_NULL
+    End If
+
+    Let n be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT
+    Let pm be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX
+    Let sem be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_SEM
+    Let deques be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DEQUES
+
+    proc mutex_acquire from Mutex with pm
+    Let rr be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_RR
+    Let idx be rr modulo by n
+    Let next_rr_raw be rr plus 1
+    Let next_rr be next_rr_raw modulo by n
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_RR, next_rr
+    Let pending be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+    Let new_pending be pending plus 1
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_PENDING, new_pending
+    proc mutex_release from Mutex with pm
+
+    Let off be idx multiplied by WS_PTR_SIZE
+    Let dq be proc memory_get_int64 from Memory with deques, off
+    Let pr be proc ws_deque_push_bottom with dq, fn, arg
+    If pr is not equal to WS_OK:
+        proc mutex_acquire from Mutex with pm
+        Let p2 be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+        Let p3 be p2 minus 1
+        proc memory_set_int64 from Memory with pool, WS_POOL_OFF_PENDING, p3
+        If p3 is equal to 0:
+            Let cv be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DRAINED_CV
+            proc condvar_broadcast from CondVar with cv
+        End If
+        proc mutex_release from Mutex with pm
+        Return pr
+    End If
+
+    proc semaphore_release from Sem with sem
+    Return WS_OK
+End Process
+
+Process called "ws_pending" takes pool as Integer returns Integer:
+    @Reasoning
+    Report how many submitted tasks have not yet completed, read under the
+    pending mutex so the value is a consistent snapshot rather than a torn read.
+    @End Reasoning
+
+    @Implementation
+    Acquire the pending mutex, read the pending counter, release, and return it.
+    @End Implementation
+
+    @Performance_Hints
+    One short critical section: a single load under the lock.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns WS_ERR_NULL. The count is always non-negative, so the -1
+    error sentinel is unambiguous.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return WS_ERR_NULL
+    End If
+
+    Let pm be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX
+    proc mutex_acquire from Mutex with pm
+    Let pending be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+    proc mutex_release from Mutex with pm
+    Return pending
+End Process
+
+Process called "ws_wait_idle" takes pool as Integer returns Integer:
+    @Reasoning
+    Block the caller until the pool has no outstanding tasks. Used to join a
+    batch of submitted work before reading results or shutting down. The wait is
+    event-driven on the drained condition variable, never a poll.
+    @End Reasoning
+
+    @Implementation
+    Acquire the pending mutex and loop: while pending is non-zero, condvar_wait
+    on the drained condition with the pending mutex (which atomically releases
+    the mutex, sleeps until ws_complete_one broadcasts, and re-acquires it),
+    then re-read pending. The While-predicate re-check makes the wait robust to
+    spurious wakeups. Release the mutex once pending is zero and return WS_OK.
+    @End Implementation
+
+    @Performance_Hints
+    Sleeps in the OS until the last task completes; no busy-waiting. Wakes once
+    per drain event and re-checks the predicate.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns WS_ERR_NULL. The pending mutex is held only across the
+    predicate checks and is always released before returning.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return WS_ERR_NULL
+    End If
+
+    Let pm be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING_MUTEX
+    Let cv be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_DRAINED_CV
+
+    proc mutex_acquire from Mutex with pm
+    Let pending be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+    While pending is not equal to 0:
+        proc condvar_wait from CondVar with cv, pm
+        Set pending to proc memory_get_int64 from Memory with pool, WS_POOL_OFF_PENDING
+    End While
+    proc mutex_release from Mutex with pm
+    Return WS_OK
+End Process
+
+Process called "ws_worker_count" takes pool as Integer returns Integer:
+    @Reasoning
+    Report how many worker threads the pool runs, the fixed degree of
+    parallelism chosen at construction.
+    @End Reasoning
+
+    @Implementation
+    Read and return the worker_count field.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns WS_ERR_NULL; a live pool always has at least one worker.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return WS_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT
+End Process
+
+Process called "ws_shutdown" takes pool as Integer returns Integer:
+    @Reasoning
+    Stop the pool cleanly: tell workers to finish, wake every one of them, wait
+    for them all to exit, then release every resource. Tasks already queued are
+    drained before the workers exit because a worker only exits when an
+    exhaustive scan finds no task anywhere.
+    @End Reasoning
+
+    @Implementation
+    Set the shutdown flag, then release exactly one semaphore permit per worker
+    so each blocked worker wakes at least once. Join every spawned worker thread
+    (thread_join frees each thread structure) and clear its slot. Finally call
+    ws_free_pool_memory to destroy the deques, contexts, arrays, semaphore,
+    pending mutex, drained condvar, and pool header.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path run once. Cost is worker_count permit signals plus worker_count
+    joins plus linear resource teardown.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null pool returns WS_ERR_NULL. After this returns the pool pointer is
+    invalid and must not be used. Submitting concurrently with shutdown is a
+    caller logic error.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return WS_ERR_NULL
+    End If
+
+    Let n be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_WORKER_COUNT
+    Let sem be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_SEM
+    Let tids be proc memory_get_int64 from Memory with pool, WS_POOL_OFF_TIDS
+
+    proc memory_set_int64 from Memory with pool, WS_POOL_OFF_SHUTDOWN, 1
+
+    Let r be 0
+    While r is less than n:
+        proc semaphore_release from Sem with sem
+        Set r to r plus 1
+    End While
+
+    Let i be 0
+    While i is less than n:
+        Let off be i multiplied by WS_PTR_SIZE
+        Let tid be proc memory_get_int64 from Memory with tids, off
+        If tid is not equal to 0:
+            proc thread_join from Thread with tid
+            proc memory_set_int64 from Memory with tids, off, 0
+        End If
+        Set i to i plus 1
+    End While
+
+    proc ws_free_pool_memory with pool
+    Return WS_OK
+End Process

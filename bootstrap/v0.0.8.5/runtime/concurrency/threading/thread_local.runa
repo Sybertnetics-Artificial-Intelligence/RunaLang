@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,594 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles thread-local storage and thread-local management for the Runa runtime concurrency system.
+Thread-local storage (TLS) API for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process thread-local storage and thread-local management
-- Handle thread-local allocation and thread-local access
-- Manage thread-local cleanup and thread-local coordination
-- Process thread-local error handling and thread-local feedback
+This module implements a process-wide TLS registry. Callers obtain an opaque
+integer KEY from tls_key_create and then associate one Integer value with that
+key per thread. The pair (current_thread_id, key) is the lookup identity, so the
+same key resolves to a different value on every thread — exactly the thread-local
+semantics callers expect.
 
-This file is essential because of the following reasons:
-- thread_local enables comprehensive thread-local storage and thread-local management
-- Proper thread-local handling ensures correct thread-local data access and user experience
-- thread_local support enables Runa compilation for thread-local-based workflows
+The registry is a single dynamically-grown table of fixed-size entries protected
+by ONE process-wide RuntimeMutex (from the completed runtime mutex layer). The
+mutex, the table, and the bookkeeping counters all live in a single state block
+that is allocated lazily on first use and cached in a module-level pointer.
 
-This file consists of the following functions/features/operation types:
-- Thread-local storage and thread-local management
-- Thread-local allocation and thread-local access
-- Thread-local cleanup and thread-local coordination
-- Thread-local error handling and thread-local feedback
+State block layout (40 bytes):
+    offset 0:  table     — pointer to the entry array (the live registry)
+    offset 8:  count     — number of slots currently in use (the high-water mark;
+                           includes tombstones so addresses stay stable)
+    offset 16: capacity  — number of entry slots the table can hold
+    offset 24: next_key  — monotonically increasing key counter (next id to hand out)
+    offset 32: mutex     — the RuntimeMutex handle guarding every access
+
+Entry layout (32 bytes):
+    offset 0:  thread_id — owning OS thread id (from thread_current_id)
+    offset 8:  key       — the key id this entry binds
+    offset 16: in_use    — 1 live, 0 free/tombstone
+    offset 24: value     — the stored Integer value
+
+The spec for this module documents the first three entry fields at offsets 0, 8,
+and 16. Those three offsets are preserved here exactly; the value an entry must
+carry is stored immediately after them at offset 24, giving a 32-byte entry. A
+24-byte entry physically cannot hold thread_id, key, in_use AND a value, so the
+table widens to 32 bytes while keeping every documented offset stable.
+
+Removal is a tombstone (in_use cleared) rather than a compaction so that no entry
+address held across a call is invalidated; tombstoned slots are reused by the
+next insert before the table grows. The table doubles in capacity when an append
+finds it full.
 :End Note
 
-Note: TODO - Implement thread_local functionality
+Import "compiler/frontend/primitives/threading/thread_core.runa" as Thread
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: Status codes returned by the TLS API
+Constant TLS_OK as Integer is 0
+Constant TLS_ERR as Integer is 0 minus 1
+
+Note: State block layout
+Constant TLS_STATE_SIZE as Integer is 40
+Constant TLS_STATE_OFF_TABLE as Integer is 0
+Constant TLS_STATE_OFF_COUNT as Integer is 8
+Constant TLS_STATE_OFF_CAPACITY as Integer is 16
+Constant TLS_STATE_OFF_NEXT_KEY as Integer is 24
+Constant TLS_STATE_OFF_MUTEX as Integer is 32
+
+Note: Entry layout
+Constant TLS_ENTRY_SIZE as Integer is 32
+Constant TLS_ENTRY_OFF_THREAD as Integer is 0
+Constant TLS_ENTRY_OFF_KEY as Integer is 8
+Constant TLS_ENTRY_OFF_IN_USE as Integer is 16
+Constant TLS_ENTRY_OFF_VALUE as Integer is 24
+
+Note: Initial table capacity in entries; doubled on overflow
+Constant TLS_INITIAL_CAPACITY as Integer is 16
+
+Note: Cached pointer to the lazily-allocated registry state block (0 = not yet built)
+Let tls_state be 0
+
+Process called "tls_ensure_state" returns Integer:
+    @Reasoning
+    Every public entry point needs the registry before it can do anything, so the
+    registry is built on first touch rather than at module load. Building it here
+    keeps the public API free of an explicit init call and lets the very first
+    operation (typically tls_key_create at program startup) bring the table and
+    its guarding mutex into existence together.
+    @End Reasoning
+
+    @Implementation
+    If the cached state pointer is already set, return it. Otherwise allocate the
+    state block, then the initial entry table, then create the registry mutex.
+    The table is allocated before the mutex so that a mutex-creation failure has
+    nothing leaked to clean up beyond two deallocations. Zero every slot's in_use
+    field so freshly allocated slots read as free, seed the counters (count 0,
+    capacity TLS_INITIAL_CAPACITY, next_key 1 so the first handed-out key is 1),
+    store the mutex handle, publish the state pointer, and return it. Any
+    allocation failure unwinds what was acquired and returns 0.
+    @End Implementation
+
+    @Performance_Hints
+    Two allocations plus one mutex_new on the cold path, executed once per process.
+    Every later call is a single pointer load and compare.
+    @End Performance_Hints
+
+    @Security_Scope
+    First use must happen before the program spawns the threads that will share
+    this registry — the standard lifecycle, since keys are created at startup. The
+    lazy build is not itself serialized (the guarding mutex does not exist until it
+    completes), so two threads racing the very first call could each build a state
+    block; the registry is therefore initialized on the main thread before fan-out.
+    A failed build returns 0 and every caller treats 0 as out-of-memory.
+    @End Security_Scope
+
+    If tls_state is not equal to 0:
+        Return tls_state
+    End If
+
+    Let st be proc allocate from Memory with TLS_STATE_SIZE
+    If st is equal to 0:
+        Return 0
+    End If
+
+    Let initial_bytes be TLS_INITIAL_CAPACITY multiplied by TLS_ENTRY_SIZE
+    Let tbl be proc allocate from Memory with initial_bytes
+    If tbl is equal to 0:
+        proc deallocate from Memory with st
+        Return 0
+    End If
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc deallocate from Memory with tbl
+        proc deallocate from Memory with st
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than TLS_INITIAL_CAPACITY:
+        Let slot be tbl plus (i multiplied by TLS_ENTRY_SIZE)
+        proc memory_set_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE, 0
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Memory with st, TLS_STATE_OFF_TABLE, tbl
+    proc memory_set_int64 from Memory with st, TLS_STATE_OFF_COUNT, 0
+    proc memory_set_int64 from Memory with st, TLS_STATE_OFF_CAPACITY, TLS_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with st, TLS_STATE_OFF_NEXT_KEY, 1
+    proc memory_set_int64 from Memory with st, TLS_STATE_OFF_MUTEX, mtx
+
+    Set tls_state to st
+    Return st
+End Process
+
+Process called "tls_entry_addr" takes state as Integer, index as Integer returns Integer:
+    @Reasoning
+    Entry addresses are needed in several places (find, insert, grow, clear). One
+    computation point keeps the stride arithmetic correct and consistent and reads
+    the table pointer fresh each time so callers stay correct across a grow that
+    reallocated the table.
+    @End Reasoning
+
+    @Implementation
+    Load the current table base from the state block and add index times the fixed
+    entry stride.
+    @End Implementation
+
+    @Performance_Hints
+    One field load, one multiply, one add. No branches.
+    @End Performance_Hints
+
+    @Security_Scope
+    Internal helper. The caller is responsible for passing an index within the
+    table's current capacity; callers here only ever pass indices in [0, count].
+    @End Security_Scope
+
+    Let tbl be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_TABLE
+    Return tbl plus (index multiplied by TLS_ENTRY_SIZE)
+End Process
+
+Process called "tls_find_slot" takes state as Integer, tid as Integer, key as Integer returns Integer:
+    @Reasoning
+    Lookup, presence test, update, and removal all need the same scan for the live
+    entry matching a (thread, key) pair, so the scan lives in one place to keep the
+    four public operations identical in how they identify an entry.
+    @End Reasoning
+
+    @Implementation
+    Walk slots [0, count). Skip tombstones (in_use 0). For a live slot, compare its
+    thread_id then its key against the requested pair and return the slot address on
+    a full match. Return 0 when no live entry matches.
+    @End Implementation
+
+    @Performance_Hints
+    Linear over the in-use high-water mark. The registry holds one entry per live
+    (thread, key) pair, which is small for typical thread-local usage; tombstones
+    are reused by inserts so the scan length stays bounded by live demand.
+    @End Performance_Hints
+
+    @Security_Scope
+    Internal helper, called only with the registry mutex held so the table cannot
+    be reallocated underneath the scan.
+    @End Security_Scope
+
+    Let count be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let slot be tls_entry_addr(state, i)
+        Let in_use be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE
+        If in_use is equal to 1:
+            Let slot_tid be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_THREAD
+            If slot_tid is equal to tid:
+                Let slot_key be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_KEY
+                If slot_key is equal to key:
+                    Return slot
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "tls_grow" takes state as Integer returns Integer:
+    @Reasoning
+    When an append finds every slot live, capacity must expand so new bindings can
+    be stored. Doubling amortizes the copy cost so a run of N inserts stays linear.
+    @End Reasoning
+
+    @Implementation
+    Allocate a new table of double the capacity. Copy all four fields of every used
+    slot [0, count) into the matching slot of the new table so live entries and
+    tombstone positions are preserved exactly. Initialize the in_use field of every
+    newly added slot to 0 so it reads as free. Free the old table, then publish the
+    new table pointer and the new capacity into the state block. Return 1 on success
+    and 0 if the new allocation fails (leaving the existing table untouched).
+    @End Implementation
+
+    @Performance_Hints
+    One allocation, a field-wise copy of count entries, and one deallocation. Cold
+    relative to ordinary get/set because doubling makes it rare.
+    @End Performance_Hints
+
+    @Security_Scope
+    Internal helper, called only with the registry mutex held. On allocation
+    failure the registry is left fully intact and usable.
+    @End Security_Scope
+
+    Let old_cap be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_CAPACITY
+    Let new_cap be old_cap multiplied by 2
+    Let old_tbl be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_TABLE
+
+    Let new_bytes be new_cap multiplied by TLS_ENTRY_SIZE
+    Let new_tbl be proc allocate from Memory with new_bytes
+    If new_tbl is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let src be old_tbl plus (i multiplied by TLS_ENTRY_SIZE)
+        Let dst be new_tbl plus (i multiplied by TLS_ENTRY_SIZE)
+        Let src_tid be proc memory_get_int64 from Memory with src, TLS_ENTRY_OFF_THREAD
+        Let src_key be proc memory_get_int64 from Memory with src, TLS_ENTRY_OFF_KEY
+        Let src_in_use be proc memory_get_int64 from Memory with src, TLS_ENTRY_OFF_IN_USE
+        Let src_value be proc memory_get_int64 from Memory with src, TLS_ENTRY_OFF_VALUE
+        proc memory_set_int64 from Memory with dst, TLS_ENTRY_OFF_THREAD, src_tid
+        proc memory_set_int64 from Memory with dst, TLS_ENTRY_OFF_KEY, src_key
+        proc memory_set_int64 from Memory with dst, TLS_ENTRY_OFF_IN_USE, src_in_use
+        proc memory_set_int64 from Memory with dst, TLS_ENTRY_OFF_VALUE, src_value
+        Set i to i plus 1
+    End While
+
+    While i is less than new_cap:
+        Let slot be new_tbl plus (i multiplied by TLS_ENTRY_SIZE)
+        proc memory_set_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE, 0
+        Set i to i plus 1
+    End While
+
+    proc deallocate from Memory with old_tbl
+    proc memory_set_int64 from Memory with state, TLS_STATE_OFF_TABLE, new_tbl
+    proc memory_set_int64 from Memory with state, TLS_STATE_OFF_CAPACITY, new_cap
+    Return 1
+End Process
+
+Process called "tls_key_create" returns Integer:
+    @Reasoning
+    Keys must be unique across the whole process so that two unrelated subsystems
+    never collide on the same id. A single monotonic counter, advanced under the
+    registry lock, guarantees that.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry exists, take the lock, read the next_key counter, store the
+    incremented counter back, release the lock, and return the value that was read.
+    The first key handed out is 1, so 0 is never a valid key.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip and two field accesses. Called rarely (once per logical
+    thread-local slot, at setup), so its cost is irrelevant to the hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns TLS_ERR if the registry cannot be built (out of memory). The registry
+    mutex is never poisoned by this module, so a successful acquire always returns
+    MUTEX_OK (0) with the lock held; any non-zero result means the lock was not
+    taken and no counter is advanced.
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return TLS_ERR
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return TLS_ERR
+    End If
+
+    Let key be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_NEXT_KEY
+    proc memory_set_int64 from Memory with state, TLS_STATE_OFF_NEXT_KEY, key plus 1
+    proc mutex_release from Mutex with mtx
+    Return key
+End Process
+
+Process called "tls_set" takes key as Integer, value as Integer returns Integer:
+    @Reasoning
+    Binding a value for the current thread is an upsert: if this thread already has
+    the key, overwrite it in place; otherwise create a new entry. Reusing the
+    existing slot keeps a thread's repeated writes from growing the table.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry, take the lock, resolve the current thread id. Look for an
+    existing live (tid, key) entry; if found, overwrite its value and return TLS_OK.
+    Otherwise find the first tombstone to reuse; if none exists, append at count,
+    growing the table first when it is full. Populate the chosen slot's thread_id,
+    key, value, and in_use fields, release the lock, and return TLS_OK. A grow
+    failure releases the lock and returns TLS_ERR.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip and a single linear scan that doubles as the lookup and the
+    free-slot search. Amortized O(1) appends thanks to capacity doubling.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns TLS_ERR on registry build failure, lock-not-taken, or table growth
+    failure. The chosen slot address is computed after any grow so it always points
+    into the live (possibly reallocated) table.
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return TLS_ERR
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return TLS_ERR
+    End If
+
+    Let tid be proc thread_current_id from Thread
+
+    Let existing be tls_find_slot(state, tid, key)
+    If existing is not equal to 0:
+        proc memory_set_int64 from Memory with existing, TLS_ENTRY_OFF_VALUE, value
+        proc mutex_release from Mutex with mtx
+        Return TLS_OK
+    End If
+
+    Let count be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_COUNT
+    Let found_free be 0
+    Let free_idx be 0
+    Let i be 0
+    While i is less than count:
+        Let slot be tls_entry_addr(state, i)
+        Let in_use be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE
+        If in_use is equal to 0:
+            Set found_free to 1
+            Set free_idx to i
+            Set i to count
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    Let target_index be 0
+    If found_free is equal to 1:
+        Set target_index to free_idx
+    Otherwise:
+        Let cap be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_CAPACITY
+        If count is equal to cap:
+            Let grown be tls_grow(state)
+            If grown is equal to 0:
+                proc mutex_release from Mutex with mtx
+                Return TLS_ERR
+            End If
+        End If
+        Set target_index to count
+        proc memory_set_int64 from Memory with state, TLS_STATE_OFF_COUNT, count plus 1
+    End If
+
+    Let target be tls_entry_addr(state, target_index)
+    proc memory_set_int64 from Memory with target, TLS_ENTRY_OFF_THREAD, tid
+    proc memory_set_int64 from Memory with target, TLS_ENTRY_OFF_KEY, key
+    proc memory_set_int64 from Memory with target, TLS_ENTRY_OFF_VALUE, value
+    proc memory_set_int64 from Memory with target, TLS_ENTRY_OFF_IN_USE, 1
+    proc mutex_release from Mutex with mtx
+    Return TLS_OK
+End Process
+
+Process called "tls_get" takes key as Integer returns Integer:
+    @Reasoning
+    Read the value this thread bound to the key. Absence is reported as 0 so simple
+    callers can treat an unset slot as a zero default without a separate presence
+    check; callers that must distinguish "unset" from "set to 0" use tls_has.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry, take the lock, resolve the current thread id, find the live
+    (tid, key) entry, and read its value if present. Release the lock and return the
+    value, or 0 when there is no matching entry. The lock is held across the read
+    because a concurrent tls_set may grow (reallocate and free) the table.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip and one linear scan bounded by the live-entry high-water
+    mark.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns 0 if the registry cannot be built or the lock is not taken — the same
+    result as a genuine miss, which is the safe default for a value read.
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return 0
+    End If
+
+    Let tid be proc thread_current_id from Thread
+    Let slot be tls_find_slot(state, tid, key)
+    Let result be 0
+    If slot is not equal to 0:
+        Set result to proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_VALUE
+    End If
+    proc mutex_release from Mutex with mtx
+    Return result
+End Process
+
+Process called "tls_has" takes key as Integer returns Integer:
+    @Reasoning
+    Distinguish "this thread has bound the key" from "value happens to be 0", which
+    a bare tls_get cannot express. This is the presence test callers use before
+    treating a 0 from tls_get as meaningful.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry, take the lock, resolve the current thread id, and search
+    for a live (tid, key) entry. Release the lock and return 1 if one was found, 0
+    otherwise.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip and one linear scan; no value read beyond the match test.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns 0 (absent) if the registry cannot be built or the lock is not taken, so
+    a caller never falsely believes a binding exists.
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return 0
+    End If
+
+    Let tid be proc thread_current_id from Thread
+    Let slot be tls_find_slot(state, tid, key)
+    Let present be 0
+    If slot is not equal to 0:
+        Set present to 1
+    End If
+    proc mutex_release from Mutex with mtx
+    Return present
+End Process
+
+Process called "tls_remove" takes key as Integer returns Integer:
+    @Reasoning
+    Drop this thread's binding for a key while leaving every other thread's binding
+    for the same key intact. Removal is idempotent: removing an absent key succeeds.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry, take the lock, resolve the current thread id, and find the
+    live (tid, key) entry. If present, clear its in_use flag, turning the slot into
+    a tombstone that a later insert can reuse — addresses of other entries stay
+    valid because nothing is compacted. Release the lock and return TLS_OK whether
+    or not an entry was found. If the registry was never built there is nothing to
+    remove, which is also TLS_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip, one linear scan, and a single field store. No allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns TLS_ERR only when the lock cannot be taken. A never-built registry and
+    an absent key both return TLS_OK because the post-condition (no such binding) is
+    already satisfied.
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return TLS_OK
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return TLS_ERR
+    End If
+
+    Let tid be proc thread_current_id from Thread
+    Let slot be tls_find_slot(state, tid, key)
+    If slot is not equal to 0:
+        proc memory_set_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE, 0
+    End If
+    proc mutex_release from Mutex with mtx
+    Return TLS_OK
+End Process
+
+Process called "tls_clear_current_thread" returns Integer:
+    @Reasoning
+    A thread about to exit must release every value it bound so its slots are
+    reclaimable and stale data never leaks to a future thread that is later assigned
+    the same OS thread id. This is the teardown counterpart to tls_set.
+    @End Reasoning
+
+    @Implementation
+    Ensure the registry, take the lock, resolve the current thread id, and scan all
+    used slots. For every live entry whose thread_id matches, clear its in_use flag
+    (tombstone it) and count it. Release the lock and return the number of bindings
+    removed. A never-built registry removes nothing and returns 0.
+    @End Implementation
+
+    @Performance_Hints
+    One lock round-trip and a single linear scan over the used slots; one field
+    store per removed entry. No allocation or compaction.
+    @End Performance_Hints
+
+    @Security_Scope
+    Intended to be called exactly once on thread teardown. Returns 0 if the registry
+    cannot be built or the lock is not taken (nothing was removed in either case).
+    @End Security_Scope
+
+    Let state be tls_ensure_state()
+    If state is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_MUTEX
+    Let acq be proc mutex_acquire from Mutex with mtx
+    If acq is not equal to 0:
+        Return 0
+    End If
+
+    Let tid be proc thread_current_id from Thread
+    Let count be proc memory_get_int64 from Memory with state, TLS_STATE_OFF_COUNT
+    Let removed be 0
+    Let i be 0
+    While i is less than count:
+        Let slot be tls_entry_addr(state, i)
+        Let in_use be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE
+        If in_use is equal to 1:
+            Let slot_tid be proc memory_get_int64 from Memory with slot, TLS_ENTRY_OFF_THREAD
+            If slot_tid is equal to tid:
+                proc memory_set_int64 from Memory with slot, TLS_ENTRY_OFF_IN_USE, 0
+                Set removed to removed plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc mutex_release from Mutex with mtx
+    Return removed
+End Process

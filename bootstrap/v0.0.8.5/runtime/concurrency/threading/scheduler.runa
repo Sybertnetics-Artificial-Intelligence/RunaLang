@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,825 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles thread scheduling and thread management for the Runa runtime concurrency system.
+Runtime priority task scheduler — the public strict-priority work dispatcher
+for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process thread scheduling and thread management
-- Handle thread priority and thread coordination
-- Manage thread execution and thread synchronization
-- Process thread error handling and thread feedback
+This is the runtime-facing object layer. The actual thread mechanism comes
+from the completed thread_core primitives (which delegate to the per-platform
+OS thread create/join), the mutual exclusion from the runtime mutex object,
+and the blocking wait/wake from the runtime condition-variable object. This
+module does NOT re-implement threads, locks, or wait queues; it composes them
+into a fixed-worker, strict-priority scheduler that always runs the
+highest-priority ready task before any lower-priority one.
 
-This file is essential because of the following reasons:
-- scheduler enables comprehensive thread scheduling and thread management
-- Proper thread scheduling ensures correct thread execution and user experience
-- scheduler support enables Runa compilation for thread-based workflows
+Distinction from thread_pool: a thread pool runs tasks in submission order
+(FIFO) across its workers. This scheduler maintains one FIFO ready-queue PER
+priority level and a worker always pops from the highest-priority non-empty
+level first. Within a single level the order is FIFO; across levels it is
+strict priority. The two modules are intentionally separate dispatch
+disciplines and neither duplicates the other.
 
-This file consists of the following functions/features/operation types:
-- Thread scheduling and thread management
-- Thread priority and thread coordination
-- Thread execution and thread synchronization
-- Thread error handling and thread feedback
+A task is a (function-pointer, argument) pair. A worker invokes it through
+the assembly indirect-call primitive call_indirect_1, so any module-level
+Process whose address is taken with the $name operator and that takes a
+single Integer argument can be scheduled.
+
+Scheduler object layout (64 bytes):
+    offset 0:  mutex        — RuntimeMutex guarding all scheduler state
+    offset 8:  cv_work      — RuntimeCondVar signalled when a task is enqueued
+    offset 16: cv_drained   — RuntimeCondVar broadcast when pending reaches 0
+    offset 24: pending      — count of submitted-but-not-yet-completed tasks
+    offset 32: shutdown     — 0 running, 1 shutting down (workers must drain+exit)
+    offset 40: worker_count — number of worker threads
+    offset 48: worker_tids  — pointer to an array of worker_count thread ids
+    offset 56: levels       — pointer to an array of SCHED_PRIORITY_LEVELS ring pointers
+
+Per-level ready queue (a growable FIFO ring, 32 bytes):
+    offset 0:  buffer   — pointer to capacity * 16 bytes of (fn,arg) slots
+    offset 8:  capacity — number of slots the buffer can hold
+    offset 16: count    — number of tasks currently queued
+    offset 24: head     — index of the front (oldest) task
+
+Each ring slot is 16 bytes: the function pointer at +0, the argument at +8.
 :End Note
 
-Note: TODO - Implement scheduler functionality
+Import "compiler/frontend/primitives/threading/thread_core.runa" as Thread
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: Number of strict-priority levels: 0 is highest, SCHED_PRIORITY_LEVELS-1 lowest
+Constant SCHED_PRIORITY_LEVELS as Integer is 4
+
+Note: Initial slot capacity of each per-level ready ring before its first grow
+Constant SCHED_RING_INIT_CAPACITY as Integer is 8
+
+Note: Scheduler object layout
+Constant SCHED_SIZE as Integer is 64
+Constant SCHED_OFF_MUTEX as Integer is 0
+Constant SCHED_OFF_CV_WORK as Integer is 8
+Constant SCHED_OFF_CV_DRAINED as Integer is 16
+Constant SCHED_OFF_PENDING as Integer is 24
+Constant SCHED_OFF_SHUTDOWN as Integer is 32
+Constant SCHED_OFF_WORKER_COUNT as Integer is 40
+Constant SCHED_OFF_WORKER_TIDS as Integer is 48
+Constant SCHED_OFF_LEVELS as Integer is 56
+
+Note: Per-level ring layout
+Constant RING_SIZE as Integer is 32
+Constant RING_OFF_BUFFER as Integer is 0
+Constant RING_OFF_CAPACITY as Integer is 8
+Constant RING_OFF_COUNT as Integer is 16
+Constant RING_OFF_HEAD as Integer is 24
+
+Note: Ring slot geometry — a (function-pointer, argument) pair
+Constant SCHED_SLOT_SIZE as Integer is 16
+Constant SCHED_SLOT_OFF_ARG as Integer is 8
+
+Note: Status codes returned by the scheduler API
+Constant SCHED_OK as Integer is 0
+Constant SCHED_ERR_NULL as Integer is 0 minus 1
+Constant SCHED_ERR_ALLOC as Integer is 0 minus 2
+
+Process called "ring_new" takes capacity as Integer returns Integer:
+    @Reasoning
+    Build one per-level ready ring: a growable circular buffer of (fn,arg)
+    slots that preserves FIFO order within its priority level.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 32-byte ring header and a slot buffer of capacity * 16 bytes.
+    A non-positive requested capacity is clamped to 1 so the ring is always
+    valid and the doubling grow always makes forward progress. On buffer
+    allocation failure the header is released and 0 is returned.
+    @End Implementation
+
+    @Performance_Hints
+    Two allocations, done once per level at scheduler construction. The buffer
+    grows by doubling thereafter, giving amortized O(1) enqueue.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let cap be capacity
+    If cap is less than 1:
+        Set cap to 1
+    End If
+
+    Let ring be proc allocate from Memory with RING_SIZE
+    If ring is equal to 0:
+        Return 0
+    End If
+
+    Let buffer_bytes be cap multiplied by SCHED_SLOT_SIZE
+    Let buffer be proc allocate from Memory with buffer_bytes
+    If buffer is equal to 0:
+        proc deallocate from Memory with ring
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with ring, RING_OFF_BUFFER, buffer
+    proc memory_set_int64 from Memory with ring, RING_OFF_CAPACITY, cap
+    proc memory_set_int64 from Memory with ring, RING_OFF_COUNT, 0
+    proc memory_set_int64 from Memory with ring, RING_OFF_HEAD, 0
+    Return ring
+End Process
+
+Process called "ring_push" takes ring as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Append a task to the tail of one level's ready ring, preserving FIFO order
+    among tasks of equal priority. When the ring is full it is grown so no
+    submission is ever dropped.
+    @End Reasoning
+
+    @Implementation
+    When count equals capacity, double the capacity, allocate a new buffer, and
+    copy the existing tasks into it in FIFO order (walking from head forward,
+    wrapping once), then free the old buffer and reset head to 0. After any
+    needed grow, the new task is written at the tail slot
+    ((head + count) wrapped into capacity) and count is incremented. A failed
+    grow allocation returns SCHED_ERR_ALLOC and leaves the ring unchanged.
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1): most pushes write a single slot; a grow copies count slots
+    but doubling makes the copy cost amortize to a constant per task.
+    @End Performance_Hints
+
+    @Security_Scope
+    Called while the scheduler mutex is held, so the ring fields are observed
+    and mutated under mutual exclusion.
+    @End Security_Scope
+
+    Let cap be proc memory_get_int64 from Memory with ring, RING_OFF_CAPACITY
+    Let cnt be proc memory_get_int64 from Memory with ring, RING_OFF_COUNT
+    Let head be proc memory_get_int64 from Memory with ring, RING_OFF_HEAD
+    Let buffer be proc memory_get_int64 from Memory with ring, RING_OFF_BUFFER
+
+    If cnt is equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_bytes be new_cap multiplied by SCHED_SLOT_SIZE
+        Let new_buffer be proc allocate from Memory with new_bytes
+        If new_buffer is equal to 0:
+            Return SCHED_ERR_ALLOC
+        End If
+
+        Let k be 0
+        While k is less than cnt:
+            Let src_idx be head plus k
+            If src_idx is greater than or equal to cap:
+                Set src_idx to src_idx minus cap
+            End If
+            Let src_off be src_idx multiplied by SCHED_SLOT_SIZE
+            Let dst_off be k multiplied by SCHED_SLOT_SIZE
+            Let slot_fn be proc memory_get_int64 from Memory with buffer, src_off
+            Let slot_arg be proc memory_get_int64 from Memory with buffer, src_off plus SCHED_SLOT_OFF_ARG
+            proc memory_set_int64 from Memory with new_buffer, dst_off, slot_fn
+            proc memory_set_int64 from Memory with new_buffer, dst_off plus SCHED_SLOT_OFF_ARG, slot_arg
+            Set k to k plus 1
+        End While
+
+        proc deallocate from Memory with buffer
+        Set buffer to new_buffer
+        Set cap to new_cap
+        Set head to 0
+        proc memory_set_int64 from Memory with ring, RING_OFF_BUFFER, new_buffer
+        proc memory_set_int64 from Memory with ring, RING_OFF_CAPACITY, new_cap
+        proc memory_set_int64 from Memory with ring, RING_OFF_HEAD, 0
+    End If
+
+    Let tail be head plus cnt
+    If tail is greater than or equal to cap:
+        Set tail to tail minus cap
+    End If
+    Let tail_off be tail multiplied by SCHED_SLOT_SIZE
+    proc memory_set_int64 from Memory with buffer, tail_off, fn
+    proc memory_set_int64 from Memory with buffer, tail_off plus SCHED_SLOT_OFF_ARG, arg
+    proc memory_set_int64 from Memory with ring, RING_OFF_COUNT, cnt plus 1
+    Return SCHED_OK
+End Process
+
+Process called "ring_destroy" takes ring as Integer returns Integer:
+    @Reasoning
+    Release a per-level ring and its slot buffer at scheduler teardown.
+    @End Reasoning
+
+    @Implementation
+    Free the slot buffer (if present) then the ring header. A null ring is a
+    no-op so teardown of a partially constructed scheduler is safe.
+    @End Implementation
+
+    @Performance_Hints
+    Two deallocations. Cold path: once per level at shutdown.
+    @End Performance_Hints
+
+    @Security_Scope
+    Must be called only when no worker can still reference the ring (after
+    shutdown has joined all workers).
+    @End Security_Scope
+
+    If ring is equal to 0:
+        Return SCHED_OK
+    End If
+    Let buffer be proc memory_get_int64 from Memory with ring, RING_OFF_BUFFER
+    If buffer is not equal to 0:
+        proc deallocate from Memory with buffer
+    End If
+    proc deallocate from Memory with ring
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_total_ready" takes sched as Integer returns Integer:
+    @Reasoning
+    Report how many tasks are ready across every priority level. Workers use
+    this as the wait predicate (no work means park) and as the drain test.
+    @End Reasoning
+
+    @Implementation
+    Sum the count field of each per-level ring. A null ring slot contributes
+    nothing, which keeps the scan safe during partial construction.
+    @End Implementation
+
+    @Performance_Hints
+    A bounded scan over SCHED_PRIORITY_LEVELS rings (a constant), each one
+    field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Called while the scheduler mutex is held so the per-level counts are read
+    under mutual exclusion.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return 0
+    End If
+    Let levels be proc memory_get_int64 from Memory with sched, SCHED_OFF_LEVELS
+    If levels is equal to 0:
+        Return 0
+    End If
+    Let total be 0
+    Let i be 0
+    While i is less than SCHED_PRIORITY_LEVELS:
+        Let ring be proc memory_get_int64 from Memory with levels, i multiplied by 8
+        If ring is not equal to 0:
+            Let cnt be proc memory_get_int64 from Memory with ring, RING_OFF_COUNT
+            Set total to total plus cnt
+        End If
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+Process called "scheduler_free_resources" takes sched as Integer returns Integer:
+    @Reasoning
+    Release every resource a scheduler owns. Shared by the normal shutdown path
+    (after workers are joined) and by every partial-failure path in
+    scheduler_new, so cleanup logic lives in exactly one place.
+    @End Reasoning
+
+    @Implementation
+    Each field is read and freed only when non-zero, because scheduler_new zero
+    initializes all fields up front and fills them in stages. Destroy the per
+    level rings and their array, the worker-tid array, both condition variables,
+    and the mutex, then free the scheduler object itself.
+    @End Implementation
+
+    @Performance_Hints
+    A bounded number of deallocations plus the sync-object destroys. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Must not be called while any worker thread can still touch the scheduler;
+    the shutdown path joins all workers first.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let levels be proc memory_get_int64 from Memory with sched, SCHED_OFF_LEVELS
+    If levels is not equal to 0:
+        Let i be 0
+        While i is less than SCHED_PRIORITY_LEVELS:
+            Let ring be proc memory_get_int64 from Memory with levels, i multiplied by 8
+            If ring is not equal to 0:
+                proc ring_destroy with ring
+            End If
+            Set i to i plus 1
+        End While
+        proc deallocate from Memory with levels
+    End If
+
+    Let tids be proc memory_get_int64 from Memory with sched, SCHED_OFF_WORKER_TIDS
+    If tids is not equal to 0:
+        proc deallocate from Memory with tids
+    End If
+
+    Let cv_work be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_WORK
+    If cv_work is not equal to 0:
+        proc condvar_destroy from CondVar with cv_work
+    End If
+
+    Let cv_drained be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_DRAINED
+    If cv_drained is not equal to 0:
+        proc condvar_destroy from CondVar with cv_drained
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    If mtx is not equal to 0:
+        proc mutex_destroy from Mutex with mtx
+    End If
+
+    proc deallocate from Memory with sched
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_worker_main" takes sched as Integer returns Integer:
+    @Reasoning
+    The body of every worker thread. A worker always executes the
+    highest-priority ready task before any lower-priority one, parking on the
+    work condition variable when nothing is ready, and exiting only once
+    shutdown has been requested AND every level is drained.
+    @End Reasoning
+
+    @Implementation
+    Loop: acquire the mutex; while there is no ready work and shutdown is not
+    set, wait on cv_work (the wait re-checks the predicate on every wake, so
+    spurious wakes and broadcast storms are handled correctly). If shutdown is
+    set and nothing is ready, release and return. Otherwise scan the levels
+    from highest priority (0) upward and pop the front task of the first
+    non-empty level by reading its head slot and advancing head with wraparound.
+    Release the mutex, run the task through call_indirect_1, then re-acquire,
+    decrement pending, and broadcast cv_drained when pending hits 0 so
+    scheduler_wait_idle can return.
+    @End Implementation
+
+    @Performance_Hints
+    No busy-waiting: idle workers sleep in the OS until a submit signals them.
+    Task selection is a bounded scan over SCHED_PRIORITY_LEVELS levels. The
+    task runs with the mutex released so workers execute in parallel.
+    @End Performance_Hints
+
+    @Security_Scope
+    Entered only via thread_create from scheduler_new with a valid scheduler.
+    The task function pointer was validated by the submitter; an indirect call
+    to a corrupt pointer is the caller's responsibility, as documented on
+    scheduler_submit.
+    @End Security_Scope
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv_work be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_WORK
+    Let cv_drained be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_DRAINED
+    Let levels be proc memory_get_int64 from Memory with sched, SCHED_OFF_LEVELS
+
+    Loop forever:
+        proc mutex_acquire from Mutex with mtx
+
+        Note: Park while nothing is ready and we are not shutting down. The
+        Note: predicate is re-evaluated on every iteration so each wake (real
+        Note: or spurious) rechecks before proceeding.
+        Let waiting be 1
+        While waiting is equal to 1:
+            Let ready be proc scheduler_total_ready with sched
+            Let shutdown_flag be proc memory_get_int64 from Memory with sched, SCHED_OFF_SHUTDOWN
+            If ready is equal to 0:
+                If shutdown_flag is equal to 0:
+                    proc condvar_wait from CondVar with cv_work, mtx
+                Otherwise:
+                    Set waiting to 0
+                End If
+            Otherwise:
+                Set waiting to 0
+            End If
+        End While
+
+        Note: Exit only when shutting down AND fully drained.
+        Let shutdown_now be proc memory_get_int64 from Memory with sched, SCHED_OFF_SHUTDOWN
+        Let ready_now be proc scheduler_total_ready with sched
+        If shutdown_now is not equal to 0:
+            If ready_now is equal to 0:
+                proc mutex_release from Mutex with mtx
+                Return 0
+            End If
+        End If
+
+        Note: Select the highest-priority non-empty level (0 is highest).
+        Let found be 0 minus 1
+        Let lvl be 0
+        While lvl is less than SCHED_PRIORITY_LEVELS:
+            Let ring be proc memory_get_int64 from Memory with levels, lvl multiplied by 8
+            Let ring_count be 0
+            If ring is not equal to 0:
+                Set ring_count to proc memory_get_int64 from Memory with ring, RING_OFF_COUNT
+            End If
+            If ring_count is greater than 0:
+                Set found to lvl
+                Set lvl to SCHED_PRIORITY_LEVELS
+            Otherwise:
+                Set lvl to lvl plus 1
+            End If
+        End While
+
+        Note: found is always >= 0 here because ready_now was greater than 0.
+        Let sel_ring be proc memory_get_int64 from Memory with levels, found multiplied by 8
+        Let sel_buffer be proc memory_get_int64 from Memory with sel_ring, RING_OFF_BUFFER
+        Let sel_cap be proc memory_get_int64 from Memory with sel_ring, RING_OFF_CAPACITY
+        Let sel_head be proc memory_get_int64 from Memory with sel_ring, RING_OFF_HEAD
+        Let sel_count be proc memory_get_int64 from Memory with sel_ring, RING_OFF_COUNT
+        Let head_off be sel_head multiplied by SCHED_SLOT_SIZE
+        Let task_fn be proc memory_get_int64 from Memory with sel_buffer, head_off
+        Let task_arg be proc memory_get_int64 from Memory with sel_buffer, head_off plus SCHED_SLOT_OFF_ARG
+        Let new_head be sel_head plus 1
+        If new_head is greater than or equal to sel_cap:
+            Set new_head to 0
+        End If
+        proc memory_set_int64 from Memory with sel_ring, RING_OFF_HEAD, new_head
+        proc memory_set_int64 from Memory with sel_ring, RING_OFF_COUNT, sel_count minus 1
+
+        proc mutex_release from Mutex with mtx
+
+        Note: Run the task with the lock released so workers run in parallel.
+        proc call_indirect_1 from Call with task_fn, task_arg
+
+        proc mutex_acquire from Mutex with mtx
+        Let pending be proc memory_get_int64 from Memory with sched, SCHED_OFF_PENDING
+        Set pending to pending minus 1
+        proc memory_set_int64 from Memory with sched, SCHED_OFF_PENDING, pending
+        If pending is equal to 0:
+            proc condvar_broadcast from CondVar with cv_drained
+        End If
+        proc mutex_release from Mutex with mtx
+    End Loop
+
+    Return 0
+End Process
+
+Process called "scheduler_new" takes worker_count as Integer returns Integer:
+    @Reasoning
+    Construct a running priority scheduler: its synchronization objects, one
+    ready ring per priority level, the worker-tid array, and the worker threads
+    themselves. After this returns non-zero the scheduler is live and accepts
+    submissions.
+    @End Reasoning
+
+    @Implementation
+    A non-positive worker_count is resolved to the hardware concurrency (and
+    floored at 1). All scheduler fields are zero-initialized first so the shared
+    scheduler_free_resources can clean up from any failure point. The mutex,
+    both condition variables, the levels array, each per-level ring, and the
+    tid array are created in turn; any allocation failure unwinds through
+    scheduler_free_resources and returns 0. Workers are spawned last via
+    thread_create with the $name address of scheduler_worker_main and the
+    scheduler pointer as the argument; if a spawn fails mid-way, shutdown is
+    requested, the already-spawned workers are joined, resources are freed, and
+    0 is returned.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path. Cost is dominated by the worker_count thread creations (each a
+    kernel operation). Per-level rings start small and grow on demand.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use. No partially
+    constructed scheduler and no leaked threads or memory escape this call.
+    @End Security_Scope
+
+    Let workers be worker_count
+    If workers is less than 1:
+        Set workers to proc thread_hardware_concurrency from Thread
+    End If
+    If workers is less than 1:
+        Set workers to 1
+    End If
+
+    Let sched be proc allocate from Memory with SCHED_SIZE
+    If sched is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero-initialize all fields so scheduler_free_resources is null-safe
+    Note: at every failure point below.
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_MUTEX, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_CV_WORK, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_CV_DRAINED, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_PENDING, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_SHUTDOWN, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_WORKER_COUNT, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_WORKER_TIDS, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_LEVELS, 0
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc scheduler_free_resources with sched
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_MUTEX, mtx
+
+    Let cv_work be proc condvar_new from CondVar
+    If cv_work is equal to 0:
+        proc scheduler_free_resources with sched
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_CV_WORK, cv_work
+
+    Let cv_drained be proc condvar_new from CondVar
+    If cv_drained is equal to 0:
+        proc scheduler_free_resources with sched
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_CV_DRAINED, cv_drained
+
+    Let levels_bytes be SCHED_PRIORITY_LEVELS multiplied by 8
+    Let levels be proc allocate from Memory with levels_bytes
+    If levels is equal to 0:
+        proc scheduler_free_resources with sched
+        Return 0
+    End If
+    Let z be 0
+    While z is less than SCHED_PRIORITY_LEVELS:
+        proc memory_set_int64 from Memory with levels, z multiplied by 8, 0
+        Set z to z plus 1
+    End While
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_LEVELS, levels
+
+    Let li be 0
+    While li is less than SCHED_PRIORITY_LEVELS:
+        Let ring be proc ring_new with SCHED_RING_INIT_CAPACITY
+        If ring is equal to 0:
+            proc scheduler_free_resources with sched
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with levels, li multiplied by 8, ring
+        Set li to li plus 1
+    End While
+
+    Let tids_bytes be workers multiplied by 8
+    Let tids be proc allocate from Memory with tids_bytes
+    If tids is equal to 0:
+        proc scheduler_free_resources with sched
+        Return 0
+    End If
+    Let tz be 0
+    While tz is less than workers:
+        proc memory_set_int64 from Memory with tids, tz multiplied by 8, 0
+        Set tz to tz plus 1
+    End While
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_WORKER_TIDS, tids
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_WORKER_COUNT, workers
+
+    Note: Spawn the workers. Their entry is the real code address of
+    Note: scheduler_worker_main taken via the $name function-pointer operator.
+    Let entry_fn be $scheduler_worker_main
+    Let wi be 0
+    While wi is less than workers:
+        Let tid be proc thread_create from Thread with entry_fn, sched
+        If tid is equal to 0:
+            Note: A spawn failed. Request shutdown, wake any started workers,
+            Note: join them, free everything, and report failure.
+            proc mutex_acquire from Mutex with mtx
+            proc memory_set_int64 from Memory with sched, SCHED_OFF_SHUTDOWN, 1
+            proc condvar_broadcast from CondVar with cv_work
+            proc mutex_release from Mutex with mtx
+
+            Let ji be 0
+            While ji is less than wi:
+                Let started_tid be proc memory_get_int64 from Memory with tids, ji multiplied by 8
+                If started_tid is not equal to 0:
+                    proc thread_join from Thread with started_tid
+                End If
+                Set ji to ji plus 1
+            End While
+
+            proc scheduler_free_resources with sched
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with tids, wi multiplied by 8, tid
+        Set wi to wi plus 1
+    End While
+
+    Return sched
+End Process
+
+Process called "scheduler_submit" takes sched as Integer, fn as Integer, arg as Integer, priority as Integer returns Integer:
+    @Reasoning
+    Enqueue a task at a given priority. The task becomes immediately eligible
+    and is guaranteed to run before any task of strictly lower priority that is
+    submitted at or after this point.
+    @End Reasoning
+
+    @Implementation
+    Clamp the priority into [0, SCHED_PRIORITY_LEVELS-1] so out-of-range values
+    are dispatched at the nearest valid level. Under the mutex, push the
+    (fn,arg) pair onto that level's ring (growing it if full), increment
+    pending, and signal cv_work to wake one parked worker. A failed ring grow
+    surfaces SCHED_ERR_ALLOC and does not change pending.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex round-trip, an amortized O(1) ring push, and one condvar signal
+    (a single futex wake). Hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null scheduler returns SCHED_ERR_NULL. The function pointer must reference a
+    live module-level Process taking one Integer; the worker calls it through
+    call_indirect_1.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let level be priority
+    If level is less than 0:
+        Set level to 0
+    End If
+    If level is greater than or equal to SCHED_PRIORITY_LEVELS:
+        Set level to SCHED_PRIORITY_LEVELS minus 1
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv_work be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_WORK
+    Let levels be proc memory_get_int64 from Memory with sched, SCHED_OFF_LEVELS
+
+    proc mutex_acquire from Mutex with mtx
+    Let ring be proc memory_get_int64 from Memory with levels, level multiplied by 8
+    Let push_rc be proc ring_push with ring, fn, arg
+    If push_rc is not equal to SCHED_OK:
+        proc mutex_release from Mutex with mtx
+        Return push_rc
+    End If
+    Let pending be proc memory_get_int64 from Memory with sched, SCHED_OFF_PENDING
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_PENDING, pending plus 1
+    proc condvar_signal from CondVar with cv_work
+    proc mutex_release from Mutex with mtx
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_pending" takes sched as Integer returns Integer:
+    @Reasoning
+    Report how many submitted tasks have not yet completed (queued plus
+    currently executing). Used by callers polling for progress.
+    @End Reasoning
+
+    @Implementation
+    Read the pending counter under the mutex so the value is a consistent
+    snapshot rather than a torn read against a concurrent worker decrement.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex round-trip and a single field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null scheduler returns 0. The value is advisory and may change immediately
+    after the call returns.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+    Let pending be proc memory_get_int64 from Memory with sched, SCHED_OFF_PENDING
+    proc mutex_release from Mutex with mtx
+    Return pending
+End Process
+
+Process called "scheduler_wait_idle" takes sched as Integer returns Integer:
+    @Reasoning
+    Block the calling thread until every submitted task has completed. Used to
+    join a batch of work without polling.
+    @End Reasoning
+
+    @Implementation
+    Under the mutex, wait on cv_drained while pending is greater than 0. The
+    wait re-checks pending on every wake, so it returns exactly when the last
+    task's completion drives pending to 0 and broadcasts cv_drained. If nothing
+    is pending on entry it returns immediately.
+    @End Implementation
+
+    @Performance_Hints
+    No busy-waiting: the caller sleeps in the OS until the drain broadcast.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null scheduler returns SCHED_ERR_NULL. On return the mutex is released and
+    no obligation is left to the caller.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv_drained be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_DRAINED
+    proc mutex_acquire from Mutex with mtx
+    Let pending be proc memory_get_int64 from Memory with sched, SCHED_OFF_PENDING
+    While pending is greater than 0:
+        proc condvar_wait from CondVar with cv_drained, mtx
+        Set pending to proc memory_get_int64 from Memory with sched, SCHED_OFF_PENDING
+    End While
+    proc mutex_release from Mutex with mtx
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_yield" returns Integer:
+    @Reasoning
+    Cooperative hint that the calling thread is willing to relinquish the CPU so
+    other ready threads — including scheduler workers — can run.
+    @End Reasoning
+
+    @Implementation
+    Delegate to thread_yield, the platform-routed scheduler yield primitive.
+    @End Implementation
+
+    @Performance_Hints
+    One yield syscall; no allocation or locking.
+    @End Performance_Hints
+
+    @Security_Scope
+    Advisory hint only; never blocks indefinitely.
+    @End Security_Scope
+
+    Return proc thread_yield from Thread
+End Process
+
+Process called "scheduler_worker_count" takes sched as Integer returns Integer:
+    @Reasoning
+    Report the number of worker threads servicing this scheduler.
+    @End Reasoning
+
+    @Implementation
+    Read the worker_count field. The value is fixed for the scheduler's
+    lifetime, so no lock is required.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null scheduler returns 0.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sched, SCHED_OFF_WORKER_COUNT
+End Process
+
+Process called "scheduler_shutdown" takes sched as Integer returns Integer:
+    @Reasoning
+    Stop the scheduler cleanly: let workers finish every already-queued task,
+    then exit and join them, then release all resources. After this returns the
+    scheduler pointer is invalid.
+    @End Reasoning
+
+    @Implementation
+    Under the mutex, set the shutdown flag and broadcast cv_work so every parked
+    worker wakes; workers then drain all levels before returning (see
+    scheduler_worker_main). Join each worker thread, then free every resource
+    through scheduler_free_resources.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path. Blocks until all queued tasks finish and all workers join.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null scheduler returns SCHED_ERR_NULL. Must not be called concurrently with
+    itself; one shutdown owns the teardown.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv_work be proc memory_get_int64 from Memory with sched, SCHED_OFF_CV_WORK
+
+    proc mutex_acquire from Mutex with mtx
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_SHUTDOWN, 1
+    proc condvar_broadcast from CondVar with cv_work
+    proc mutex_release from Mutex with mtx
+
+    Let worker_count be proc memory_get_int64 from Memory with sched, SCHED_OFF_WORKER_COUNT
+    Let tids be proc memory_get_int64 from Memory with sched, SCHED_OFF_WORKER_TIDS
+    If tids is not equal to 0:
+        Let i be 0
+        While i is less than worker_count:
+            Let tid be proc memory_get_int64 from Memory with tids, i multiplied by 8
+            If tid is not equal to 0:
+                proc thread_join from Thread with tid
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    proc scheduler_free_resources with sched
+    Return SCHED_OK
+End Process
