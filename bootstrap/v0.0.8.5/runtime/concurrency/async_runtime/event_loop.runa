@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,644 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles event loop implementation and event loop management for the Runa runtime concurrency system.
+Runtime event loop — the epoll-based reactor core of the Runa async runtime.
 
-This file performs the following tasks:
-- Process event loop implementation and event loop management
-- Handle event registration and event dispatching
-- Manage event loop lifecycle and event loop coordination
-- Process event loop error handling and event loop feedback
+This module is the readiness engine that the rest of the async runtime is
+built on. It owns a single Linux epoll instance and turns kernel readiness
+notifications into Runa callback dispatches. A higher layer (futures, tasks,
+timers, network streams) registers a file descriptor together with an event
+mask and a callback; when the kernel reports that descriptor ready, this loop
+invokes the callback with the caller-supplied argument. The loop does NOT
+own the file descriptors it watches and does NOT interpret what readiness
+means for any particular subsystem — it is purely the demultiplexer.
 
-This file is essential because of the following reasons:
-- event_loop enables comprehensive event loop implementation and event loop management
-- Proper event loop handling ensures correct event processing and user experience
-- event_loop support enables Runa compilation for event-driven workflows
+Mechanism: the readiness primitive is the OS epoll facility, reached through
+the completed platform syscall facade (epoll_create1 / epoll_ctl /
+epoll_wait / close). This module does not re-implement polling; it wraps the
+raw facade in a RuntimeEventLoop object plus a per-descriptor Registration
+object, adds growable bookkeeping so registrations can be enumerated for
+clean teardown, and exposes a stable status-code contract.
 
-This file consists of the following functions/features/operation types:
-- Event loop implementation and event loop management
-- Event registration and event dispatching
-- Event loop lifecycle and event loop coordination
-- Event loop error handling and event loop feedback
+RuntimeEventLoop layout (56 bytes):
+    offset 0:   epfd        — the epoll instance file descriptor
+    offset 8:   result_buf  — preallocated epoll_event array (capacity * 12)
+    offset 16:  capacity    — number of epoll_event slots in result_buf
+    offset 24:  reg_list    — growable array of Registration pointers (8 each)
+    offset 32:  reg_cap     — number of pointer slots in reg_list
+    offset 40:  reg_count   — number of live registrations (also active count)
+    offset 48:  running     — 0 stopped, 1 running (drives event_loop_run)
+
+Registration layout (32 bytes):
+    offset 0:   fd          — the watched file descriptor
+    offset 8:   events_mask — the epoll event mask registered for fd
+    offset 16:  callback_fn — the $name function pointer dispatched on ready
+    offset 24:  user_arg    — opaque argument passed to callback_fn
+
+epoll_event ABI (PACKED, 12 bytes — load-bearing):
+    offset 0:   events  — u32 event mask, written with memory_set_int32
+    offset 4:   data    — u64 user data, written with memory_set_int64;
+                          here it holds the Registration pointer
+    The kernel reads and writes a packed 12-byte record (NOT the 16-byte
+    naturally-aligned shape). EPOLL_EVENT_SIZE is therefore 12, and the
+    result buffer is strided by 12 so epoll_wait fills consecutive records
+    without gaps. memory_set_int32 exists in the layout primitives, so the
+    events field is written directly as a clean 4-byte store at offset 0 and
+    the data pointer as a clean 8-byte store at offset 4 — no overlapping
+    int64-overwrite trick is required.
 :End Note
 
-Note: TODO - Implement event_loop functionality
+Import "compiler/frontend/primitives/platform/linux_x86_64/syscall.runa" as Sys
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: RuntimeEventLoop object layout
+Constant EVLOOP_SIZE as Integer is 56
+Constant EVLOOP_OFF_EPFD as Integer is 0
+Constant EVLOOP_OFF_BUFFER as Integer is 8
+Constant EVLOOP_OFF_CAPACITY as Integer is 16
+Constant EVLOOP_OFF_REG_LIST as Integer is 24
+Constant EVLOOP_OFF_REG_CAP as Integer is 32
+Constant EVLOOP_OFF_REG_COUNT as Integer is 40
+Constant EVLOOP_OFF_RUNNING as Integer is 48
+
+Note: Registration object layout
+Constant REG_SIZE as Integer is 32
+Constant REG_OFF_FD as Integer is 0
+Constant REG_OFF_EVENTS as Integer is 8
+Constant REG_OFF_CALLBACK as Integer is 16
+Constant REG_OFF_USERARG as Integer is 24
+
+Note: Packed epoll_event ABI — 12 bytes, NOT 16
+Constant EPOLL_EVENT_SIZE as Integer is 12
+Constant EPOLL_EV_OFF_EVENTS as Integer is 0
+Constant EPOLL_EV_OFF_DATA as Integer is 4
+
+Note: Size of one pointer slot in the registration list
+Constant PTR_SIZE as Integer is 8
+
+Note: Default sizing — result buffer slots and initial registration capacity
+Constant EVLOOP_DEFAULT_CAPACITY as Integer is 64
+Constant EVLOOP_DEFAULT_REG_CAPACITY as Integer is 8
+
+Note: epoll_ctl operations
+Constant EPOLL_CTL_ADD as Integer is 1
+Constant EPOLL_CTL_DEL as Integer is 2
+Constant EPOLL_CTL_MOD as Integer is 3
+
+Note: epoll event-mask flags
+Constant EPOLLIN as Integer is 1
+Constant EPOLLOUT as Integer is 4
+Constant EPOLLERR as Integer is 8
+Constant EPOLLHUP as Integer is 16
+Constant EPOLLET as Integer is 2147483648
+
+Note: epoll_create1 flag — set close-on-exec on the epoll fd
+Constant EPOLL_CLOEXEC as Integer is 524288
+
+Note: Blocking timeout sentinel for epoll_wait (wait indefinitely)
+Constant EVLOOP_TIMEOUT_BLOCK as Integer is 0 minus 1
+
+Note: NULL event pointer accepted by EPOLL_CTL_DEL on modern kernels
+Constant EVLOOP_NULL_EVENT as Integer is 0
+
+Note: -EINTR — epoll_wait interrupted by a signal; a benign, retryable result
+Constant EVLOOP_NEG_EINTR as Integer is 0 minus 4
+
+Note: Status codes returned by the runtime event loop API
+Constant EVLOOP_OK as Integer is 0
+Constant EVLOOP_ERR_NULL as Integer is 0 minus 1
+Constant EVLOOP_ERR_CREATE as Integer is 0 minus 2
+Constant EVLOOP_ERR_CTL as Integer is 0 minus 3
+Constant EVLOOP_ERR_WAIT as Integer is 0 minus 4
+Constant EVLOOP_ERR_ALLOC as Integer is 0 minus 5
+
+Process called "event_loop_new" returns Integer:
+    @Reasoning
+    Construct a reactor. The readiness mechanism is a single OS epoll instance
+    created with EPOLL_CLOEXEC so it is not leaked across an exec. The object
+    additionally carries a preallocated epoll_wait result buffer (so the hot
+    polling path never allocates) and a growable registration list (so every
+    live registration can be enumerated and torn down deterministically).
+    @End Reasoning
+
+    @Implementation
+    Create the epoll fd first; a negative return means the kernel refused the
+    instance, so report failure (0) before any allocation. Then allocate, in
+    order, the loop object, the result buffer (capacity * 12 packed records),
+    and the registration pointer list. Each allocation failure unwinds every
+    resource already acquired — earlier allocations are freed and the epoll fd
+    is closed — so a failed constructor leaks nothing. Initialize reg_count and
+    running to 0.
+    @End Implementation
+
+    @Performance_Hints
+    One epoll_create1 syscall plus three allocations, all on the cold
+    construction path. The 64-slot result buffer (768 bytes) is sized so the
+    common ready-set fits without a second epoll_wait round-trip.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use. EPOLL_CLOEXEC
+    prevents the epoll descriptor from surviving into child processes.
+    @End Security_Scope
+
+    Let epfd be proc linux_x86_64_syscall_epoll_create1 from Sys with EPOLL_CLOEXEC
+    If epfd is less than 0:
+        Return 0
+    End If
+
+    Let loop be proc allocate from Memory with EVLOOP_SIZE
+    If loop is equal to 0:
+        proc linux_x86_64_syscall_close from Sys with epfd
+        Return 0
+    End If
+
+    Let capacity be EVLOOP_DEFAULT_CAPACITY
+    Let buffer_bytes be capacity multiplied by EPOLL_EVENT_SIZE
+    Let buffer be proc allocate from Memory with buffer_bytes
+    If buffer is equal to 0:
+        proc deallocate from Memory with loop
+        proc linux_x86_64_syscall_close from Sys with epfd
+        Return 0
+    End If
+
+    Let reg_cap be EVLOOP_DEFAULT_REG_CAPACITY
+    Let reg_bytes be reg_cap multiplied by PTR_SIZE
+    Let reg_list be proc allocate from Memory with reg_bytes
+    If reg_list is equal to 0:
+        proc deallocate from Memory with buffer
+        proc deallocate from Memory with loop
+        proc linux_x86_64_syscall_close from Sys with epfd
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_EPFD, epfd
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_BUFFER, buffer
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_CAPACITY, capacity
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_LIST, reg_list
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_CAP, reg_cap
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT, 0
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_RUNNING, 0
+    Return loop
+End Process
+
+Process called "event_loop_add" takes loop as Integer, fd as Integer, events as Integer, callback as Integer, user_arg as Integer returns Integer:
+    @Reasoning
+    Register a descriptor for readiness notification. The Registration object
+    is the durable record of "who to call when fd is ready"; its pointer is
+    handed to the kernel as the epoll_event data word so that when the fd later
+    becomes ready, epoll_wait returns that exact pointer and dispatch is an
+    O(1) field read rather than a search keyed on the descriptor.
+    @End Reasoning
+
+    @Implementation
+    Allocate and populate a 32-byte Registration (fd, mask, callback, arg).
+    Build a packed 12-byte epoll_event on a scratch allocation: the u32 mask
+    is written at offset 0 with memory_set_int32 and the Registration pointer
+    is written at offset 4 with memory_set_int64 (the kernel reads the 8-byte
+    data word starting at offset 4 of the packed record). Submit it with
+    EPOLL_CTL_ADD, then free the scratch event — the kernel has copied it. On
+    a control failure the Registration is freed and EVLOOP_ERR_CTL returned.
+    On success the Registration pointer is appended to the registration list,
+    doubling the list first if it is full; copy via memory_copy and free the
+    old backing store. If the list grow itself fails, the ADD is rolled back
+    with EPOLL_CTL_DEL so loop bookkeeping never diverges from kernel state.
+    @End Implementation
+
+    @Performance_Hints
+    One allocation for the Registration plus one scratch allocation for the
+    event record, one epoll_ctl syscall, and an amortized-O(1) list append.
+    The doubling growth keeps total copying linear across the loop's lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL without touching memory. The caller
+    retains ownership of fd; this loop only references it. The callback pointer
+    is invoked verbatim later via call_indirect_1, matching that primitive's
+    contract — the caller is responsible for supplying a valid $name pointer.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let reg be proc allocate from Memory with REG_SIZE
+    If reg is equal to 0:
+        Return EVLOOP_ERR_ALLOC
+    End If
+    proc memory_set_int64 from Memory with reg, REG_OFF_FD, fd
+    proc memory_set_int64 from Memory with reg, REG_OFF_EVENTS, events
+    proc memory_set_int64 from Memory with reg, REG_OFF_CALLBACK, callback
+    proc memory_set_int64 from Memory with reg, REG_OFF_USERARG, user_arg
+
+    Let ev be proc allocate from Memory with EPOLL_EVENT_SIZE
+    If ev is equal to 0:
+        proc deallocate from Memory with reg
+        Return EVLOOP_ERR_ALLOC
+    End If
+    proc memory_set_int32 from Memory with ev, EPOLL_EV_OFF_EVENTS, events
+    proc memory_set_int64 from Memory with ev, EPOLL_EV_OFF_DATA, reg
+
+    Let epfd be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_EPFD
+    Let rc be proc linux_x86_64_syscall_epoll_ctl from Sys with epfd, EPOLL_CTL_ADD, fd, ev
+    proc deallocate from Memory with ev
+    If rc is less than 0:
+        proc deallocate from Memory with reg
+        Return EVLOOP_ERR_CTL
+    End If
+
+    Let count be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+    Let cap be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_CAP
+    If count is equal to cap:
+        Let new_cap be cap multiplied by 2
+        If new_cap is equal to 0:
+            Set new_cap to EVLOOP_DEFAULT_REG_CAPACITY
+        End If
+        Let new_bytes be new_cap multiplied by PTR_SIZE
+        Let new_list be proc allocate from Memory with new_bytes
+        If new_list is equal to 0:
+            proc linux_x86_64_syscall_epoll_ctl from Sys with epfd, EPOLL_CTL_DEL, fd, EVLOOP_NULL_EVENT
+            proc deallocate from Memory with reg
+            Return EVLOOP_ERR_ALLOC
+        End If
+        Let old_list be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_LIST
+        Let copy_bytes be count multiplied by PTR_SIZE
+        proc memory_copy from Memory with new_list, old_list, copy_bytes
+        proc deallocate from Memory with old_list
+        proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_LIST, new_list
+        proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_CAP, new_cap
+    End If
+
+    Let list be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_LIST
+    Let slot_offset be count multiplied by PTR_SIZE
+    proc memory_set_int64 from Memory with list, slot_offset, reg
+    Let new_count be count plus 1
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT, new_count
+    Return EVLOOP_OK
+End Process
+
+Process called "event_loop_modify" takes loop as Integer, fd as Integer, events as Integer returns Integer:
+    @Reasoning
+    Change the event mask for an already-registered descriptor without tearing
+    down and recreating its Registration, so the callback identity and any
+    pending kernel state for fd are preserved across the change.
+    @End Reasoning
+
+    @Implementation
+    Linearly locate the Registration whose fd matches (the registration set is
+    small and walked rarely). Update its stored mask, build a fresh packed
+    12-byte epoll_event carrying the new mask at offset 0 and the unchanged
+    Registration pointer at offset 4, and submit it with EPOLL_CTL_MOD. The
+    scratch event is freed after the syscall. A missing fd is reported as
+    EVLOOP_ERR_NULL; a kernel control failure as EVLOOP_ERR_CTL.
+    @End Implementation
+
+    @Performance_Hints
+    One linear scan over the live registrations, one scratch allocation, and
+    one epoll_ctl syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. Modifying an unregistered fd is a
+    caller error surfaced as EVLOOP_ERR_NULL rather than a silent no-op.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let count be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+    Let list be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_LIST
+    Let found be 0
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let candidate be proc memory_get_int64 from Memory with list, slot_offset
+        Let candidate_fd be proc memory_get_int64 from Memory with candidate, REG_OFF_FD
+        If candidate_fd is equal to fd:
+            Set found to candidate
+            Set i to count
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    If found is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    proc memory_set_int64 from Memory with found, REG_OFF_EVENTS, events
+
+    Let ev be proc allocate from Memory with EPOLL_EVENT_SIZE
+    If ev is equal to 0:
+        Return EVLOOP_ERR_ALLOC
+    End If
+    proc memory_set_int32 from Memory with ev, EPOLL_EV_OFF_EVENTS, events
+    proc memory_set_int64 from Memory with ev, EPOLL_EV_OFF_DATA, found
+
+    Let epfd be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_EPFD
+    Let rc be proc linux_x86_64_syscall_epoll_ctl from Sys with epfd, EPOLL_CTL_MOD, fd, ev
+    proc deallocate from Memory with ev
+    If rc is less than 0:
+        Return EVLOOP_ERR_CTL
+    End If
+    Return EVLOOP_OK
+End Process
+
+Process called "event_loop_remove" takes loop as Integer, fd as Integer returns Integer:
+    @Reasoning
+    Stop watching a descriptor and reclaim its Registration. Removal must keep
+    the registration list dense so the active count stays accurate and future
+    scans stay cheap.
+    @End Reasoning
+
+    @Implementation
+    Locate the index of the Registration matching fd. Detach the fd from epoll
+    with EPOLL_CTL_DEL (a NULL event pointer is accepted for DEL). Compact the
+    list by moving the last pointer into the vacated slot (a no-op when the
+    removed entry was already last), decrement reg_count, and free the
+    Registration. The DEL result is captured: even if the kernel reports the fd
+    was already gone (for example the caller closed it first), the loop's own
+    bookkeeping is still reclaimed, and the DEL status is surfaced so callers
+    learn of an unexpected control failure.
+    @End Implementation
+
+    @Performance_Hints
+    One linear scan, one epoll_ctl syscall, an O(1) swap-compaction, and one
+    deallocate. No buffer shrink — capacity is retained for reuse.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. Removing an unregistered fd returns
+    EVLOOP_ERR_NULL without altering any state.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let count be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+    Let list be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_LIST
+    Let idx be 0 minus 1
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let candidate be proc memory_get_int64 from Memory with list, slot_offset
+        Let candidate_fd be proc memory_get_int64 from Memory with candidate, REG_OFF_FD
+        If candidate_fd is equal to fd:
+            Set idx to i
+            Set i to count
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    If idx is less than 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let idx_offset be idx multiplied by PTR_SIZE
+    Let reg be proc memory_get_int64 from Memory with list, idx_offset
+
+    Let epfd be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_EPFD
+    Let rc be proc linux_x86_64_syscall_epoll_ctl from Sys with epfd, EPOLL_CTL_DEL, fd, EVLOOP_NULL_EVENT
+
+    Let last_idx be count minus 1
+    If idx is not equal to last_idx:
+        Let last_offset be last_idx multiplied by PTR_SIZE
+        Let last_reg be proc memory_get_int64 from Memory with list, last_offset
+        proc memory_set_int64 from Memory with list, idx_offset, last_reg
+    End If
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT, last_idx
+    proc deallocate from Memory with reg
+
+    If rc is less than 0:
+        Return EVLOOP_ERR_CTL
+    End If
+    Return EVLOOP_OK
+End Process
+
+Process called "event_loop_run_once" takes loop as Integer, timeout_ms as Integer returns Integer:
+    @Reasoning
+    Perform a single reactor turn: ask the kernel which descriptors are ready
+    within the timeout, then dispatch each ready descriptor's callback. This is
+    the hot path; one epoll_wait drives every dispatch in the turn.
+    @End Reasoning
+
+    @Implementation
+    Call epoll_wait into the preallocated result buffer for up to capacity
+    records. A negative return is an error: -EINTR (a signal interrupted the
+    wait) is benign and reported as 0 events dispatched so callers simply retry
+    the turn; any other negative is reported as EVLOOP_ERR_WAIT. For each of the
+    N returned packed 12-byte records, read the Registration pointer from the
+    data word at offset 4, load its callback and user_arg, and invoke the
+    callback via call_indirect_1. A null Registration or null callback record
+    is skipped defensively. Returns N, the number of callbacks dispatched.
+    @End Implementation
+
+    @Performance_Hints
+    Exactly one epoll_wait syscall per turn. Dispatch is a tight loop of two
+    field loads and one indirect call per ready descriptor, striding the result
+    buffer by the packed 12-byte record size with no per-event allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. The Registration pointer read back from
+    the kernel data word is exactly the one this loop stored at registration
+    time, so dispatch cannot be redirected by descriptor-number reuse.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let epfd be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_EPFD
+    Let buffer be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_BUFFER
+    Let capacity be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_CAPACITY
+
+    Let n be proc linux_x86_64_syscall_epoll_wait from Sys with epfd, buffer, capacity, timeout_ms
+    If n is less than 0:
+        If n is equal to EVLOOP_NEG_EINTR:
+            Return 0
+        End If
+        Return EVLOOP_ERR_WAIT
+    End If
+
+    Let i be 0
+    While i is less than n:
+        Let record_offset be i multiplied by EPOLL_EVENT_SIZE
+        Let record_ptr be buffer plus record_offset
+        Let reg be proc memory_get_int64 from Memory with record_ptr, EPOLL_EV_OFF_DATA
+        If reg is not equal to 0:
+            Let callback be proc memory_get_int64 from Memory with reg, REG_OFF_CALLBACK
+            Let user_arg be proc memory_get_int64 from Memory with reg, REG_OFF_USERARG
+            If callback is not equal to 0:
+                proc call_indirect_1 from Call with callback, user_arg
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return n
+End Process
+
+Process called "event_loop_run" takes loop as Integer returns Integer:
+    @Reasoning
+    Drive the reactor until it is asked to stop or has nothing left to watch.
+    Running with no registrations leaves epoll_wait blocked indefinitely, so
+    the loop also exits when the active registration count reaches zero.
+    @End Reasoning
+
+    @Implementation
+    Set running to 1, then repeatedly run a blocking turn (timeout -1). The
+    bootstrap compiler has no compound boolean operators in a condition, so the
+    "still running AND has registrations" decision is expressed with a
+    should_continue flag set by nested Ifs: clear it when running drops to 0,
+    when the active count reaches 0, or when a turn reports a hard
+    EVLOOP_ERR_WAIT (so a persistent kernel error cannot spin the loop). An
+    interrupted wait (-EINTR) is reported by run_once as 0 and simply retried.
+    @End Implementation
+
+    @Performance_Hints
+    Blocks in the kernel between events (timeout -1), so an idle loop consumes
+    no CPU. Each wake performs exactly one turn's dispatch before re-arming.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. event_loop_stop may be called from a
+    dispatched callback to request an orderly shutdown after the current turn.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_RUNNING, 1
+
+    Let should_continue be 1
+    While should_continue is equal to 1:
+        Let running be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_RUNNING
+        If running is equal to 0:
+            Set should_continue to 0
+        Otherwise:
+            Let active be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+            If active is equal to 0:
+                Set should_continue to 0
+            Otherwise:
+                Let rc be event_loop_run_once(loop, EVLOOP_TIMEOUT_BLOCK)
+                If rc is less than 0:
+                    Set should_continue to 0
+                End If
+            End If
+        End If
+    End While
+    Return EVLOOP_OK
+End Process
+
+Process called "event_loop_stop" takes loop as Integer returns Integer:
+    @Reasoning
+    Request an orderly shutdown of event_loop_run. Stopping only clears the
+    running flag; the loop exits after the in-flight turn completes, so a
+    callback that calls stop still returns cleanly.
+    @End Reasoning
+
+    @Implementation
+    Set the running flag to 0. The next iteration of event_loop_run's guard
+    observes it and exits.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. Safe to call from any thread or from
+    within a dispatched callback; the flag is read once per turn.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with loop, EVLOOP_OFF_RUNNING, 0
+    Return EVLOOP_OK
+End Process
+
+Process called "event_loop_active_count" takes loop as Integer returns Integer:
+    @Reasoning
+    Report how many descriptors are currently registered, which is the figure
+    that decides whether event_loop_run has any work left.
+    @End Reasoning
+
+    @Implementation
+    Return the reg_count field, which is kept exactly equal to the number of
+    live Registrations by add (increment) and remove (decrement with
+    compaction).
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns 0. Pure read.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+End Process
+
+Process called "event_loop_destroy" takes loop as Integer returns Integer:
+    @Reasoning
+    Fully tear down a reactor with no leaks: every live Registration is
+    detached from the kernel and freed, then the epoll fd is closed and all
+    backing allocations are released. This is why the loop tracks its
+    registrations — without the list, the per-fd Registration objects could not
+    be reclaimed.
+    @End Reasoning
+
+    @Implementation
+    Walk the registration list. For each live Registration, detach its fd with
+    EPOLL_CTL_DEL (NULL event) and free the Registration. Free the registration
+    list backing store, free the epoll_wait result buffer, close the epoll fd,
+    and finally free the loop object itself.
+    @End Implementation
+
+    @Performance_Hints
+    One epoll_ctl plus one deallocate per registration, then one close and
+    three deallocates. Cold path: done once per loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns EVLOOP_ERR_NULL. After destroy the loop pointer is
+    dangling and must not be reused. Descriptors are detached, not closed —
+    their ownership stays with the original registrant.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return EVLOOP_ERR_NULL
+    End If
+
+    Let epfd be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_EPFD
+    Let list be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_LIST
+    Let count be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_REG_COUNT
+
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let reg be proc memory_get_int64 from Memory with list, slot_offset
+        If reg is not equal to 0:
+            Let reg_fd be proc memory_get_int64 from Memory with reg, REG_OFF_FD
+            proc linux_x86_64_syscall_epoll_ctl from Sys with epfd, EPOLL_CTL_DEL, reg_fd, EVLOOP_NULL_EVENT
+            proc deallocate from Memory with reg
+        End If
+        Set i to i plus 1
+    End While
+
+    proc deallocate from Memory with list
+    Let buffer be proc memory_get_int64 from Memory with loop, EVLOOP_OFF_BUFFER
+    proc deallocate from Memory with buffer
+    proc linux_x86_64_syscall_close from Sys with epfd
+    proc deallocate from Memory with loop
+    Return EVLOOP_OK
+End Process
