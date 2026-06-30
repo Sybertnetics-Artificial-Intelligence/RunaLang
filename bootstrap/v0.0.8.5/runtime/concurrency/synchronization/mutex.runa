@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,344 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles mutex implementation and mutex management for the Runa runtime concurrency system.
+Runtime mutex API — the public mutual-exclusion object for the Runa runtime
+concurrency system.
 
-This file performs the following tasks:
-- Process mutex implementation and mutex management
-- Handle mutex locking and mutex unlocking
-- Manage mutex coordination and mutex synchronization
-- Process mutex error handling and mutex feedback
+This is the runtime-facing object layer. The actual locking mechanism is the
+completed cross-platform synchronization facade (sync_core), which itself
+delegates to the per-architecture OS futex / ulock primitives. This module
+does NOT re-implement locking; it wraps the sync_core handle in a runtime
+RuntimeMutex object and adds the semantics a runtime contract requires that
+the raw facade does not provide:
 
-This file is essential because of the following reasons:
-- mutex enables comprehensive mutex implementation and mutex management
-- Proper mutex handling ensures correct mutex-based synchronization and user experience
-- mutex support enables Runa compilation for mutex-based workflows
+  - POISONING: a holder that detects an unrecoverable error in the data it is
+    protecting marks the mutex poisoned. Subsequent acquirers still obtain the
+    lock (mutual exclusion is still needed to inspect/repair the data) but are
+    told MUTEX_ERR_POISONED so they can decide whether to recover or abort.
+    This mirrors the poison model used by mature systems runtimes and is the
+    standard way to surface "a previous critical section left this state
+    inconsistent" without unwinding.
+  - STANDARDIZED STATUS CODES: every entry point returns a MUTEX_* status so
+    callers branch on a single, documented contract rather than the facade's
+    raw 1/0 platform results.
 
-This file consists of the following functions/features/operation types:
-- Mutex implementation and mutex management
-- Mutex locking and mutex unlocking
-- Mutex coordination and mutex synchronization
-- Mutex error handling and mutex feedback
+RuntimeMutex layout (16 bytes):
+    offset 0:  handle    — the sync_core mutex_ptr (the real lock)
+    offset 8:  poisoned  — 0 healthy, 1 poisoned
 :End Note
 
-Note: TODO - Implement mutex functionality
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: RuntimeMutex object layout
+Constant RT_MUTEX_SIZE as Integer is 16
+Constant RT_MUTEX_OFF_HANDLE as Integer is 0
+Constant RT_MUTEX_OFF_POISONED as Integer is 8
+
+Note: Status codes returned by the runtime mutex API
+Constant MUTEX_OK as Integer is 0
+Constant MUTEX_ERR_NULL as Integer is -1
+Constant MUTEX_ERR_POISONED as Integer is -2
+Constant MUTEX_ERR_LOCK_FAILED as Integer is -3
+Constant MUTEX_ERR_BUSY as Integer is -4
+
+Process called "mutex_new" returns Integer:
+    @Reasoning
+    Create a runtime mutex object. Mechanism (the OS lock) comes from sync_core;
+    this layer adds the poison flag and a stable object identity callers hold.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 16-byte RuntimeMutex, create the underlying sync_core mutex,
+    store its handle, and initialize the poison flag to healthy (0). On any
+    allocation/creation failure, release whatever was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    One small allocation plus one sync_core mutex_create (which allocates its
+    own 24-byte control block and an OS lock). Cold path: done once per mutex.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let m be proc allocate from Memory with RT_MUTEX_SIZE
+    If m is equal to 0:
+        Return 0
+    End If
+
+    Let handle be proc mutex_create from Sync
+    If handle is equal to 0:
+        proc deallocate from Memory with m
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with m, RT_MUTEX_OFF_HANDLE, handle
+    proc memory_set_int64 from Memory with m, RT_MUTEX_OFF_POISONED, 0
+    Return m
+End Process
+
+Process called "mutex_acquire" takes m as Integer returns Integer:
+    @Reasoning
+    Block until the lock is held, then report whether the protected state is
+    trustworthy. The lock is acquired even when poisoned because the caller
+    still needs exclusive access to inspect or repair the inconsistent data.
+    @End Reasoning
+
+    @Implementation
+    Delegate the blocking acquire to sync_core mutex_lock. If that fails to
+    report success, the lock is NOT held and we return MUTEX_ERR_LOCK_FAILED.
+    Once held, return MUTEX_ERR_POISONED when the poison flag is set (the lock
+    is still held and must be released), otherwise MUTEX_OK.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core mutex_lock (fast user-space CAS on the uncontended path; OS
+    futex wait only under contention) plus two field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns MUTEX_ERR_NULL without touching memory. When MUTEX_OK
+    or MUTEX_ERR_POISONED is returned the lock IS held and the caller owns the
+    obligation to release it.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Let r be proc mutex_lock from Sync with handle
+    If r is not equal to 1:
+        Return MUTEX_ERR_LOCK_FAILED
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return MUTEX_ERR_POISONED
+    End If
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_try_acquire" takes m as Integer returns Integer:
+    @Reasoning
+    Non-blocking acquire for callers that must make progress rather than wait.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core mutex_try_lock. A 0 result means the lock is held by
+    another owner (MUTEX_ERR_BUSY). On success, surface poison state exactly as
+    mutex_acquire does so the held/poison contract is identical on both paths.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core mutex_try_lock (single CAS, never blocks) plus field loads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns MUTEX_ERR_NULL. The lock is held only when MUTEX_OK or
+    MUTEX_ERR_POISONED is returned.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Let r be proc mutex_try_lock from Sync with handle
+    If r is not equal to 1:
+        Return MUTEX_ERR_BUSY
+    End If
+
+    Let poisoned be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_POISONED
+    If poisoned is not equal to 0:
+        Return MUTEX_ERR_POISONED
+    End If
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_release" takes m as Integer returns Integer:
+    @Reasoning
+    Release a held lock. Must be called exactly once per successful acquire
+    (including the MUTEX_ERR_POISONED acquire, which still holds the lock).
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core mutex_unlock, which also clears its owner/count
+    tracking. Return MUTEX_OK on success.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core mutex_unlock (user-space store on the uncontended path; a
+    single futex wake when waiters are present).
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns MUTEX_ERR_NULL. Releasing a lock not held by the caller
+    is a logic error surfaced by the underlying facade.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    proc mutex_unlock from Sync with handle
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_is_held" takes m as Integer returns Integer:
+    @Reasoning
+    Report whether the lock is currently held by any thread.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core mutex_is_locked (1 held, 0 free).
+    @End Implementation
+
+    @Performance_Hints
+    One field load inside the facade.
+    @End Performance_Hints
+
+    @Security_Scope
+    Advisory only; the state may change immediately after the call returns.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Return proc mutex_is_locked from Sync with handle
+End Process
+
+Process called "mutex_owner" takes m as Integer returns Integer:
+    @Reasoning
+    Return the thread id of the current owner, or 0 if unlocked.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core mutex_get_owner.
+    @End Implementation
+
+    @Performance_Hints
+    One field load inside the facade.
+    @End Performance_Hints
+
+    @Security_Scope
+    Advisory; for diagnostics and deadlock detection, not for ownership-based
+    control flow.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    Return proc mutex_get_owner from Sync with handle
+End Process
+
+Process called "mutex_is_poisoned" takes m as Integer returns Integer:
+    @Reasoning
+    Report whether a previous critical section flagged the protected data as
+    inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Read the poison flag (1 poisoned, 0 healthy).
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_POISONED
+End Process
+
+Process called "mutex_poison" takes m as Integer returns Integer:
+    @Reasoning
+    Mark the mutex poisoned. A holder that detects an unrecoverable failure in
+    the protected state calls this before releasing so later acquirers are
+    warned the data may be inconsistent.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 1.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the lock so the flag is published before the
+    next acquirer observes it.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with m, RT_MUTEX_OFF_POISONED, 1
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_clear_poison" takes m as Integer returns Integer:
+    @Reasoning
+    Clear the poison flag after a caller has repaired the protected state,
+    returning the mutex to normal service.
+    @End Reasoning
+
+    @Implementation
+    Set the poison flag to 0.
+    @End Implementation
+
+    @Performance_Hints
+    One field store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Should be called while holding the lock, after the inconsistent state has
+    actually been repaired.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+    proc memory_set_int64 from Memory with m, RT_MUTEX_OFF_POISONED, 0
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_destroy" takes m as Integer returns Integer:
+    @Reasoning
+    Release the OS lock and free the runtime object. Must not be called while
+    the lock is held.
+    @End Reasoning
+
+    @Implementation
+    Delegate to sync_core mutex_destroy (which frees the facade control block
+    and the OS lock), then deallocate the RuntimeMutex object.
+    @End Implementation
+
+    @Performance_Hints
+    One sync_core mutex_destroy plus one deallocate. Cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null object returns MUTEX_ERR_NULL. Destroying a held lock is a logic error.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MUTEX_ERR_NULL
+    End If
+
+    Let handle be proc memory_get_int64 from Memory with m, RT_MUTEX_OFF_HANDLE
+    proc mutex_destroy from Sync with handle
+    proc deallocate from Memory with m
+    Return MUTEX_OK
+End Process
