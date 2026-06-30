@@ -28,6 +28,7 @@ Dependencies:
 Import "compiler/frontend/primitives/concurrency/channel.runa" as Chan
 Import "compiler/frontend/primitives/concurrency/future_promise.runa" as FP
 Import "compiler/frontend/primitives/threading/thread_core.runa" as ThreadCore
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as CallIndirect
 Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
 Import "compiler/frontend/primitives/memory/layout.runa" as Memory
 Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
@@ -173,9 +174,11 @@ overrides can take effect without rewriting actor_thread_entry.
 @End Reasoning
 
 @Implementation
-Indirect call via the runtime's call_indirect_2 shim. Until the runtime
-closure dispatcher is linked, returns the current state unchanged - this
-preserves invariants and lets unit tests exercise the mailbox flow.
+Invokes behavior_fn(state_ptr, message_ptr) through call_indirect_2 (the
+real System V indirect-call primitive: loads the pointer into rax, marshals
+the two arguments into rdi/rsi, issues `call rax`). The behavior function
+returns the actor's next state, which becomes the new state_ptr. A null
+behavior_fn (no behavior installed) leaves the state unchanged.
 @End Implementation
 
 @Performance_Hints
@@ -190,9 +193,8 @@ Process called "actor_behavior_dispatch" takes behavior_fn as Integer, state_ptr
     If behavior_fn is equal to 0:
         Return state_ptr
     End If
-    Let _m be message_ptr
-    Note: The runtime FFI closure dispatcher overrides this symbol at link time. Until linked, the default no-op behavior returns the current state unchanged so the mailbox loop terminates cleanly.
-    Return state_ptr
+    Note: Invoke behavior_fn(state_ptr, message_ptr); it returns the next state.
+    Return proc call_indirect_2 from CallIndirect with behavior_fn, state_ptr, message_ptr
 End Process
 
 @Reasoning
@@ -218,10 +220,9 @@ Process called "actor_start" takes actor_ref as Integer returns Integer:
         Return ACTOR_ERR_INVALID
     End If
     Note: Use thread_core to spawn. Returns thread id pointer; 0 on failure.
-    Note: actor_thread_entry's address is taken via the language's
-    Note: function-pointer-of-process feature. We reference its name in a
-    Note: Let so the codegen emits an address constant.
-    Let entry_fn_addr be proc actor_thread_entry_address
+    Note: actor_thread_entry's address is taken via the $name function-pointer
+    Note: operator, which the codegen lowers to leaq actor_thread_entry(%rip).
+    Let entry_fn_addr be $actor_thread_entry
     Let tid be proc thread_create from ThreadCore with entry_fn_addr, actor_ref
     If tid is equal to 0:
         Return ACTOR_ERR_INVALID
@@ -232,27 +233,26 @@ End Process
 
 @Reasoning
 Returns the address of actor_thread_entry so that thread_create can spawn
-it. Implemented as a stub here because the bootstrap codegen exposes
-function addresses via a runtime hook rather than a syntactic operator.
+it. The $name function-pointer operator yields the real code address.
 @End Reasoning
 
 @Implementation
-The runtime's closure dispatcher resolves this at link time to the real
-address. For self-tests where threads are not spawned, returns 0; the
-caller path (actor_start) propagates the 0 as ACTOR_ERR_INVALID.
+Returns $actor_thread_entry, which the codegen lowers to
+leaq actor_thread_entry(%rip) -- the genuine entry-point address the new
+thread branches to. Kept as a named accessor so callers that prefer an
+explicit helper over the inline operator have one source of truth.
 @End Implementation
 
 @Performance_Hints
-A single memory load when linked; one indirect call when stubbed.
+A single leaq (RIP-relative address computation).
 @End Performance_Hints
 
 @Security_Scope
-Safe.
+Safe; produces the address of a known in-module function only.
 @End Security_Scope
 
 Process called "actor_thread_entry_address" returns Integer:
-    Note: Address-of-process is resolved by the runtime closure dispatcher. Until linked, return 0 so actor_start fails gracefully and the unit-test flow exercises only the mailbox queue.
-    Return 0
+    Return $actor_thread_entry
 End Process
 
 @Reasoning
