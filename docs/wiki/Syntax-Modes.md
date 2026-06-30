@@ -45,7 +45,7 @@ Process called "calculate total price" that takes quantity and unit price:
 | Subtraction | `minus` | `x minus y` |
 | Multiplication | `multiplied by` | `x multiplied by y` |
 | Division | `divided by` | `x divided by y` |
-| Modulo | `modulo` | `x modulo y` |
+| Modulo | `modulo by` | `x modulo by y` |
 | Equality | `is equal to` | `x is equal to y` |
 | Inequality | `is not equal to` | `x is not equal to y` |
 | Greater than | `is greater than` | `x is greater than y` |

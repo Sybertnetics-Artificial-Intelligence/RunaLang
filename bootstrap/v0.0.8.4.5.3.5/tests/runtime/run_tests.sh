@@ -16,10 +16,12 @@
 
 set -u
 
-BOOT=$(cd "$(dirname "$0")/../.." && pwd)
-RUNAC=${RUNAC:-$BOOT/v0.0.8.4.5.3.5/stage1/runac}
-RT_OBJ=$BOOT/v0.0.8.4.5.3.5/runtime/runtime.o
-TESTS_DIR=$BOOT/tests/runtime
+# VERSION_ROOT resolves to the v0.0.8.4.5.3.5 compiler dir (this runner now
+# lives at <version>/tests/runtime/, so ../.. is the version root).
+VERSION_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+RUNAC=${RUNAC:-$VERSION_ROOT/stage1/runac}
+RT_OBJ=$VERSION_ROOT/runtime/runtime.o
+TESTS_DIR=$VERSION_ROOT/tests/runtime
 TMPS=$(mktemp -d)
 trap 'rm -rf "$TMPS"' EXIT
 
