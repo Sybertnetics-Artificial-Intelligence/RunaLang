@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,660 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles task scheduling and task management for the Runa runtime concurrency system.
+Runtime dependency (DAG) task-scheduler API — the public data-flow scheduler
+for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process task scheduling and task management
-- Handle task execution and task result processing
-- Manage task priority and task coordination
-- Process task error handling and task feedback
+This is the runtime-facing object layer. It schedules a TASK GRAPH rather than
+a flat queue: each task may declare prerequisite tasks, and a task only becomes
+eligible to run once EVERY one of its prerequisites has completed. It is
+therefore distinct from two neighbouring facilities it composes on top of:
 
-This file is essential because of the following reasons:
-- task_scheduler enables comprehensive task scheduling and task management
-- Proper task scheduling ensures correct task execution and user experience
-- task_scheduler support enables Runa compilation for task-based workflows
+  - the thread pool (thread_pool.runa) is a flat FIFO executor with no notion
+    of ordering between the functions it runs; this scheduler decides WHICH
+    tasks are runnable and WHEN, then hands each runnable task to the pool.
+  - a single-value future carries one result from producer to consumer; this
+    scheduler coordinates a whole graph of tasks and the happens-before edges
+    between them.
 
-This file consists of the following functions/features/operation types:
-- Task scheduling and task management
-- Task execution and task result processing
-- Task priority and task coordination
-- Task error handling and task feedback
+It adds no new locking or thread mechanism of its own. It composes three
+already-complete lower layers:
+
+  - EXECUTION comes from the runtime thread pool (pool_new / pool_submit /
+    pool_shutdown). Every runnable task is submitted to the pool, which runs it
+    on one of its worker threads via the module-level scheduler_task_trampoline
+    entry point (its address is taken with the $name function-pointer operator,
+    exactly as the thread pool spawns its own workers).
+  - MUTUAL EXCLUSION over all task bookkeeping — every task's pending-prereq
+    counter and state, the task array, and the remaining-task counter — comes
+    from a single runtime RuntimeMutex (mutex.runa). One lock serialises every
+    read-modify-write of the graph state so cascades from concurrently
+    completing tasks can never race.
+  - COMPLETION COORDINATION comes from one runtime RuntimeCondVar
+    (condition_variable.runa) paired with that single mutex: scheduler_run
+    blocks on it while the remaining-task counter is above zero, and the
+    trampoline broadcasts it exactly when the counter reaches zero. Per the
+    condvar contract, the RuntimeMutex object handle is passed to condvar_wait
+    (it extracts the inner sync_core handle at offset 0), and the wait is
+    wrapped in a predicate loop so a broadcast re-checks the shared state.
+
+DATA-FLOW MODEL. Building the graph and running it are two phases:
+
+  1. BUILD (single caller): scheduler_add_task registers a task body and its
+     argument; scheduler_add_dependency records a "task depends on prereq" edge
+     by incrementing the dependent's pending-prereq count and appending the
+     dependent to the prereq's dependents list. Both must complete before
+     scheduler_run is called.
+  2. RUN: scheduler_run submits every task that starts with zero pending
+     prerequisites, then blocks until every task is done. Each time a task
+     finishes, the trampoline decrements the pending-prereq count of each of
+     its dependents; any dependent whose count reaches zero is itself submitted
+     (the cascade). When the count of not-yet-done tasks reaches zero the
+     trampoline broadcasts the completion condvar and scheduler_run returns.
+
+EXACTLY-ONCE EXECUTION. A task is submitted only on the single state
+transition WAITING -> SUBMITTED, and that transition is performed under the
+lock guarded by a check that the task is still WAITING, so no task can be
+submitted twice even if two prerequisites finish simultaneously. Each task's
+completion decrements the remaining counter exactly once, so the counter
+reaches zero precisely when every task has run once.
+
+CONTEXT OWNERSHIP. Each task owns a single TaskRunCtx {sched, task}, allocated
+when the task is added and freed at shutdown. That one context is the argument
+passed to the pool for that task's single submission — whether the initial
+submission from scheduler_run or the cascaded submission from the trampoline —
+so the run path performs no per-submission allocation and has no allocation
+failure mode that could strand a runnable task.
+
+Task layout (64 bytes):
+    offset  0:  fn         — task body function pointer
+    offset  8:  arg        — opaque argument passed to the body
+    offset 16:  pending    — count of prerequisites not yet completed
+    offset 24:  state      — 0 waiting, 1 submitted, 2 done
+    offset 32:  deps       — pointer to the dependents array (Task pointers)
+    offset 40:  dep_count  — number of dependents recorded
+    offset 48:  dep_cap    — dependents array capacity in slots
+    offset 56:  ctx        — pointer to this task's TaskRunCtx
+
+Scheduler layout (56 bytes):
+    offset  0:  pool       — the runtime thread pool that executes tasks
+    offset  8:  mutex      — RuntimeMutex guarding all task bookkeeping
+    offset 16:  tasks      — pointer to the all-tasks array (Task pointers)
+    offset 24:  task_count — number of tasks registered
+    offset 32:  task_cap   — all-tasks array capacity in slots
+    offset 40:  remaining  — count of tasks not yet completed
+    offset 48:  condvar    — RuntimeCondVar broadcast when remaining hits zero
+
+TaskRunCtx layout (16 bytes):
+    offset 0:  sched  — the owning scheduler
+    offset 8:  task   — the task this submission runs
 :End Note
 
-Note: TODO - Implement task_scheduler functionality
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "runtime/concurrency/threading/thread_pool.runa" as Pool
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: Task object layout
+Constant TASK_SIZE as Integer is 64
+Constant TASK_OFF_FN as Integer is 0
+Constant TASK_OFF_ARG as Integer is 8
+Constant TASK_OFF_PENDING as Integer is 16
+Constant TASK_OFF_STATE as Integer is 24
+Constant TASK_OFF_DEPS as Integer is 32
+Constant TASK_OFF_DEP_COUNT as Integer is 40
+Constant TASK_OFF_DEP_CAP as Integer is 48
+Constant TASK_OFF_CTX as Integer is 56
+
+Note: Task state values
+Constant TASK_STATE_WAITING as Integer is 0
+Constant TASK_STATE_SUBMITTED as Integer is 1
+Constant TASK_STATE_DONE as Integer is 2
+
+Note: Scheduler object layout
+Constant SCHED_SIZE as Integer is 56
+Constant SCHED_OFF_POOL as Integer is 0
+Constant SCHED_OFF_MUTEX as Integer is 8
+Constant SCHED_OFF_TASKS as Integer is 16
+Constant SCHED_OFF_TASK_COUNT as Integer is 24
+Constant SCHED_OFF_TASK_CAP as Integer is 32
+Constant SCHED_OFF_REMAINING as Integer is 40
+Constant SCHED_OFF_CONDVAR as Integer is 48
+
+Note: TaskRunCtx object layout
+Constant CTX_SIZE as Integer is 16
+Constant CTX_OFF_SCHED as Integer is 0
+Constant CTX_OFF_TASK as Integer is 8
+
+Note: Size of one pointer slot in the growable task and dependents arrays
+Constant PTR_SIZE as Integer is 8
+
+Note: Initial capacities in slots; each array doubles on demand when full
+Constant SCHED_INITIAL_TASK_CAP as Integer is 64
+Constant TASK_INITIAL_DEP_CAP as Integer is 4
+
+Note: Status codes returned by the runtime task-scheduler API
+Constant SCHED_OK as Integer is 0
+Constant SCHED_ERR_NULL as Integer is 0 minus 1
+Constant SCHED_ERR_ALLOC as Integer is 0 minus 2
+
+Process called "scheduler_task_trampoline" takes ctx as Integer returns Integer:
+    @Reasoning
+    The per-task entry point every worker runs. It has two jobs that must be
+    kept strictly apart: execute the task body, which may be arbitrarily long
+    and must not hold any scheduler lock so sibling tasks run in parallel; and
+    then, under the single scheduler lock, account for the task's completion and
+    propagate its effect through the graph. That propagation is the cascade —
+    the only place new tasks become runnable — so the ordering guarantee of the
+    whole scheduler lives in this function.
+    @End Reasoning
+
+    @Implementation
+    Read the owning scheduler and this task from the context, then run the body
+    with call_indirect_1(fn, arg) holding no lock. Re-acquire the scheduler
+    mutex and mark the task done. Walk its dependents: for each, decrement the
+    dependent's pending-prerequisite count; when that count reaches zero and the
+    dependent is still WAITING, transition it to SUBMITTED and hand its own
+    pre-allocated context to the pool. The pool has its own independent lock, so
+    submitting while holding the scheduler lock is safe and never inverts. The
+    two conditions (count reached zero, dependent still waiting) are expressed as
+    nested checks rather than a compound predicate. Finally decrement the
+    scheduler's remaining-task counter; if it reaches zero, broadcast the
+    completion condvar so scheduler_run can return, then release the lock.
+    @End Implementation
+
+    @Performance_Hints
+    One indirect call for the body outside any lock, then one short critical
+    section proportional to the task's dependent count. The context is reused
+    from the task, so the completion path performs no allocation. Cascaded
+    submissions each cost one pool_submit (a single enqueue plus one futex wake).
+    @End Performance_Hints
+
+    @Security_Scope
+    A null context returns immediately. The function pointer invoked is the one
+    supplied when the task was added; this layer performs the indirect call
+    faithfully and does not validate the target, matching call_indirect_1's
+    contract. The scheduler lock is always released before return.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let sched be proc memory_get_int64 from Memory with ctx, CTX_OFF_SCHED
+    Let task be proc memory_get_int64 from Memory with ctx, CTX_OFF_TASK
+    Let fn be proc memory_get_int64 from Memory with task, TASK_OFF_FN
+    Let arg be proc memory_get_int64 from Memory with task, TASK_OFF_ARG
+
+    Note: Run the task body with no lock held so other tasks proceed in parallel.
+    proc call_indirect_1 from Call with fn, arg
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with sched, SCHED_OFF_CONDVAR
+    Let pool be proc memory_get_int64 from Memory with sched, SCHED_OFF_POOL
+    Let trampoline_fn be $scheduler_task_trampoline
+
+    proc mutex_acquire from Mutex with mtx
+
+    Note: Mark this task done, then cascade to every dependent it unblocks.
+    proc memory_set_int64 from Memory with task, TASK_OFF_STATE, TASK_STATE_DONE
+
+    Let deps be proc memory_get_int64 from Memory with task, TASK_OFF_DEPS
+    Let dep_count be proc memory_get_int64 from Memory with task, TASK_OFF_DEP_COUNT
+    Let i be 0
+    While i is less than dep_count:
+        Let dep_slot be i multiplied by PTR_SIZE
+        Let dep be proc memory_get_int64 from Memory with deps, dep_slot
+        Let dep_pending be proc memory_get_int64 from Memory with dep, TASK_OFF_PENDING
+        Let dep_pending_after be dep_pending minus 1
+        proc memory_set_int64 from Memory with dep, TASK_OFF_PENDING, dep_pending_after
+        If dep_pending_after is equal to 0:
+            Let dep_state be proc memory_get_int64 from Memory with dep, TASK_OFF_STATE
+            If dep_state is equal to TASK_STATE_WAITING:
+                proc memory_set_int64 from Memory with dep, TASK_OFF_STATE, TASK_STATE_SUBMITTED
+                Let dep_ctx be proc memory_get_int64 from Memory with dep, TASK_OFF_CTX
+                proc pool_submit from Pool with pool, trampoline_fn, dep_ctx
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Account for this task's completion; wake scheduler_run when all done.
+    Let remaining be proc memory_get_int64 from Memory with sched, SCHED_OFF_REMAINING
+    Let remaining_after be remaining minus 1
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_REMAINING, remaining_after
+    If remaining_after is equal to 0:
+        proc condvar_broadcast from CondVar with cv
+    End If
+
+    proc mutex_release from Mutex with mtx
+    Return 0
+End Process
+
+Process called "scheduler_new" takes worker_count as Integer returns Integer:
+    @Reasoning
+    Construct a ready-to-use dependency scheduler. It owns exactly the resources
+    it composes: a thread pool to run tasks, one mutex to serialise graph
+    bookkeeping, one condvar to signal whole-graph completion, and a growable
+    array of the tasks it will manage. Construction acquires each resource in
+    order and only returns a scheduler once every one is in place.
+    @End Reasoning
+
+    @Implementation
+    Allocate the scheduler object, then create the pool (passing worker_count
+    straight through so the pool applies its own hardware-concurrency default for
+    non-positive values), the mutex, the condvar, and the initial task array. On
+    any failure, unwind exactly the resources already acquired — shutting down
+    the pool, destroying the mutex/condvar as applicable — and return 0.
+    Initialise the task count and remaining counter to zero and the capacity to
+    the initial size.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one pool construction (which spawns the worker threads), one
+    mutex and one condvar creation, and two allocations. Done once per graph.
+    @End Performance_Hints
+
+    @Security_Scope
+    Every allocation and creation is checked; partial failure frees what was
+    acquired and returns 0 (NULL), so callers MUST check the result before use.
+    @End Security_Scope
+
+    Let sched be proc allocate from Memory with SCHED_SIZE
+    If sched is equal to 0:
+        Return 0
+    End If
+
+    Let pool be proc pool_new from Pool with worker_count
+    If pool is equal to 0:
+        proc deallocate from Memory with sched
+        Return 0
+    End If
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc pool_shutdown from Pool with pool
+        proc deallocate from Memory with sched
+        Return 0
+    End If
+
+    Let cv be proc condvar_new from CondVar
+    If cv is equal to 0:
+        proc mutex_destroy from Mutex with mtx
+        proc pool_shutdown from Pool with pool
+        proc deallocate from Memory with sched
+        Return 0
+    End If
+
+    Let task_bytes be SCHED_INITIAL_TASK_CAP multiplied by PTR_SIZE
+    Let tasks be proc allocate from Memory with task_bytes
+    If tasks is equal to 0:
+        proc condvar_destroy from CondVar with cv
+        proc mutex_destroy from Mutex with mtx
+        proc pool_shutdown from Pool with pool
+        proc deallocate from Memory with sched
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_POOL, pool
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_MUTEX, mtx
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_TASKS, tasks
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_TASK_COUNT, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_TASK_CAP, SCHED_INITIAL_TASK_CAP
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_REMAINING, 0
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_CONDVAR, cv
+    Return sched
+End Process
+
+Process called "scheduler_add_task" takes sched as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Register one task in the graph without running it. A task begins with no
+    prerequisites and no dependents; edges are added afterwards by
+    scheduler_add_dependency. The returned pointer is the task's stable identity,
+    used as the handle to name it in dependency edges. Because the run phase must
+    never fail to submit a runnable task for lack of a context, each task's
+    single TaskRunCtx is allocated here, up front, alongside the task.
+    @End Reasoning
+
+    @Implementation
+    Allocate the task object, its initial dependents array, and its context.
+    Initialise the body pointer and argument, a zero pending-prereq count, the
+    WAITING state, an empty dependents list at initial capacity, and the context
+    pointer; populate the context with the scheduler and the task. Then, under
+    the scheduler mutex, append the task to the all-tasks array — doubling that
+    array first if it is full, copying the live entries into the larger buffer —
+    increment the task count and the remaining-task counter, and release the
+    lock. Any allocation failure frees exactly what was allocated and returns
+    the allocation error.
+    @End Implementation
+
+    @Performance_Hints
+    Three small allocations plus one array append. The append is amortised O(1):
+    the all-tasks array doubles, so total copy work is linear in tasks added.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null scheduler returns SCHED_ERR_NULL. Every allocation is checked and
+    unwound on failure, and the lock is released on every return path.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let task be proc allocate from Memory with TASK_SIZE
+    If task is equal to 0:
+        Return SCHED_ERR_ALLOC
+    End If
+
+    Let dep_bytes be TASK_INITIAL_DEP_CAP multiplied by PTR_SIZE
+    Let deps be proc allocate from Memory with dep_bytes
+    If deps is equal to 0:
+        proc deallocate from Memory with task
+        Return SCHED_ERR_ALLOC
+    End If
+
+    Let ctx be proc allocate from Memory with CTX_SIZE
+    If ctx is equal to 0:
+        proc deallocate from Memory with deps
+        proc deallocate from Memory with task
+        Return SCHED_ERR_ALLOC
+    End If
+
+    proc memory_set_int64 from Memory with task, TASK_OFF_FN, fn
+    proc memory_set_int64 from Memory with task, TASK_OFF_ARG, arg
+    proc memory_set_int64 from Memory with task, TASK_OFF_PENDING, 0
+    proc memory_set_int64 from Memory with task, TASK_OFF_STATE, TASK_STATE_WAITING
+    proc memory_set_int64 from Memory with task, TASK_OFF_DEPS, deps
+    proc memory_set_int64 from Memory with task, TASK_OFF_DEP_COUNT, 0
+    proc memory_set_int64 from Memory with task, TASK_OFF_DEP_CAP, TASK_INITIAL_DEP_CAP
+    proc memory_set_int64 from Memory with task, TASK_OFF_CTX, ctx
+
+    proc memory_set_int64 from Memory with ctx, CTX_OFF_SCHED, sched
+    proc memory_set_int64 from Memory with ctx, CTX_OFF_TASK, task
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+
+    Let count be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASK_COUNT
+    Let cap be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASK_CAP
+    If count is equal to cap:
+        Note: All-tasks array is full — grow it to double capacity.
+        Let old_arr be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASKS
+        Let new_cap be cap multiplied by 2
+        Let new_bytes be new_cap multiplied by PTR_SIZE
+        Let new_arr be proc allocate from Memory with new_bytes
+        If new_arr is equal to 0:
+            proc mutex_release from Mutex with mtx
+            proc deallocate from Memory with ctx
+            proc deallocate from Memory with deps
+            proc deallocate from Memory with task
+            Return SCHED_ERR_ALLOC
+        End If
+        Let copy_bytes be count multiplied by PTR_SIZE
+        proc memory_copy from Memory with new_arr, old_arr, copy_bytes
+        proc deallocate from Memory with old_arr
+        proc memory_set_int64 from Memory with sched, SCHED_OFF_TASKS, new_arr
+        proc memory_set_int64 from Memory with sched, SCHED_OFF_TASK_CAP, new_cap
+    End If
+
+    Let arr be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASKS
+    Let slot_off be count multiplied by PTR_SIZE
+    proc memory_set_int64 from Memory with arr, slot_off, task
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_TASK_COUNT, count plus 1
+
+    Let remaining be proc memory_get_int64 from Memory with sched, SCHED_OFF_REMAINING
+    proc memory_set_int64 from Memory with sched, SCHED_OFF_REMAINING, remaining plus 1
+
+    proc mutex_release from Mutex with mtx
+    Return task
+End Process
+
+Process called "scheduler_add_dependency" takes sched as Integer, task as Integer, prereq as Integer returns Integer:
+    @Reasoning
+    Record one happens-before edge: task must not run until prereq has completed.
+    An edge has two effects that must both be published atomically — the
+    dependent gains one more prerequisite it is waiting on, and the prerequisite
+    gains one more dependent to notify when it finishes — so the whole update is
+    performed under the scheduler lock. Edges must be added during the build
+    phase, before scheduler_run submits anything.
+    @End Reasoning
+
+    @Implementation
+    Under the scheduler mutex, increment the dependent's pending-prerequisite
+    count, then append the dependent to the prerequisite's dependents array,
+    doubling that array first if it is full and copying the live entries across.
+    If the grow allocation fails, roll the pending increment back so the edge is
+    recorded all-or-nothing, release the lock, and return the allocation error.
+    @End Implementation
+
+    @Performance_Hints
+    One counter increment and one array append under the lock. The dependents
+    array doubles on demand, so appends are amortised O(1) in the number of
+    dependents.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null scheduler, task, or prerequisite returns SCHED_ERR_NULL. On the grow
+    failure path the pending count is restored so no half-recorded edge is left
+    behind, and the lock is released on every return path.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+    If task is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+    If prereq is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+
+    Let pending be proc memory_get_int64 from Memory with task, TASK_OFF_PENDING
+    proc memory_set_int64 from Memory with task, TASK_OFF_PENDING, pending plus 1
+
+    Let dcount be proc memory_get_int64 from Memory with prereq, TASK_OFF_DEP_COUNT
+    Let dcap be proc memory_get_int64 from Memory with prereq, TASK_OFF_DEP_CAP
+    If dcount is equal to dcap:
+        Note: Dependents array is full — grow it to double capacity.
+        Let old_deps be proc memory_get_int64 from Memory with prereq, TASK_OFF_DEPS
+        Let new_dcap be dcap multiplied by 2
+        Let new_dbytes be new_dcap multiplied by PTR_SIZE
+        Let new_deps be proc allocate from Memory with new_dbytes
+        If new_deps is equal to 0:
+            Note: Roll back the pending increment so the edge is all-or-nothing.
+            proc memory_set_int64 from Memory with task, TASK_OFF_PENDING, pending
+            proc mutex_release from Mutex with mtx
+            Return SCHED_ERR_ALLOC
+        End If
+        Let dcopy_bytes be dcount multiplied by PTR_SIZE
+        proc memory_copy from Memory with new_deps, old_deps, dcopy_bytes
+        proc deallocate from Memory with old_deps
+        proc memory_set_int64 from Memory with prereq, TASK_OFF_DEPS, new_deps
+        proc memory_set_int64 from Memory with prereq, TASK_OFF_DEP_CAP, new_dcap
+    End If
+
+    Let darr be proc memory_get_int64 from Memory with prereq, TASK_OFF_DEPS
+    Let dslot be dcount multiplied by PTR_SIZE
+    proc memory_set_int64 from Memory with darr, dslot, task
+    proc memory_set_int64 from Memory with prereq, TASK_OFF_DEP_COUNT, dcount plus 1
+
+    proc mutex_release from Mutex with mtx
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_run" takes sched as Integer returns Integer:
+    @Reasoning
+    Drive the built graph to completion. The initial wavefront is every task
+    that has no prerequisites; once those are running, completions cascade
+    through the trampoline and make later tasks runnable, so scheduler_run's own
+    job after seeding the wavefront is simply to block until the whole graph has
+    drained.
+    @End Reasoning
+
+    @Implementation
+    Acquire the scheduler mutex once. Scan the all-tasks array and submit every
+    task whose pending-prerequisite count is zero and whose state is still
+    WAITING, transitioning each to SUBMITTED and handing its pre-allocated
+    context to the pool; the zero-count and still-waiting conditions are checked
+    as nested Ifs, not a compound predicate. Holding the lock across both the
+    submissions and the first read of the remaining counter closes the
+    lost-wakeup window: no worker can decrement remaining or broadcast until
+    condvar_wait releases the lock. Then wait in a predicate loop — while
+    remaining is above zero, condvar_wait on the completion condvar (passing the
+    RuntimeMutex object, which it atomically releases and re-acquires) and
+    re-read remaining after each wake. Release the lock once remaining is zero.
+    @End Implementation
+
+    @Performance_Hints
+    One linear scan of the task array to seed the wavefront, then the caller
+    parks on the OS futex via condvar_wait with no busy-waiting until the graph
+    completes. Submitting under the scheduler lock is safe because the pool has
+    its own independent lock.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null scheduler returns SCHED_ERR_NULL. On return the lock is released and
+    every task in the graph has run to completion exactly once.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with sched, SCHED_OFF_CONDVAR
+    Let pool be proc memory_get_int64 from Memory with sched, SCHED_OFF_POOL
+    Let trampoline_fn be $scheduler_task_trampoline
+
+    proc mutex_acquire from Mutex with mtx
+
+    Note: Seed the wavefront: submit every task that starts with no prerequisites.
+    Let count be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASK_COUNT
+    Let arr be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASKS
+    Let i be 0
+    While i is less than count:
+        Let slot_off be i multiplied by PTR_SIZE
+        Let cur be proc memory_get_int64 from Memory with arr, slot_off
+        Let pending be proc memory_get_int64 from Memory with cur, TASK_OFF_PENDING
+        If pending is equal to 0:
+            Let cur_state be proc memory_get_int64 from Memory with cur, TASK_OFF_STATE
+            If cur_state is equal to TASK_STATE_WAITING:
+                proc memory_set_int64 from Memory with cur, TASK_OFF_STATE, TASK_STATE_SUBMITTED
+                Let cur_ctx be proc memory_get_int64 from Memory with cur, TASK_OFF_CTX
+                proc pool_submit from Pool with pool, trampoline_fn, cur_ctx
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Block until every task has completed and remaining has reached zero.
+    Let remaining be proc memory_get_int64 from Memory with sched, SCHED_OFF_REMAINING
+    While remaining is greater than 0:
+        proc condvar_wait from CondVar with cv, mtx
+        Set remaining to proc memory_get_int64 from Memory with sched, SCHED_OFF_REMAINING
+    End While
+
+    proc mutex_release from Mutex with mtx
+    Return SCHED_OK
+End Process
+
+Process called "scheduler_task_count" takes sched as Integer returns Integer:
+    @Reasoning
+    Report how many tasks are registered in the graph, for diagnostics and for
+    callers that size their own bookkeeping to the graph. Read under the lock so
+    the count is a coherent snapshot rather than a torn read against a concurrent
+    add.
+    @End Reasoning
+
+    @Implementation
+    Acquire the scheduler mutex, read the task-count field, release, and return
+    it.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex acquire/release and a single field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null scheduler returns SCHED_ERR_NULL. Advisory: the count may change the
+    instant the lock is released if tasks are still being added.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    proc mutex_acquire from Mutex with mtx
+    Let count be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASK_COUNT
+    proc mutex_release from Mutex with mtx
+    Return count
+End Process
+
+Process called "scheduler_shutdown" takes sched as Integer returns Integer:
+    @Reasoning
+    Stop and destroy the scheduler, releasing every resource it owns. The pool
+    is shut down first so that once teardown of the graph state begins, no worker
+    thread is left running the trampoline against tasks that are about to be
+    freed.
+    @End Reasoning
+
+    @Implementation
+    Shut the pool down (which drains and joins every worker). With no thread left
+    touching the graph, free each task's dependents array, its context, and the
+    task object itself, then free the all-tasks array, destroy the condvar and
+    the mutex, and deallocate the scheduler object.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one pool shutdown (joining the workers), one linear walk freeing
+    three allocations per task, one condvar destroy, one mutex destroy, and two
+    deallocations. Blocks until the pool has fully drained.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null scheduler returns SCHED_ERR_NULL. After this call the scheduler
+    pointer is invalid and MUST NOT be reused. Calling it while scheduler_run is
+    still blocked on the same scheduler is a logic error.
+    @End Security_Scope
+
+    If sched is equal to 0:
+        Return SCHED_ERR_NULL
+    End If
+
+    Let pool be proc memory_get_int64 from Memory with sched, SCHED_OFF_POOL
+    proc pool_shutdown from Pool with pool
+
+    Let arr be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASKS
+    Let count be proc memory_get_int64 from Memory with sched, SCHED_OFF_TASK_COUNT
+    Let i be 0
+    While i is less than count:
+        Let slot_off be i multiplied by PTR_SIZE
+        Let cur be proc memory_get_int64 from Memory with arr, slot_off
+        If cur is not equal to 0:
+            Let deps be proc memory_get_int64 from Memory with cur, TASK_OFF_DEPS
+            If deps is not equal to 0:
+                proc deallocate from Memory with deps
+            End If
+            Let ctx be proc memory_get_int64 from Memory with cur, TASK_OFF_CTX
+            If ctx is not equal to 0:
+                proc deallocate from Memory with ctx
+            End If
+            proc deallocate from Memory with cur
+        End If
+        Set i to i plus 1
+    End While
+
+    proc deallocate from Memory with arr
+
+    Let cv be proc memory_get_int64 from Memory with sched, SCHED_OFF_CONDVAR
+    proc condvar_destroy from CondVar with cv
+    Let mtx be proc memory_get_int64 from Memory with sched, SCHED_OFF_MUTEX
+    proc mutex_destroy from Mutex with mtx
+    proc deallocate from Memory with sched
+    Return SCHED_OK
+End Process

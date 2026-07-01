@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,463 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles future execution and future management for the Runa runtime concurrency system.
+Future/Promise + thread-pool-backed executor — the asynchronous-result layer
+for the Runa runtime concurrency system.
 
-This file performs the following tasks:
-- Process future execution and future management
-- Handle future completion and future result processing
-- Manage future scheduling and future coordination
-- Process future error handling and future feedback
+This module provides two cooperating abstractions built on the completed
+synchronization and threading primitives:
 
-This file is essential because of the following reasons:
-- future_executor enables comprehensive future execution and future management
-- Proper future handling ensures correct asynchronous execution and user experience
-- future_executor support enables Runa compilation for future-based workflows
+  - FUTURE / PROMISE: a one-shot, thread-safe result cell. A Future is created
+    empty (pending) and later fulfilled exactly once by promise_set. Any number
+    of consumers may block in future_get until the value is published, then
+    every one of them observes the same value. The pending/ready transition is
+    published under the Future's own mutex and announced with a condition-
+    variable broadcast, so a waiter parked in future_get wakes as soon as the
+    producer commits the value. All waits sit inside a While predicate loop so a
+    spurious wake simply re-checks the ready flag and parks again.
 
-This file consists of the following functions/features/operation types:
-- Future execution and future management
-- Future completion and future result processing
-- Future scheduling and future coordination
-- Future error handling and future feedback
+  - EXECUTOR: a facade over the runtime thread pool that turns "run this
+    function asynchronously" into "here is a Future for its return value". Each
+    submission allocates a TaskCtx capturing the target function pointer, its
+    argument, and the Future to fulfill, then hands a module-level trampoline to
+    the pool. When a worker runs the trampoline it invokes the captured function
+    through call_indirect_1, fulfills the Future with the callee's actual return
+    value, and frees the TaskCtx. The Executor owns the pool; it does NOT own the
+    Futures it hands back — the caller that received a Future from
+    executor_submit owns it and must future_destroy it once the value is read.
+
+Future layout (32 bytes):
+    offset 0:  mutex_handle    — RuntimeMutex object guarding state/value
+    offset 8:  condvar_handle  — RuntimeCondVar paired with mutex_handle
+    offset 16: state           — 0 pending, 1 ready
+    offset 24: value           — the fulfilled result (valid once state == 1)
+
+TaskCtx layout (24 bytes):
+    offset 0:  fn      — $name function pointer to invoke
+    offset 8:  arg     — single Integer argument passed to fn
+    offset 16: future  — Future to fulfill with fn's return value
+
+Executor layout (8 bytes):
+    offset 0:  pool    — thread pool backing every submission
 :End Note
 
-Note: TODO - Implement future_executor functionality
+Import "runtime/concurrency/synchronization/mutex.runa" as Mutex
+Import "runtime/concurrency/synchronization/condition_variable.runa" as CondVar
+Import "runtime/concurrency/threading/thread_pool.runa" as Pool
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Note: Future object layout
+Constant FUT_SIZE as Integer is 32
+Constant FUT_OFF_MUTEX as Integer is 0
+Constant FUT_OFF_CONDVAR as Integer is 8
+Constant FUT_OFF_STATE as Integer is 16
+Constant FUT_OFF_VALUE as Integer is 24
+
+Note: Future state values
+Constant FUT_STATE_PENDING as Integer is 0
+Constant FUT_STATE_READY as Integer is 1
+
+Note: TaskCtx object layout
+Constant TASKCTX_SIZE as Integer is 24
+Constant TASKCTX_OFF_FN as Integer is 0
+Constant TASKCTX_OFF_ARG as Integer is 8
+Constant TASKCTX_OFF_FUTURE as Integer is 16
+
+Note: Executor object layout
+Constant EXEC_SIZE as Integer is 8
+Constant EXEC_OFF_POOL as Integer is 0
+
+Note: Status codes returned by the Future/Promise API
+Constant FUT_OK as Integer is 0
+Constant FUT_ERR_NULL as Integer is 0 minus 1
+Constant FUT_ERR_ALLOC as Integer is 0 minus 2
+
+Note: Status codes returned by the Executor API
+Constant EXEC_OK as Integer is 0
+Constant EXEC_ERR_NULL as Integer is 0 minus 1
+Constant EXEC_ERR_ALLOC as Integer is 0 minus 2
+
+Process called "future_new" returns Integer:
+    @Reasoning
+    Create an empty, pending Future. Its mutex and condition variable are the
+    runtime synchronization objects that make the pending/ready transition
+    thread-safe and let consumers block without busy-waiting.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 32-byte Future, create its RuntimeMutex and RuntimeCondVar,
+    and initialize the state to pending with a zero value. On any allocation or
+    creation failure, unwind exactly what was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one small allocation plus one mutex and one condvar creation.
+    Done once per asynchronous result.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use. No field is
+    published until the whole object is initialized.
+    @End Security_Scope
+
+    Let f be proc allocate from Memory with FUT_SIZE
+    If f is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc mutex_new from Mutex
+    If mtx is equal to 0:
+        proc deallocate from Memory with f
+        Return 0
+    End If
+
+    Let cv be proc condvar_new from CondVar
+    If cv is equal to 0:
+        proc mutex_destroy from Mutex with mtx
+        proc deallocate from Memory with f
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with f, FUT_OFF_MUTEX, mtx
+    proc memory_set_int64 from Memory with f, FUT_OFF_CONDVAR, cv
+    proc memory_set_int64 from Memory with f, FUT_OFF_STATE, FUT_STATE_PENDING
+    proc memory_set_int64 from Memory with f, FUT_OFF_VALUE, 0
+    Return f
+End Process
+
+Process called "promise_set" takes future as Integer, val as Integer returns Integer:
+    @Reasoning
+    Fulfill the Future exactly once, publishing the result and releasing every
+    consumer parked in future_get. This is the producer side of the one-shot
+    contract.
+    @End Reasoning
+
+    @Implementation
+    Under the Future's mutex, store the value, flip the state to ready, and
+    broadcast the condition variable so every waiter re-evaluates the ready
+    predicate and proceeds. The store happens under the lock so a consumer that
+    observes state == ready is guaranteed to read the committed value. Setting an
+    already-ready Future re-publishes the same transition harmlessly and still
+    returns FUT_OK, so the entry point is idempotent-safe.
+    @End Implementation
+
+    @Performance_Hints
+    One mutex acquire/release bracketing two field stores and a single condvar
+    broadcast (one futex wake when waiters are present, a no-op otherwise).
+    @End Performance_Hints
+
+    @Security_Scope
+    Null Future returns FUT_ERR_NULL without touching memory. The value is
+    published under the lock, so there is no torn read on the consumer side.
+    @End Security_Scope
+
+    If future is equal to 0:
+        Return FUT_ERR_NULL
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with future, FUT_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with future, FUT_OFF_CONDVAR
+
+    proc mutex_acquire from Mutex with mtx
+    proc memory_set_int64 from Memory with future, FUT_OFF_VALUE, val
+    proc memory_set_int64 from Memory with future, FUT_OFF_STATE, FUT_STATE_READY
+    proc condvar_broadcast from CondVar with cv
+    proc mutex_release from Mutex with mtx
+    Return FUT_OK
+End Process
+
+Process called "future_get" takes future as Integer returns Integer:
+    @Reasoning
+    Block until the Future is fulfilled, then return its value. This is the
+    consumer side of the one-shot contract; many consumers may call it and each
+    observes the same published value.
+    @End Reasoning
+
+    @Implementation
+    Under the Future's mutex, wait while the state is still pending. The wait
+    sits in a While predicate loop so a spurious wake re-checks the ready flag
+    and parks again — the loop only exits once the producer has committed the
+    value. condvar_wait atomically releases and re-acquires the mutex, so the
+    ready flag and value are read under the lock before it is released.
+    @End Implementation
+
+    @Performance_Hints
+    Fast path (already ready) is a single lock/unlock with no sleep. Otherwise
+    the thread parks on the condition variable until promise_set broadcasts —
+    no busy-waiting.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null Future returns 0 (no value exists to return). On the fulfilled path the
+    value is read under the lock, guaranteeing it matches the committed result.
+    @End Security_Scope
+
+    If future is equal to 0:
+        Return 0
+    End If
+
+    Let mtx be proc memory_get_int64 from Memory with future, FUT_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Memory with future, FUT_OFF_CONDVAR
+
+    proc mutex_acquire from Mutex with mtx
+    Let state be proc memory_get_int64 from Memory with future, FUT_OFF_STATE
+    While state is equal to FUT_STATE_PENDING:
+        proc condvar_wait from CondVar with cv, mtx
+        Set state to proc memory_get_int64 from Memory with future, FUT_OFF_STATE
+    End While
+    Let val be proc memory_get_int64 from Memory with future, FUT_OFF_VALUE
+    proc mutex_release from Mutex with mtx
+    Return val
+End Process
+
+Process called "future_is_ready" takes future as Integer returns Integer:
+    @Reasoning
+    Report whether the Future has been fulfilled, so a caller can poll instead
+    of blocking when it must make forward progress on other work.
+    @End Reasoning
+
+    @Implementation
+    Return the state field directly: 1 when ready, 0 when still pending. The
+    field is a single aligned word published under the producer's lock, so a
+    reader sees either the pre- or post-fulfillment value, never a torn one.
+    @End Implementation
+
+    @Performance_Hints
+    One field load; never blocks.
+    @End Performance_Hints
+
+    @Security_Scope
+    Advisory only; the Future may become ready immediately after the call
+    returns. Null Future reports 0 (not ready).
+    @End Security_Scope
+
+    If future is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with future, FUT_OFF_STATE
+End Process
+
+Process called "future_destroy" takes future as Integer returns Integer:
+    @Reasoning
+    Release the Future's synchronization objects and free it. Must be called by
+    the owner once the value has been read and no consumer is still blocked in
+    future_get.
+    @End Reasoning
+
+    @Implementation
+    Destroy the condition variable and the mutex (each frees its own facade
+    control block and OS primitive), then deallocate the Future object itself.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one condvar destroy, one mutex destroy, one deallocate.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null Future returns FUT_ERR_NULL. Destroying a Future with a consumer still
+    parked in future_get is a lifetime error the caller must avoid.
+    @End Security_Scope
+
+    If future is equal to 0:
+        Return FUT_ERR_NULL
+    End If
+
+    Let cv be proc memory_get_int64 from Memory with future, FUT_OFF_CONDVAR
+    Let mtx be proc memory_get_int64 from Memory with future, FUT_OFF_MUTEX
+    proc condvar_destroy from CondVar with cv
+    proc mutex_destroy from Mutex with mtx
+    proc deallocate from Memory with future
+    Return FUT_OK
+End Process
+
+Process called "executor_new" takes worker_count as Integer returns Integer:
+    @Reasoning
+    Construct an executor over a fresh thread pool. The pool provides the worker
+    threads that run submitted tasks; the executor is the thin object that owns
+    it and turns submissions into Futures.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 8-byte executor, create the backing pool with the requested
+    worker count, and store the pool handle. On any allocation or creation
+    failure, unwind exactly what was acquired and return 0.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one small allocation plus one pool creation (which spawns the
+    worker threads). Done once per executor.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let e be proc allocate from Memory with EXEC_SIZE
+    If e is equal to 0:
+        Return 0
+    End If
+
+    Let p be proc pool_new from Pool with worker_count
+    If p is equal to 0:
+        proc deallocate from Memory with e
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with e, EXEC_OFF_POOL, p
+    Return e
+End Process
+
+Process called "executor_submit" takes exec as Integer, fn as Integer, arg as Integer returns Integer:
+    @Reasoning
+    Run fn(arg) asynchronously and hand the caller a Future for its return
+    value. The caller blocks on that Future with future_get whenever it needs
+    the result, and owns the Future's lifetime thereafter.
+    @End Reasoning
+
+    @Implementation
+    Create the Future, allocate a TaskCtx capturing (fn, arg, future), and
+    submit the module-level executor_trampoline to the pool with the TaskCtx as
+    its argument. On any failure before the task is queued, unwind what was
+    acquired and return 0. On success return the Future; the trampoline will
+    fulfill it on a worker thread.
+    @End Implementation
+
+    @Performance_Hints
+    One Future creation, one small allocation, and one pool_submit (an enqueue
+    plus a single condvar signal to wake a worker). No blocking on the caller.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null executor returns 0. If the Future or TaskCtx cannot be allocated, or
+    the submission fails, every resource acquired here is released before
+    returning 0, so no Future or context is leaked on the failure paths.
+    @End Security_Scope
+
+    If exec is equal to 0:
+        Return 0
+    End If
+
+    Let fut be proc future_new
+    If fut is equal to 0:
+        Return 0
+    End If
+
+    Let ctx be proc allocate from Memory with TASKCTX_SIZE
+    If ctx is equal to 0:
+        proc future_destroy with fut
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with ctx, TASKCTX_OFF_FN, fn
+    proc memory_set_int64 from Memory with ctx, TASKCTX_OFF_ARG, arg
+    proc memory_set_int64 from Memory with ctx, TASKCTX_OFF_FUTURE, fut
+
+    Let p be proc memory_get_int64 from Memory with exec, EXEC_OFF_POOL
+    Let trampoline be $executor_trampoline
+    Let rc be proc pool_submit from Pool with p, trampoline, ctx
+    If rc is not equal to 0:
+        proc deallocate from Memory with ctx
+        proc future_destroy with fut
+        Return 0
+    End If
+
+    Return fut
+End Process
+
+Process called "executor_trampoline" takes ctx as Integer returns Integer:
+    @Reasoning
+    The worker-side entry point for every submission. Its address is taken with
+    $executor_trampoline in executor_submit and handed to the pool, so it must
+    be a module-level Process with the pool's task signature (one Integer arg).
+    @End Reasoning
+
+    @Implementation
+    Read the captured function pointer, argument, and Future from the TaskCtx.
+    Invoke the target through call_indirect_1, which returns the callee's actual
+    return value, then fulfill the Future with that value via promise_set. Free
+    the TaskCtx last — the Future outlives it and is owned by the submitter.
+    @End Implementation
+
+    @Performance_Hints
+    Three field loads, one indirect call, one promise_set, one deallocate.
+    Runs on a pool worker with no lock held during the user call.
+    @End Performance_Hints
+
+    @Security_Scope
+    The pool never hands this trampoline a null context, so ctx is a valid
+    TaskCtx built by executor_submit. call_indirect_1 does not validate the
+    target, matching the pool's own task contract.
+    @End Security_Scope
+
+    Let fn be proc memory_get_int64 from Memory with ctx, TASKCTX_OFF_FN
+    Let arg be proc memory_get_int64 from Memory with ctx, TASKCTX_OFF_ARG
+    Let fut be proc memory_get_int64 from Memory with ctx, TASKCTX_OFF_FUTURE
+
+    Let res be proc call_indirect_1 from Call with fn, arg
+    proc promise_set with fut, res
+    proc deallocate from Memory with ctx
+    Return 0
+End Process
+
+Process called "executor_wait_idle" takes exec as Integer returns Integer:
+    @Reasoning
+    Block until every submitted task has completed, so a caller can join the
+    asynchronous work as a barrier before proceeding.
+    @End Reasoning
+
+    @Implementation
+    Delegate to the pool's pool_wait_idle, which blocks until the pending count
+    reaches zero.
+    @End Implementation
+
+    @Performance_Hints
+    One pool_wait_idle: parks on the pool's drained condition variable until the
+    last in-flight task finishes; no busy-waiting.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null executor returns EXEC_ERR_NULL without touching the pool.
+    @End Security_Scope
+
+    If exec is equal to 0:
+        Return EXEC_ERR_NULL
+    End If
+
+    Let p be proc memory_get_int64 from Memory with exec, EXEC_OFF_POOL
+    proc pool_wait_idle from Pool with p
+    Return EXEC_OK
+End Process
+
+Process called "executor_shutdown" takes exec as Integer returns Integer:
+    @Reasoning
+    Stop the pool, join its worker threads, and free the executor object. Any
+    Futures already handed to callers are NOT touched — the callers own those
+    and must future_destroy them.
+    @End Reasoning
+
+    @Implementation
+    Delegate to the pool's pool_shutdown (which signals the workers to drain and
+    exit, joins them, and frees the pool's owned resources), then deallocate the
+    executor object itself.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path: one pool_shutdown (joins N worker threads) plus one deallocate.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null executor returns EXEC_ERR_NULL. Outstanding Futures are deliberately
+    left alone so a consumer still reading a result is not freed out from under
+    it; their lifetime is the caller's responsibility.
+    @End Security_Scope
+
+    If exec is equal to 0:
+        Return EXEC_ERR_NULL
+    End If
+
+    Let p be proc memory_get_int64 from Memory with exec, EXEC_OFF_POOL
+    proc pool_shutdown from Pool with p
+    proc deallocate from Memory with exec
+    Return EXEC_OK
+End Process
