@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,599 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles timer wheel implementation and timer management for the Runa runtime concurrency system.
+Runtime timer wheel — the monotonic timer facility of the Runa async runtime.
 
-This file performs the following tasks:
-- Process timer wheel implementation and timer management
-- Handle timer scheduling and timer execution
-- Manage timer expiration and timer coordination
-- Process timer error handling and timer feedback
+This module is the time-driven scheduling counterpart to the event loop's
+readiness-driven scheduling. Where the event loop wakes callbacks when a file
+descriptor becomes ready, this facility wakes callbacks when a point in time
+is reached. It owns no file descriptors and no threads; it is a pure registry
+of pending timers keyed on an absolute monotonic deadline, plus the small
+amount of syscall glue needed to read the clock and to sleep until the next
+deadline.
 
-This file is essential because of the following reasons:
-- timer_wheel enables comprehensive timer wheel implementation and timer management
-- Proper timer handling ensures correct timer execution and user experience
-- timer_wheel support enables Runa compilation for timer-based workflows
+Mechanism: time comes from the OS CLOCK_MONOTONIC clock, reached through the
+completed platform syscall facade (clock_gettime / nanosleep). CLOCK_MONOTONIC
+is used deliberately — it never runs backward and is unaffected by wall-clock
+adjustments (NTP steps, settimeofday, daylight changes), so a deadline
+computed as now()+delay always fires after exactly that much elapsed time.
+All time inside this module is a single Integer count of nanoseconds, folded
+from the kernel's two-field timespec so that deadline arithmetic is plain
+integer add/compare with no field juggling on the hot path.
 
-This file consists of the following functions/features/operation types:
-- Timer wheel implementation and timer management
-- Timer scheduling and timer execution
-- Timer expiration and timer coordination
-- Timer error handling and timer feedback
+A Timer entry is a permanent-until-fired record of "call this callback when
+this deadline is reached". Periodic timers (interval greater than 0) re-arm
+themselves after firing; one-shot timers (interval 0) are dropped after their
+single firing. The wheel holds a growable array of Timer pointers; the Timer
+pointer itself is the caller-visible timer id, so cancel and dispatch never
+search on an opaque handle.
+
+RuntimeTimerWheel layout (24 bytes):
+    offset 0:   timers    — growable array of Timer pointers (8 bytes each)
+    offset 8:   capacity  — number of pointer slots in the timers array
+    offset 16:  count     — number of live Timer entries (also active count)
+
+Timer layout (40 bytes):
+    offset 0:   deadline_ns — absolute CLOCK_MONOTONIC nanosecond fire time
+    offset 8:   interval_ns — re-arm period in ns; 0 marks a one-shot timer
+    offset 16:  callback    — the $name function pointer dispatched on expiry
+    offset 24:  user_arg    — opaque argument passed to callback
+    offset 32:  active      — 1 armed, 0 retired (a defensive liveness flag)
+
+timespec ABI (16 bytes — kernel contract for clock_gettime / nanosleep):
+    offset 0:   tv_sec  — whole seconds  (8 bytes)
+    offset 8:   tv_nsec — nanoseconds within the second (8 bytes)
+    The monotonic nanosecond value this module works in is folded as
+    tv_sec * 1000000000 + tv_nsec, and unfolded for nanosleep as
+    tv_sec = ns / 1000000000, tv_nsec = ns modulo 1000000000.
 :End Note
 
-Note: TODO - Implement timer_wheel functionality
+Import "compiler/frontend/primitives/platform/linux_x86_64/syscall.runa" as Sys
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: RuntimeTimerWheel object layout
+Constant WHEEL_SIZE as Integer is 24
+Constant WHEEL_OFF_TIMERS as Integer is 0
+Constant WHEEL_OFF_CAPACITY as Integer is 8
+Constant WHEEL_OFF_COUNT as Integer is 16
+
+Note: Timer object layout
+Constant TIMER_STRUCT_SIZE as Integer is 40
+Constant TIMER_OFF_DEADLINE as Integer is 0
+Constant TIMER_OFF_INTERVAL as Integer is 8
+Constant TIMER_OFF_CALLBACK as Integer is 16
+Constant TIMER_OFF_USERARG as Integer is 24
+Constant TIMER_OFF_ACTIVE as Integer is 32
+
+Note: Size of one pointer slot in the timers array
+Constant PTR_SIZE as Integer is 8
+
+Note: Initial number of Timer slots in a fresh wheel
+Constant WHEEL_DEFAULT_CAPACITY as Integer is 8
+
+Note: timespec ABI — 16 bytes, two 8-byte fields
+Constant TIMESPEC_SIZE as Integer is 16
+Constant TS_OFF_SEC as Integer is 0
+Constant TS_OFF_NSEC as Integer is 8
+
+Note: Nanoseconds per second — the fold/unfold factor for timespec
+Constant NS_PER_SEC as Integer is 1000000000
+
+Note: CLOCK_MONOTONIC — never runs backward, immune to wall-clock adjustment
+Constant CLOCK_MONOTONIC as Integer is 1
+
+Note: NULL remaining-time pointer for nanosleep (no interrupt bookkeeping)
+Constant TIMER_NULL_REM as Integer is 0
+
+Note: Status codes returned by the runtime timer wheel API
+Constant TIMER_OK as Integer is 0
+Constant TIMER_ERR_NULL as Integer is 0 minus 1
+Constant TIMER_ERR_ALLOC as Integer is 0 minus 2
+
+Note: Sentinel returned by timer_next_deadline when no timer is armed
+Constant TIMER_NO_DEADLINE as Integer is 0 minus 1
+
+Process called "timer_wheel_new" returns Integer:
+    @Reasoning
+    Construct an empty timer registry. The wheel is deliberately minimal: a
+    growable array of Timer pointers plus its capacity and live count. No clock
+    is read and no timer is armed at construction — a fresh wheel simply has
+    somewhere to put timers.
+    @End Reasoning
+
+    @Implementation
+    Allocate the 24-byte wheel object, then allocate the initial Timer pointer
+    array (default capacity slots of 8 bytes each). If either allocation fails,
+    unwind anything already acquired and return 0. Initialize count to 0.
+    @End Implementation
+
+    @Performance_Hints
+    Two small allocations on the cold construction path. The pointer array is
+    grown by doubling so total copying stays linear across the wheel's lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure returns 0 (NULL); callers MUST check before use.
+    @End Security_Scope
+
+    Let wheel be proc allocate from Memory with WHEEL_SIZE
+    If wheel is equal to 0:
+        Return 0
+    End If
+
+    Let cap be WHEEL_DEFAULT_CAPACITY
+    Let array_bytes be cap multiplied by PTR_SIZE
+    Let timers be proc allocate from Memory with array_bytes
+    If timers is equal to 0:
+        proc deallocate from Memory with wheel
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_TIMERS, timers
+    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_CAPACITY, cap
+    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_COUNT, 0
+    Return wheel
+End Process
+
+Process called "timer_now" returns Integer:
+    @Reasoning
+    Return the current monotonic time as a single nanosecond count. This is the
+    time base every deadline is computed against; using CLOCK_MONOTONIC means
+    the value only ever increases and is unaffected by wall-clock changes, so
+    interval accounting cannot be corrupted by an NTP step or a manual clock
+    set.
+    @End Reasoning
+
+    @Implementation
+    Allocate a scratch 16-byte timespec, fill it with clock_gettime on
+    CLOCK_MONOTONIC, read tv_sec at offset 0 and tv_nsec at offset 8, and fold
+    them to nanoseconds as tv_sec * 1000000000 + tv_nsec. Free the scratch
+    timespec before returning. A negative syscall result means the clock read
+    failed; in that case the folded value is still computed from whatever the
+    kernel left in the buffer, but a well-formed CLOCK_MONOTONIC read never
+    fails on a supported kernel.
+    @End Implementation
+
+    @Performance_Hints
+    One clock_gettime syscall plus one scratch allocation. clock_gettime is a
+    vDSO-accelerated call on Linux, so it is inexpensive relative to a general
+    syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    The scratch buffer is private to this call and freed before return, so no
+    time value leaks through shared state.
+    @End Security_Scope
+
+    Let ts be proc allocate from Memory with TIMESPEC_SIZE
+    If ts is equal to 0:
+        Return 0
+    End If
+
+    proc linux_x86_64_syscall_clock_gettime from Sys with CLOCK_MONOTONIC, ts
+    Let secs be proc memory_get_int64 from Memory with ts, TS_OFF_SEC
+    Let nsec be proc memory_get_int64 from Memory with ts, TS_OFF_NSEC
+    proc deallocate from Memory with ts
+
+    Let secs_ns be secs multiplied by NS_PER_SEC
+    Let total_ns be secs_ns plus nsec
+    Return total_ns
+End Process
+
+Process called "timer_add" takes wheel as Integer, delay_ns as Integer, interval_ns as Integer, callback as Integer, user_arg as Integer returns Integer:
+    @Reasoning
+    Arm a new timer. The deadline is captured as an absolute monotonic instant
+    (now plus the requested delay) rather than kept as a relative delay, so a
+    single now() read at advance time can decide every timer's expiry with a
+    plain compare. The returned Timer pointer is the caller-visible id used to
+    cancel the timer later, so no separate handle table is needed.
+    @End Reasoning
+
+    @Implementation
+    Read now() and compute deadline = now + delay_ns. Allocate a 40-byte Timer,
+    store deadline, interval, callback, user_arg, and active = 1. Append the
+    Timer pointer to the wheel's array, doubling the array first if it is full:
+    the new backing store is allocated, existing pointers are copied with
+    memory_copy, the old store is freed, and capacity is updated. If the grow
+    allocation fails, the just-allocated Timer is freed and 0 is returned so no
+    partial state is left. On success the Timer pointer (the id) is returned.
+    @End Implementation
+
+    @Performance_Hints
+    One clock read, one Timer allocation, and an amortized-O(1) array append.
+    Doubling growth keeps total copying linear across the wheel's lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns 0. A failed allocation returns 0 and leaks nothing. The
+    callback pointer is invoked verbatim later via call_indirect_1, matching
+    that primitive's contract — the caller must supply a valid $name pointer.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return 0
+    End If
+
+    Let now_ns be timer_now()
+    Let deadline be now_ns plus delay_ns
+
+    Let timer be proc allocate from Memory with TIMER_STRUCT_SIZE
+    If timer is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with timer, TIMER_OFF_DEADLINE, deadline
+    proc memory_set_int64 from Memory with timer, TIMER_OFF_INTERVAL, interval_ns
+    proc memory_set_int64 from Memory with timer, TIMER_OFF_CALLBACK, callback
+    proc memory_set_int64 from Memory with timer, TIMER_OFF_USERARG, user_arg
+    proc memory_set_int64 from Memory with timer, TIMER_OFF_ACTIVE, 1
+
+    Let count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+    Let cap be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_CAPACITY
+    If count is equal to cap:
+        Let new_cap be cap multiplied by 2
+        If new_cap is equal to 0:
+            Set new_cap to WHEEL_DEFAULT_CAPACITY
+        End If
+        Let new_bytes be new_cap multiplied by PTR_SIZE
+        Let new_array be proc allocate from Memory with new_bytes
+        If new_array is equal to 0:
+            proc deallocate from Memory with timer
+            Return 0
+        End If
+        Let old_array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+        Let copy_bytes be count multiplied by PTR_SIZE
+        proc memory_copy from Memory with new_array, old_array, copy_bytes
+        proc deallocate from Memory with old_array
+        proc memory_set_int64 from Memory with wheel, WHEEL_OFF_TIMERS, new_array
+        proc memory_set_int64 from Memory with wheel, WHEEL_OFF_CAPACITY, new_cap
+    End If
+
+    Let array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+    Let slot_offset be count multiplied by PTR_SIZE
+    proc memory_set_int64 from Memory with array, slot_offset, timer
+    Let new_count be count plus 1
+    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_COUNT, new_count
+    Return timer
+End Process
+
+Process called "timer_cancel" takes wheel as Integer, timer_id as Integer returns Integer:
+    @Reasoning
+    Retire a timer before it fires. Cancellation must keep the timers array
+    dense so the live count stays accurate and future scans stay cheap, and it
+    must reclaim the Timer object so a cancelled timer leaks nothing.
+    @End Reasoning
+
+    @Implementation
+    Linearly locate the array index holding timer_id (the timer set is small
+    and walked rarely). Mark the Timer inactive, then compact the array by
+    moving the last pointer into the vacated slot (a no-op when the cancelled
+    entry was already last), decrement count, and free the Timer. A timer_id
+    not present is reported as TIMER_ERR_NULL rather than silently ignored.
+    @End Implementation
+
+    @Performance_Hints
+    One linear scan, an O(1) swap-compaction, and one deallocate. No array
+    shrink — capacity is retained for reuse.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns TIMER_ERR_NULL. Cancelling an unknown id returns
+    TIMER_ERR_NULL without altering any state. After cancel the timer_id
+    pointer is dangling and must not be reused.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return TIMER_ERR_NULL
+    End If
+
+    Let count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+    Let array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+    Let idx be 0 minus 1
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let candidate be proc memory_get_int64 from Memory with array, slot_offset
+        If candidate is equal to timer_id:
+            Set idx to i
+            Set i to count
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    If idx is less than 0:
+        Return TIMER_ERR_NULL
+    End If
+
+    proc memory_set_int64 from Memory with timer_id, TIMER_OFF_ACTIVE, 0
+
+    Let last_idx be count minus 1
+    If idx is not equal to last_idx:
+        Let idx_offset be idx multiplied by PTR_SIZE
+        Let last_offset be last_idx multiplied by PTR_SIZE
+        Let moved be proc memory_get_int64 from Memory with array, last_offset
+        proc memory_set_int64 from Memory with array, idx_offset, moved
+    End If
+    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_COUNT, last_idx
+    proc deallocate from Memory with timer_id
+    Return TIMER_OK
+End Process
+
+Process called "timer_advance" takes wheel as Integer, now_ns as Integer returns Integer:
+    @Reasoning
+    Fire every timer whose deadline has been reached at the supplied monotonic
+    instant. Passing now_ns in (rather than reading the clock here) lets a
+    driver read the clock once and advance several wheels against the same
+    instant, and makes the firing behaviour deterministic under test.
+    @End Reasoning
+
+    @Implementation
+    Walk the live timers. For each timer whose deadline is at or before now_ns,
+    invoke its callback via call_indirect_1(callback, user_arg) exactly once and
+    count the firing. A periodic timer (interval greater than 0) is then
+    re-armed by advancing its deadline by whole intervals until it is strictly
+    after now_ns — this catches up across an arbitrary number of missed periods
+    in one step so a badly-overdue periodic timer fires once here instead of
+    busy-looping through every elapsed period. A one-shot timer (interval 0) is
+    removed by swap-compaction and freed. Because a fired one-shot leaves a new
+    (previously-last) entry in the current slot, the index is not advanced after
+    a removal so that swapped-in entry is examined; the index advances only when
+    a timer is kept (re-armed or not yet due). The wheel's array pointer and
+    count are re-read each turn because a fired callback may itself add timers
+    and grow (reallocate) the array. Returns the number of callbacks fired.
+    @End Implementation
+
+    @Performance_Hints
+    One pass over the live timers, one indirect call per fired timer, and an
+    O(1) removal per expired one-shot. Periodic catch-up is a short integer
+    loop bounded by the number of missed periods, executed once per advance.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns TIMER_ERR_NULL (distinguishable from any non-negative
+    fire count). Callbacks are dispatched synchronously in array order; a
+    callback must not cancel or destroy this wheel during the advance, as the
+    surrounding scan holds positional state — it may, however, safely add new
+    timers, whose deadlines are honoured on a subsequent advance.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return TIMER_ERR_NULL
+    End If
+
+    Let fired be 0
+    Let i be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+        If i is less than count:
+            Let array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+            Let slot_offset be i multiplied by PTR_SIZE
+            Let timer be proc memory_get_int64 from Memory with array, slot_offset
+            Let deadline be proc memory_get_int64 from Memory with timer, TIMER_OFF_DEADLINE
+            If deadline is less than or equal to now_ns:
+                Let callback be proc memory_get_int64 from Memory with timer, TIMER_OFF_CALLBACK
+                Let user_arg be proc memory_get_int64 from Memory with timer, TIMER_OFF_USERARG
+                If callback is not equal to 0:
+                    proc call_indirect_1 from Call with callback, user_arg
+                End If
+                Set fired to fired plus 1
+
+                Let interval be proc memory_get_int64 from Memory with timer, TIMER_OFF_INTERVAL
+                If interval is greater than 0:
+                    Let next_deadline be deadline plus interval
+                    Let catching_up be 1
+                    While catching_up is equal to 1:
+                        If next_deadline is less than or equal to now_ns:
+                            Set next_deadline to next_deadline plus interval
+                        Otherwise:
+                            Set catching_up to 0
+                        End If
+                    End While
+                    proc memory_set_int64 from Memory with timer, TIMER_OFF_DEADLINE, next_deadline
+                    Set i to i plus 1
+                Otherwise:
+                    proc memory_set_int64 from Memory with timer, TIMER_OFF_ACTIVE, 0
+                    Let cur_array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+                    Let cur_count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+                    Let last_idx be cur_count minus 1
+                    If i is not equal to last_idx:
+                        Let i_offset be i multiplied by PTR_SIZE
+                        Let last_offset be last_idx multiplied by PTR_SIZE
+                        Let moved be proc memory_get_int64 from Memory with cur_array, last_offset
+                        proc memory_set_int64 from Memory with cur_array, i_offset, moved
+                    End If
+                    proc memory_set_int64 from Memory with wheel, WHEEL_OFF_COUNT, last_idx
+                    proc deallocate from Memory with timer
+                End If
+            Otherwise:
+                Set i to i plus 1
+            End If
+        Otherwise:
+            Set scanning to 0
+        End If
+    End While
+    Return fired
+End Process
+
+Process called "timer_next_deadline" takes wheel as Integer returns Integer:
+    @Reasoning
+    Report the earliest absolute deadline among all armed timers, which is the
+    instant a driver must sleep until to service the wheel with no busy-waiting
+    and no premature wake.
+    @End Reasoning
+
+    @Implementation
+    Scan the live timers tracking the minimum deadline seen. A found flag
+    distinguishes "no timers armed" from a legitimate deadline value (a deadline
+    can in principle be any non-negative nanosecond count), so an empty wheel is
+    reported as TIMER_NO_DEADLINE (0 minus 1) rather than a spurious 0.
+    @End Implementation
+
+    @Performance_Hints
+    One linear scan over the live timers with two integer compares per entry.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns TIMER_NO_DEADLINE. Pure read; no state is modified.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return TIMER_NO_DEADLINE
+    End If
+
+    Let count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+    Let array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+    Let found be 0
+    Let best be 0
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let timer be proc memory_get_int64 from Memory with array, slot_offset
+        Let deadline be proc memory_get_int64 from Memory with timer, TIMER_OFF_DEADLINE
+        If found is equal to 0:
+            Set best to deadline
+            Set found to 1
+        Otherwise:
+            If deadline is less than best:
+                Set best to deadline
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If found is equal to 0:
+        Return TIMER_NO_DEADLINE
+    End If
+    Return best
+End Process
+
+Process called "timer_sleep_until_next" takes wheel as Integer returns Integer:
+    @Reasoning
+    Block the calling thread until the next timer is due, so a single-threaded
+    timer driver can idle in the kernel between deadlines instead of polling.
+    Sleeping to an absolute deadline (rather than a fixed delay) means the wake
+    lands on the timer's due instant regardless of how long the caller spent
+    elsewhere before calling this.
+    @End Reasoning
+
+    @Implementation
+    Read the next deadline; if none is armed there is nothing to wait for and
+    TIMER_OK is returned immediately. Otherwise compute the remaining span as
+    next_deadline minus now(). A non-positive span means the timer is already
+    due, so no sleep is performed. A positive span is unfolded into a timespec
+    (tv_sec = span / 1000000000, tv_nsec = span modulo 1000000000) on a scratch
+    allocation and passed to nanosleep with a NULL remaining-time pointer; the
+    scratch timespec is freed afterward. TIMER_OK is returned in all
+    non-null-wheel cases.
+    @End Implementation
+
+    @Performance_Hints
+    At most one nanosleep syscall and one scratch allocation. When a timer is
+    already due the call returns after two clock-relative integer operations
+    with no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns TIMER_ERR_NULL. nanosleep may return early if the thread
+    receives a signal; callers that require the full span to elapse should
+    re-check timer_next_deadline and sleep again, as the wake is edge- rather
+    than level-triggered.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return TIMER_ERR_NULL
+    End If
+
+    Let next_deadline be timer_next_deadline(wheel)
+    If next_deadline is less than 0:
+        Return TIMER_OK
+    End If
+
+    Let now_ns be timer_now()
+    Let span be next_deadline minus now_ns
+    If span is less than or equal to 0:
+        Return TIMER_OK
+    End If
+
+    Let ts be proc allocate from Memory with TIMESPEC_SIZE
+    If ts is equal to 0:
+        Return TIMER_ERR_ALLOC
+    End If
+    Let secs be span divided by NS_PER_SEC
+    Let nsec be span modulo NS_PER_SEC
+    proc memory_set_int64 from Memory with ts, TS_OFF_SEC, secs
+    proc memory_set_int64 from Memory with ts, TS_OFF_NSEC, nsec
+    proc linux_x86_64_syscall_nanosleep from Sys with ts, TIMER_NULL_REM
+    proc deallocate from Memory with ts
+    Return TIMER_OK
+End Process
+
+Process called "timer_count" takes wheel as Integer returns Integer:
+    @Reasoning
+    Report how many timers are currently armed, which is the figure that decides
+    whether a timer driver has any work left to schedule.
+    @End Reasoning
+
+    @Implementation
+    Return the count field, which timer_add (increment), timer_cancel
+    (decrement with compaction), and timer_advance (decrement per fired
+    one-shot) keep exactly equal to the number of live Timer entries.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns 0. Pure read.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+End Process
+
+Process called "timer_destroy" takes wheel as Integer returns Integer:
+    @Reasoning
+    Fully tear down a wheel with no leaks: every armed Timer is freed, then the
+    pointer array and the wheel object are released. This is why the wheel keeps
+    the array — without it the per-timer objects could not be reclaimed.
+    @End Reasoning
+
+    @Implementation
+    Walk the timers array freeing each live Timer, then free the array backing
+    store and finally the wheel object itself.
+    @End Implementation
+
+    @Performance_Hints
+    One deallocate per live timer, then two more deallocates. Cold path: done
+    once per wheel.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null wheel returns TIMER_ERR_NULL. After destroy the wheel pointer is
+    dangling and must not be reused.
+    @End Security_Scope
+
+    If wheel is equal to 0:
+        Return TIMER_ERR_NULL
+    End If
+
+    Let array be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_TIMERS
+    Let count be proc memory_get_int64 from Memory with wheel, WHEEL_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let slot_offset be i multiplied by PTR_SIZE
+        Let timer be proc memory_get_int64 from Memory with array, slot_offset
+        If timer is not equal to 0:
+            proc deallocate from Memory with timer
+        End If
+        Set i to i plus 1
+    End While
+
+    proc deallocate from Memory with array
+    proc deallocate from Memory with wheel
+    Return TIMER_OK
+End Process

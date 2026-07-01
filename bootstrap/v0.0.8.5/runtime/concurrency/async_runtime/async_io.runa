@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,436 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles asynchronous I/O operations and I/O event management for the Runa runtime concurrency system.
+Asynchronous I/O — completion-style read/write layered on the event loop.
 
-This file performs the following tasks:
-- Process asynchronous I/O operations and I/O event management
-- Handle I/O completion and I/O result processing
-- Manage I/O event registration and I/O event dispatching
-- Process I/O error handling and I/O feedback
+This module turns a blocking-style read or write request into a readiness-
+driven, non-blocking completion. It does not re-implement polling or timers;
+it builds directly on the completed epoll reactor in event_loop.runa. A caller
+submits an async_read or async_write against a descriptor together with a
+$name completion callback. The request is captured in an AsyncOp record, the
+descriptor is placed into non-blocking mode, and the descriptor is registered
+with the event loop for the readiness direction the operation needs (EPOLLIN
+for reads, EPOLLOUT for writes). Control returns to the caller immediately;
+the actual transfer is deferred until the kernel reports the descriptor ready.
 
-This file is essential because of the following reasons:
-- async_io enables comprehensive asynchronous I/O operations and I/O event management
-- Proper async I/O handling ensures correct I/O performance and user experience
-- async_io support enables Runa compilation for asynchronous I/O workflows
+Mechanism: when the descriptor becomes ready, the event loop invokes this
+module's internal dispatcher, async_io_on_ready, passing back the AsyncOp
+pointer that was handed to the loop as the user argument. The dispatcher
+performs the real read or write syscall exactly once, stores the transfer
+result (bytes moved, or a negative errno) on the AsyncOp, deregisters the
+descriptor from the loop so the one-shot completion cannot re-fire, invokes
+the caller's completion callback with the AsyncOp, and finally frees the
+AsyncOp. The completion callback recovers the transferred byte count through
+async_io_result before the record is reclaimed.
 
-This file consists of the following functions/features/operation types:
-- Asynchronous I/O operations and I/O event management
-- I/O completion and I/O result processing
-- I/O event registration and I/O event dispatching
-- I/O error handling and I/O feedback
+AsyncOp layout (64 bytes):
+    offset 0:   fd            — the watched descriptor (owned by the caller)
+    offset 8:   op_kind       — 0 read, 1 write
+    offset 16:  buffer        — caller-owned data buffer for the transfer
+    offset 24:  count         — number of bytes to read or write
+    offset 32:  user_callback — $name completion fn-ptr (call_indirect_1 ABI)
+    offset 40:  user_arg      — opaque argument reserved for the caller
+    offset 48:  result        — bytes transferred, or negative errno
+    offset 56:  loop          — the event loop this op is registered with
 :End Note
 
-Note: TODO - Implement async_io functionality
+Import "runtime/concurrency/async_runtime/event_loop.runa" as EL
+Import "compiler/frontend/primitives/platform/linux_x86_64/syscall.runa" as Sys
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/assembly/call_indirect.runa" as Call
+
+Note: AsyncOp object layout
+Constant AIO_OP_SIZE as Integer is 64
+Constant AIO_OFF_FD as Integer is 0
+Constant AIO_OFF_KIND as Integer is 8
+Constant AIO_OFF_BUFFER as Integer is 16
+Constant AIO_OFF_COUNT as Integer is 24
+Constant AIO_OFF_CALLBACK as Integer is 32
+Constant AIO_OFF_USERARG as Integer is 40
+Constant AIO_OFF_RESULT as Integer is 48
+Constant AIO_OFF_LOOP as Integer is 56
+
+Note: Operation kinds stored at AIO_OFF_KIND
+Constant AIO_KIND_READ as Integer is 0
+Constant AIO_KIND_WRITE as Integer is 1
+
+Note: fcntl commands — F_GETFL fetches the file status flags, F_SETFL sets them
+Constant AIO_F_GETFL as Integer is 3
+Constant AIO_F_SETFL as Integer is 4
+
+Note: O_NONBLOCK (0x800) — the status flag that makes read/write return instead of block
+Constant AIO_O_NONBLOCK as Integer is 2048
+
+Note: epoll readiness masks for the two transfer directions
+Constant AIO_EPOLLIN as Integer is 1
+Constant AIO_EPOLLOUT as Integer is 4
+
+Note: Status codes returned by the async I/O API
+Constant AIO_OK as Integer is 0
+Constant AIO_ERR_NULL as Integer is 0 minus 1
+Constant AIO_ERR_FCNTL as Integer is 0 minus 2
+Constant AIO_ERR_ALLOC as Integer is 0 minus 3
+
+Process called "async_io_set_nonblocking" takes fd as Integer returns Integer:
+    @Reasoning
+    A completion-style transfer must never block the reactor thread: when the
+    event loop reports a descriptor ready and the dispatcher issues its single
+    read or write, that syscall has to return immediately even if a partial or
+    spurious readiness leaves nothing to move. Placing the descriptor in
+    O_NONBLOCK mode is the precondition that guarantees this, so it is applied
+    once at submission time before the descriptor is ever registered.
+    @End Reasoning
+
+    @Implementation
+    Read the current file status flags with fcntl(fd, F_GETFL, 0). A negative
+    return means the descriptor is invalid or the query failed, reported as
+    AIO_ERR_FCNTL. Combine the existing flags with O_NONBLOCK using the bitwise
+    or operator so no other status bit is disturbed, then install the merged
+    mask with fcntl(fd, F_SETFL, flags). A negative set result is likewise
+    AIO_ERR_FCNTL; success is AIO_OK.
+    @End Implementation
+
+    @Performance_Hints
+    Exactly two fcntl syscalls, done once per submitted operation on the cold
+    setup path. No allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    The caller retains ownership of fd; this only alters its status flags. A
+    non-zero (negative) status is surfaced rather than silently ignored so a
+    bad descriptor cannot be armed into the loop.
+    @End Security_Scope
+
+    Let flags be proc linux_x86_64_syscall_fcntl from Sys with fd, AIO_F_GETFL, 0
+    If flags is less than 0:
+        Return AIO_ERR_FCNTL
+    End If
+
+    Let merged be flags bitwise or AIO_O_NONBLOCK
+    Let rc be proc linux_x86_64_syscall_fcntl from Sys with fd, AIO_F_SETFL, merged
+    If rc is less than 0:
+        Return AIO_ERR_FCNTL
+    End If
+    Return AIO_OK
+End Process
+
+Process called "async_read" takes loop as Integer, fd as Integer, buffer as Integer, count as Integer, callback as Integer, user_arg as Integer returns Integer:
+    @Reasoning
+    Arm a deferred read. The transfer is not performed here; instead the
+    descriptor is made non-blocking and registered with the reactor for input
+    readiness so that the actual read happens later, exactly when the kernel
+    reports data available. All state the deferred completion needs — buffer,
+    count, and the caller's callback — is captured in an AsyncOp whose pointer
+    the reactor carries as the dispatch argument.
+    @End Reasoning
+
+    @Implementation
+    Reject a null loop up front. Put fd in non-blocking mode and abort with the
+    fcntl error if that fails. Allocate a 64-byte AsyncOp and populate it with
+    the descriptor, kind (read), buffer, count, callback, user_arg, a zero
+    initial result, and the owning loop. Register fd with the event loop for
+    EPOLLIN, handing the internal dispatcher $async_io_on_ready as the callback
+    and the AsyncOp pointer as the user argument. If registration fails, the
+    AsyncOp is freed and the loop's error is propagated so nothing leaks.
+    @End Implementation
+
+    @Performance_Hints
+    Two fcntl syscalls plus one AsyncOp allocation and one event_loop_add on the
+    submission path; the transfer itself costs one syscall later at readiness.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns AIO_ERR_NULL. The caller owns fd and buffer for the whole
+    operation lifetime and must keep them valid until the completion callback
+    fires. The dispatcher pointer is a module-internal $name value, so dispatch
+    cannot be redirected by the caller.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+
+    Let nb be async_io_set_nonblocking(fd)
+    If nb is less than 0:
+        Return nb
+    End If
+
+    Let op be proc allocate from Memory with AIO_OP_SIZE
+    If op is equal to 0:
+        Return AIO_ERR_ALLOC
+    End If
+    proc memory_set_int64 from Memory with op, AIO_OFF_FD, fd
+    proc memory_set_int64 from Memory with op, AIO_OFF_KIND, AIO_KIND_READ
+    proc memory_set_int64 from Memory with op, AIO_OFF_BUFFER, buffer
+    proc memory_set_int64 from Memory with op, AIO_OFF_COUNT, count
+    proc memory_set_int64 from Memory with op, AIO_OFF_CALLBACK, callback
+    proc memory_set_int64 from Memory with op, AIO_OFF_USERARG, user_arg
+    proc memory_set_int64 from Memory with op, AIO_OFF_RESULT, 0
+    proc memory_set_int64 from Memory with op, AIO_OFF_LOOP, loop
+
+    Let rc be proc event_loop_add from EL with loop, fd, AIO_EPOLLIN, $async_io_on_ready, op
+    If rc is less than 0:
+        proc deallocate from Memory with op
+        Return rc
+    End If
+    Return AIO_OK
+End Process
+
+Process called "async_write" takes loop as Integer, fd as Integer, buffer as Integer, count as Integer, callback as Integer, user_arg as Integer returns Integer:
+    @Reasoning
+    Arm a deferred write. Symmetric to async_read: the write is not attempted
+    now but registered against output readiness, so the reactor drives the
+    single write syscall only when the kernel reports the descriptor writable,
+    avoiding any blocking send on a full socket or pipe.
+    @End Reasoning
+
+    @Implementation
+    Reject a null loop. Set fd non-blocking, propagating any fcntl failure.
+    Allocate and populate a 64-byte AsyncOp with kind (write), buffer, count,
+    callback, user_arg, a zero initial result, and the owning loop. Register fd
+    for EPOLLOUT with $async_io_on_ready as the callback and the AsyncOp as the
+    user argument, unwinding the allocation if registration fails.
+    @End Implementation
+
+    @Performance_Hints
+    Two fcntl syscalls, one AsyncOp allocation, and one event_loop_add on the
+    submission path; the write itself is a single syscall at readiness.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null loop returns AIO_ERR_NULL. The caller owns fd and buffer and must keep
+    the buffer contents valid until completion. Dispatch is fixed to the
+    module-internal $async_io_on_ready pointer.
+    @End Security_Scope
+
+    If loop is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+
+    Let nb be async_io_set_nonblocking(fd)
+    If nb is less than 0:
+        Return nb
+    End If
+
+    Let op be proc allocate from Memory with AIO_OP_SIZE
+    If op is equal to 0:
+        Return AIO_ERR_ALLOC
+    End If
+    proc memory_set_int64 from Memory with op, AIO_OFF_FD, fd
+    proc memory_set_int64 from Memory with op, AIO_OFF_KIND, AIO_KIND_WRITE
+    proc memory_set_int64 from Memory with op, AIO_OFF_BUFFER, buffer
+    proc memory_set_int64 from Memory with op, AIO_OFF_COUNT, count
+    proc memory_set_int64 from Memory with op, AIO_OFF_CALLBACK, callback
+    proc memory_set_int64 from Memory with op, AIO_OFF_USERARG, user_arg
+    proc memory_set_int64 from Memory with op, AIO_OFF_RESULT, 0
+    proc memory_set_int64 from Memory with op, AIO_OFF_LOOP, loop
+
+    Let rc be proc event_loop_add from EL with loop, fd, AIO_EPOLLOUT, $async_io_on_ready, op
+    If rc is less than 0:
+        proc deallocate from Memory with op
+        Return rc
+    End If
+    Return AIO_OK
+End Process
+
+Process called "async_io_on_ready" takes op as Integer returns Integer:
+    @Reasoning
+    The completion engine. This is the internal callback the event loop invokes
+    when a registered descriptor becomes ready; its address is taken elsewhere
+    in this module as $async_io_on_ready. It converts kernel readiness into a
+    finished transfer: perform the operation once, record the outcome, retire
+    the registration so the one-shot completion cannot re-fire, hand control to
+    the caller's callback, and reclaim the AsyncOp.
+    @End Reasoning
+
+    @Implementation
+    A null op is ignored defensively (return 0). Read fd, kind, buffer, count,
+    and the owning loop from the AsyncOp. Dispatch on kind: kind read issues
+    linux_x86_64_syscall_read(fd, buffer, count); any other kind is a write via
+    linux_x86_64_syscall_write(fd, buffer, count). The syscall return — bytes
+    transferred, or a negative errno — is stored at AIO_OFF_RESULT so the
+    completion callback can read it through async_io_result. The descriptor is
+    then removed from the loop with event_loop_remove (the completion is
+    one-shot; leaving it armed would re-enter the dispatcher on a freed op).
+    The caller's callback, if present, is invoked via call_indirect_1 with the
+    AsyncOp pointer as its single argument, matching the callback ABI. Finally
+    the AsyncOp is freed. The callback runs before the free, so it may still
+    read result/fd/buffer/count; after this returns the op pointer is dangling.
+    @End Implementation
+
+    @Performance_Hints
+    Exactly one read or write syscall plus one event_loop_remove and one
+    deallocate per completion, and a single indirect call into user code. No
+    allocation on the completion path.
+    @End Performance_Hints
+
+    @Security_Scope
+    A null op returns 0 without touching memory. Deregistration happens before
+    the user callback and before the free, so a callback cannot observe a
+    still-armed descriptor pointing at memory about to be reclaimed. The user
+    callback pointer is invoked verbatim per the call_indirect_1 contract; the
+    caller supplied it and is responsible for its validity.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return 0
+    End If
+
+    Let fd be proc memory_get_int64 from Memory with op, AIO_OFF_FD
+    Let kind be proc memory_get_int64 from Memory with op, AIO_OFF_KIND
+    Let buffer be proc memory_get_int64 from Memory with op, AIO_OFF_BUFFER
+    Let count be proc memory_get_int64 from Memory with op, AIO_OFF_COUNT
+    Let loop be proc memory_get_int64 from Memory with op, AIO_OFF_LOOP
+
+    Let transferred be 0
+    If kind is equal to AIO_KIND_READ:
+        Set transferred to proc linux_x86_64_syscall_read from Sys with fd, buffer, count
+    Otherwise:
+        Set transferred to proc linux_x86_64_syscall_write from Sys with fd, buffer, count
+    End If
+    proc memory_set_int64 from Memory with op, AIO_OFF_RESULT, transferred
+
+    proc event_loop_remove from EL with loop, fd
+
+    Let cb be proc memory_get_int64 from Memory with op, AIO_OFF_CALLBACK
+    If cb is not equal to 0:
+        proc call_indirect_1 from Call with cb, op
+    End If
+
+    proc deallocate from Memory with op
+    Return 0
+End Process
+
+Process called "async_io_result" takes op as Integer returns Integer:
+    @Reasoning
+    The completion callback needs the transfer outcome, but the dispatcher frees
+    the AsyncOp immediately after the callback returns. This accessor is the
+    supported way to read the stored byte count (or negative errno) during the
+    callback, keeping the AsyncOp layout private to this module.
+    @End Reasoning
+
+    @Implementation
+    Return the value stored at AIO_OFF_RESULT, which the dispatcher writes from
+    the read/write syscall return before invoking the callback. A null op yields
+    AIO_ERR_NULL so a misuse outside a live completion is distinguishable.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null op returns AIO_ERR_NULL. Valid only while the AsyncOp is live, i.e.
+    from within the completion callback before the dispatcher frees it.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with op, AIO_OFF_RESULT
+End Process
+
+Process called "async_io_fd" takes op as Integer returns Integer:
+    @Reasoning
+    Expose the descriptor associated with an operation so a completion callback
+    can correlate the result with the file, socket, or pipe it submitted,
+    without reaching into the private AsyncOp layout.
+    @End Reasoning
+
+    @Implementation
+    Return the descriptor stored at AIO_OFF_FD. A null op returns AIO_ERR_NULL.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null op returns AIO_ERR_NULL. Pure read of caller-owned descriptor number.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with op, AIO_OFF_FD
+End Process
+
+Process called "async_io_buffer" takes op as Integer returns Integer:
+    @Reasoning
+    Expose the data buffer pointer so a read completion callback can consume the
+    bytes just delivered (and a write completion can identify its source) using
+    the transferred count from async_io_result, all without depending on the
+    private field offsets.
+    @End Reasoning
+
+    @Implementation
+    Return the buffer pointer stored at AIO_OFF_BUFFER. A null op returns 0,
+    matching the null-pointer convention for a pointer-valued accessor.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null op returns 0. The buffer is caller-owned; this only returns the
+    pointer the caller supplied at submission time.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with op, AIO_OFF_BUFFER
+End Process
+
+Process called "async_io_count" takes op as Integer returns Integer:
+    @Reasoning
+    Expose the requested transfer length so a completion callback can compare it
+    against the actual bytes moved (async_io_result) to detect short reads or
+    short writes and decide whether to resubmit the remainder.
+    @End Reasoning
+
+    @Implementation
+    Return the requested count stored at AIO_OFF_COUNT. A null op returns
+    AIO_ERR_NULL.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null op returns AIO_ERR_NULL. Pure read.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with op, AIO_OFF_COUNT
+End Process
+
+Process called "async_io_user_arg" takes op as Integer returns Integer:
+    @Reasoning
+    Expose the caller-supplied context pointer so a completion callback (which
+    receives the AsyncOp, not the raw user_arg) can recover the state it needs
+    to act on the result. Without this the stored user_arg is unreachable.
+    @End Reasoning
+
+    @Implementation
+    Return the user_arg stored at AIO_OFF_USERARG. A null op returns
+    AIO_ERR_NULL.
+    @End Implementation
+
+    @Performance_Hints
+    One field load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Null op returns AIO_ERR_NULL. Pure read.
+    @End Security_Scope
+
+    If op is equal to 0:
+        Return AIO_ERR_NULL
+    End If
+    Return proc memory_get_int64 from Memory with op, AIO_OFF_USERARG
+End Process
